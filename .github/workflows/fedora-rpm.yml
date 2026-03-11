@@ -1,0 +1,78 @@
+name: Build RPM on Fedora 43
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-rpm:
+    name: Build RPM (Fedora 43)
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+      options: --shm-size=2gb
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install basic RPM build tools
+        run: |
+          dnf update -y
+          dnf install -y rpm-build rpmdevtools dnf-plugins-core git tar bzip2 make wget
+
+      - name: Setup RPM build tree
+        run: |
+          rpmdev-setuptree
+          cp tools/fedora/cp2k.spec ~/rpmbuild/SPECS/
+
+      - name: Prepare source tarball
+        run: |
+          mkdir -p /tmp/cp2k-0.0.0
+          cp -a . /tmp/cp2k-0.0.0/
+          cd /tmp
+          tar -cjf ~/rpmbuild/SOURCES/cp2k-0.0.0.tar.bz2 cp2k-0.0.0
+
+      - name: Install build dependencies from spec
+        run: |
+          dnf builddep -y tools/fedora/cp2k.spec
+
+      - name: Build RPM package
+        run: |
+          source /etc/profile.d/modules.sh
+          export OMPI_ALLOW_RUN_AS_ROOT=1
+          export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+          export PRTE_MCA_rmaps_default_mapping_policy=:oversubscribe
+          rpmbuild -ba ~/rpmbuild/SPECS/cp2k.spec
+
+      - name: Install built RPMs
+        run: |
+          dnf install -y ~/rpmbuild/RPMS/x86_64/cp2k-*.rpm \
+                         ~/rpmbuild/RPMS/noarch/cp2k-common-*.rpm \
+                         ~/rpmbuild/RPMS/x86_64/cp2k-openmpi-*.rpm
+
+      - name: Test OpenMPI version
+        run: |
+          source /etc/profile.d/modules.sh
+          module load mpi/openmpi-$(arch)
+          export OMPI_ALLOW_RUN_AS_ROOT=1
+          export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+          export PRTE_MCA_rmaps_default_mapping_policy=:oversubscribe
+          wget http://sobereva.com/attach/586/test.inp -O /tmp/test.inp
+          mpirun -np 4 cp2k.psmp /tmp/test.inp
+
+      - name: Upload RPM Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fedora-43-rpms
+          path: |
+            ~/rpmbuild/RPMS/*/*.rpm
+            ~/rpmbuild/SRPMS/*.rpm
+            ~/rpmbuild/BUILD/*/build_*/CMakeCache.txt
+
