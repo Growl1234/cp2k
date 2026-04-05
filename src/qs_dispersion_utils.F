@@ -43,6 +43,7 @@ MODULE qs_dispersion_utils
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_dispersion_utils'
 
    PUBLIC :: qs_dispersion_env_set, qs_write_dispersion
+   PUBLIC :: qs_scaling_dftd4
    PUBLIC :: cellhash
 
 ! **************************************************************************************************
@@ -178,9 +179,10 @@ CONTAINS
                IF (.NOT. exfun) THEN
                   CPABORT("Missing REFERENCE_FUNCTIONAL or D4_SCALING for D4")
                ELSE
-                  CALL section_vals_val_get(vdw_section, &
-                                            "PAIR_POTENTIAL%REFERENCE_FUNCTIONAL", &
-                                            c_val=dispersion_env%ref_functional)
+                  CALL qs_scaling_dftd4(dispersion_env%s6, dispersion_env%a1, &
+                                        dispersion_env%s8, dispersion_env%a2, vdw_section)
+                  dispersion_env%sr6 = 0.0_dp
+                  dispersion_env%ref_functional = "none"
                END IF
             ELSE
                CALL section_vals_val_get(pp_section, "D4_SCALING", r_vals=scal)
@@ -1191,6 +1193,598 @@ CONTAINS
       END SELECT
 
    END SUBROUTINE qs_scaling_dftd3bj
+
+! **************************************************************************************************
+!> \brief ...
+!> \param s6 ...
+!> \param a1 ...
+!> \param s8 ...
+!> \param a2 ...
+!> \param vdw_section ...
+! **************************************************************************************************
+   SUBROUTINE qs_scaling_dftd4(s6, a1, s8, a2, vdw_section)
+      REAL(KIND=dp), INTENT(INOUT)                       :: s6, a1, s8, a2
+      TYPE(section_vals_type), POINTER                   :: vdw_section
+
+      CHARACTER(LEN=default_string_length)               :: functional
+
+      CALL section_vals_val_get(vdw_section, "PAIR_POTENTIAL%REFERENCE_FUNCTIONAL", c_val=functional)
+      CALL uppercase(functional)
+
+      ! DFT-D4 BJ-ATM rational damping parameters (for use with C9 three-body term).
+      ! References: SAW190103/SAW190107/SAW191202/SAW211021/SAW211107 = S.A. Wildman fits;
+      !             DOI references given inline for more recent parametrizations.
+      SELECT CASE (TRIM(functional))
+      CASE DEFAULT
+         CPABORT("No DFT-D4 parameters available for this functional: "//TRIM(functional))
+      CASE ("HF")
+         s6 = 1.0000_dp
+         s8 = 1.61679827_dp
+         a1 = 0.44959224_dp
+         a2 = 3.35743605_dp
+      CASE ("AM05")
+         s6 = 1.0000_dp
+         s8 = 1.71885838_dp
+         a1 = 0.47901431_dp
+         a2 = 5.96771581_dp
+      CASE ("BLYP")
+         s6 = 1.0000_dp
+         s8 = 2.34076671_dp
+         a1 = 0.44488865_dp
+         a2 = 4.09330090_dp
+      CASE ("BPBE")
+         s6 = 1.0000_dp
+         s8 = 3.64405246_dp
+         a1 = 0.52905620_dp
+         a2 = 4.11311891_dp
+      CASE ("BP86", "BP")
+         s6 = 1.0000_dp
+         s8 = 3.35497927_dp
+         a1 = 0.43645861_dp
+         a2 = 4.92406854_dp
+      CASE ("BPW", "BPW91")
+         s6 = 1.0000_dp
+         s8 = 3.24571506_dp
+         a1 = 0.50050454_dp
+         a2 = 4.12346483_dp
+      CASE ("GLYP")
+         s6 = 1.0000_dp
+         s8 = 4.23798924_dp
+         a1 = 0.38426465_dp
+         a2 = 4.38412863_dp
+      CASE ("LB94")
+         s6 = 1.0000_dp
+         s8 = 2.59538499_dp
+         a1 = 0.42088944_dp
+         a2 = 3.28193223_dp
+      CASE ("MPWLYP")
+         s6 = 1.0000_dp
+         s8 = 1.25842942_dp
+         a1 = 0.25773894_dp
+         a2 = 5.02319542_dp
+      CASE ("MPWPW91", "MPWPW")
+         s6 = 1.0000_dp
+         s8 = 1.82596836_dp
+         a1 = 0.34526745_dp
+         a2 = 4.84620734_dp
+      CASE ("OLYP")
+         s6 = 1.0000_dp
+         s8 = 2.74836820_dp
+         a1 = 0.60184498_dp
+         a2 = 2.53292167_dp
+      CASE ("OPBE")
+         s6 = 1.0000_dp
+         s8 = 3.06917417_dp
+         a1 = 0.68267534_dp
+         a2 = 2.22849018_dp
+      CASE ("PBE")
+         s6 = 1.0000_dp
+         s8 = 0.95948085_dp
+         a1 = 0.38574991_dp
+         a2 = 4.80688534_dp
+      CASE ("PBESOL")
+         s6 = 1.0000_dp
+         s8 = 1.71885698_dp
+         a1 = 0.47901421_dp
+         a2 = 5.96771589_dp
+      CASE ("PW86PBE")
+         s6 = 1.0000_dp
+         s8 = 1.21362856_dp
+         a1 = 0.40510366_dp
+         a2 = 4.66737724_dp
+      CASE ("PW91")
+         s6 = 1.0000_dp
+         s8 = 0.77283111_dp
+         a1 = 0.39581542_dp
+         a2 = 4.93405761_dp
+      CASE ("PWP", "PW91P86")
+         s6 = 1.0000_dp
+         s8 = 0.32801227_dp
+         a1 = 0.35874687_dp
+         a2 = 6.05861168_dp
+      CASE ("REVPBE")
+         s6 = 1.0000_dp
+         s8 = 1.74676530_dp
+         a1 = 0.53634900_dp
+         a2 = 3.07261485_dp
+      CASE ("RPBE")
+         s6 = 1.0000_dp
+         s8 = 1.31183787_dp
+         a1 = 0.46169493_dp
+         a2 = 3.15711757_dp
+      CASE ("RPW86PBE")
+         s6 = 1.0000_dp
+         s8 = 1.12624034_dp
+         a1 = 0.38151218_dp
+         a2 = 4.75480472_dp
+      CASE ("XLYP")
+         s6 = 1.0000_dp
+         s8 = 1.62972054_dp
+         a1 = 0.11268673_dp
+         a2 = 5.40786417_dp
+      CASE ("B97D", "B97-D")
+         s6 = 1.0000_dp
+         s8 = 1.69460052_dp
+         a1 = 0.28904684_dp
+         a2 = 4.13407323_dp
+      CASE ("B97")
+         s6 = 1.0000_dp
+         s8 = 0.87854260_dp
+         a1 = 0.29319126_dp
+         a2 = 4.51647719_dp
+      CASE ("B97M")
+         s6 = 1.0000_dp
+         s8 = 0.6633_dp
+         a1 = 0.4288_dp
+         a2 = 3.9935_dp
+      CASE ("M06L")
+         s6 = 1.0000_dp
+         s8 = 0.59493760_dp
+         a1 = 0.71422359_dp
+         a2 = 6.35314182_dp
+      CASE ("REVTPSS")
+         s6 = 1.0000_dp
+         s8 = 1.53089454_dp
+         a1 = 0.44880597_dp
+         a2 = 4.64042317_dp
+      CASE ("RSCAN")
+         s6 = 1.0000_dp
+         s8 = 0.87728975_dp
+         a1 = 0.49116966_dp
+         a2 = 5.75859346_dp
+      CASE ("R2SCAN")
+         s6 = 1.0000_dp
+         s8 = 0.60187490_dp
+         a1 = 0.51559235_dp
+         a2 = 5.77342911_dp
+      CASE ("SCAN")
+         s6 = 1.0000_dp
+         s8 = 1.46126056_dp
+         a1 = 0.62930855_dp
+         a2 = 6.31284039_dp
+      CASE ("TPSS")
+         s6 = 1.0000_dp
+         s8 = 1.76596355_dp
+         a1 = 0.42822303_dp
+         a2 = 4.54257102_dp
+      CASE ("B1B95")
+         s6 = 1.0000_dp
+         s8 = 1.27701162_dp
+         a1 = 0.40554715_dp
+         a2 = 4.63323074_dp
+      CASE ("B1LYP")
+         s6 = 1.0000_dp
+         s8 = 1.98553711_dp
+         a1 = 0.39309040_dp
+         a2 = 4.55465145_dp
+      CASE ("B1P86", "B1P")
+         s6 = 1.0000_dp
+         s8 = 3.36115015_dp
+         a1 = 0.48665293_dp
+         a2 = 5.05219572_dp
+      CASE ("B1PW91", "B1PW")
+         s6 = 1.0000_dp
+         s8 = 3.02227550_dp
+         a1 = 0.47396846_dp
+         a2 = 4.49845309_dp
+      CASE ("B3LYP")
+         s6 = 1.0000_dp
+         s8 = 2.02929367_dp
+         a1 = 0.40868035_dp
+         a2 = 4.53807137_dp
+      CASE ("B3P86", "B3P")
+         s6 = 1.0000_dp
+         s8 = 3.08822155_dp
+         a1 = 0.47324238_dp
+         a2 = 4.98682134_dp
+      CASE ("B3PW91", "B3PW")
+         s6 = 1.0000_dp
+         s8 = 2.88364295_dp
+         a1 = 0.46990860_dp
+         a2 = 4.51641422_dp
+      CASE ("BHLYP")
+         s6 = 1.0000_dp
+         s8 = 1.65281646_dp
+         a1 = 0.27263660_dp
+         a2 = 5.48634586_dp
+      CASE ("CAMB3LYP", "CAM-B3LYP")
+         s6 = 1.0000_dp
+         s8 = 1.66041301_dp
+         a1 = 0.40267156_dp
+         a2 = 5.17432195_dp
+      CASE ("CAMQTP01", "CAM-QTP01")
+         s6 = 1.0000_dp
+         s8 = 1.156_dp
+         a1 = 0.461_dp
+         a2 = 6.375_dp
+      CASE ("HSE03")
+         s6 = 1.0000_dp
+         s8 = 1.19812280_dp
+         a1 = 0.38662939_dp
+         a2 = 5.22925796_dp
+      CASE ("HSE06")
+         s6 = 1.0000_dp
+         s8 = 1.19528249_dp
+         a1 = 0.38663183_dp
+         a2 = 5.19133469_dp
+      CASE ("HSE12")
+         s6 = 1.0000_dp
+         s8 = 1.23500792_dp
+         a1 = 0.39226921_dp
+         a2 = 5.22036266_dp
+      CASE ("HSE12S")
+         s6 = 1.0000_dp
+         s8 = 1.23767762_dp
+         a1 = 0.39989137_dp
+         a2 = 5.34809245_dp
+      CASE ("HSESOL")
+         s6 = 1.0000_dp
+         s8 = 1.82207807_dp
+         a1 = 0.45646268_dp
+         a2 = 5.59662251_dp
+      CASE ("LCBLYP", "LC-BLYP")
+         s6 = 1.0000_dp
+         s8 = 1.60344180_dp
+         a1 = 0.45769839_dp
+         a2 = 7.86924893_dp
+      CASE ("LCWPBE", "LC-WPBE")
+         s6 = 1.0000_dp
+         s8 = 1.170_dp
+         a1 = 0.378_dp
+         a2 = 4.816_dp
+      CASE ("LCWPBEH", "LC-WPBEH")
+         s6 = 1.0000_dp
+         s8 = 1.318_dp
+         a1 = 0.386_dp
+         a2 = 5.010_dp
+      CASE ("M06")
+         s6 = 1.0000_dp
+         s8 = 0.16366729_dp
+         a1 = 0.53456413_dp
+         a2 = 6.06192174_dp
+      CASE ("MN12SX", "MN12-SX")
+         s6 = 1.0000_dp
+         s8 = 0.85964873_dp
+         a1 = 0.62662681_dp
+         a2 = 5.62088906_dp
+      CASE ("MPW1B95")
+         s6 = 1.0000_dp
+         s8 = 0.50093024_dp
+         a1 = 0.41585097_dp
+         a2 = 4.99154869_dp
+      CASE ("MPW1LYP")
+         s6 = 1.0000_dp
+         s8 = 1.15591153_dp
+         a1 = 0.25603493_dp
+         a2 = 5.32083895_dp
+      CASE ("MPW1PW91", "MPW1PW")
+         s6 = 1.0000_dp
+         s8 = 1.80841716_dp
+         a1 = 0.42961819_dp
+         a2 = 4.68892341_dp
+      CASE ("MPWB1K")
+         s6 = 1.0000_dp
+         s8 = 0.57338313_dp
+         a1 = 0.44687975_dp
+         a2 = 5.21266777_dp
+      CASE ("O3LYP")
+         s6 = 1.0000_dp
+         s8 = 1.75762508_dp
+         a1 = 0.10348980_dp
+         a2 = 6.16233282_dp
+      CASE ("PBE0")
+         s6 = 1.0000_dp
+         s8 = 1.20065498_dp
+         a1 = 0.40085597_dp
+         a2 = 5.02928789_dp
+      CASE ("PBE0-2", "PBE02")
+         s6 = 0.5000_dp
+         s8 = 0.64299082_dp
+         a1 = 0.76542115_dp
+         a2 = 5.78578675_dp
+      CASE ("PBE0-DH", "PBE0DH")
+         s6 = 0.8750_dp
+         s8 = 0.96811578_dp
+         a1 = 0.47592488_dp
+         a2 = 5.08622873_dp
+      CASE ("PW1PW")
+         s6 = 1.0000_dp
+         s8 = 0.96850170_dp
+         a1 = 0.42427511_dp
+         a2 = 5.02060636_dp
+      CASE ("PW6B95")
+         s6 = 1.0000_dp
+         s8 = -0.31926054_dp
+         a1 = 0.04142919_dp
+         a2 = 5.84655608_dp
+      CASE ("PWP1")
+         s6 = 1.0000_dp
+         s8 = 0.60492565_dp
+         a1 = 0.46855837_dp
+         a2 = 5.76921413_dp
+      CASE ("REVPBE0")
+         s6 = 1.0000_dp
+         s8 = 1.57185414_dp
+         a1 = 0.38705966_dp
+         a2 = 4.11028876_dp
+      CASE ("REVPBE0-DH", "REVPBE0DH")
+         s6 = 0.8750_dp
+         s8 = 1.24456037_dp
+         a1 = 0.36730560_dp
+         a2 = 4.71126482_dp
+      CASE ("REVPBE38")
+         s6 = 1.0000_dp
+         s8 = 1.66597472_dp
+         a1 = 0.39476833_dp
+         a2 = 4.39026628_dp
+      CASE ("WB97", "OMEGAB97")
+         s6 = 1.0000_dp
+         s8 = 6.55792598_dp
+         a1 = 0.76666802_dp
+         a2 = 8.36027334_dp
+      CASE ("WB97X", "OMEGAB97X")
+         s6 = 1.0000_dp
+         s8 = 0.5093_dp
+         a1 = 0.0662_dp
+         a2 = 5.4487_dp
+      CASE ("WB97X-2008", "WB97X_2008")
+         s6 = 1.0000_dp
+         s8 = -0.07519516_dp
+         a1 = 0.45094893_dp
+         a2 = 6.78425255_dp
+      CASE ("WB97X-REV", "WB97X_REV")
+         s6 = 1.0000_dp
+         s8 = 0.4485_dp
+         a1 = 0.3306_dp
+         a2 = 4.279_dp
+      CASE ("WB97X-3C", "WB97X_3C")
+         s6 = 1.0000_dp
+         s8 = 0.0_dp
+         a1 = 0.2464_dp
+         a2 = 4.737_dp
+      CASE ("WB97M", "OMEGAB97M")
+         s6 = 1.0000_dp
+         s8 = 0.7761_dp
+         a1 = 0.7514_dp
+         a2 = 2.7099_dp
+      CASE ("WB97M-REV", "WB97M_REV")
+         s6 = 1.0000_dp
+         s8 = 0.842_dp
+         a1 = 0.359_dp
+         a2 = 4.668_dp
+      CASE ("X3LYP")
+         s6 = 1.0000_dp
+         s8 = 1.54701429_dp
+         a1 = 0.20318443_dp
+         a2 = 5.61852648_dp
+      CASE ("REVTPSS0")
+         s6 = 1.0000_dp
+         s8 = 1.54664499_dp
+         a1 = 0.45890964_dp
+         a2 = 4.78426405_dp
+      CASE ("REVTPSSH")
+         s6 = 1.0000_dp
+         s8 = 1.52740307_dp
+         a1 = 0.45161957_dp
+         a2 = 4.70779483_dp
+      CASE ("TPSS0")
+         s6 = 1.0000_dp
+         s8 = 1.62438102_dp
+         a1 = 0.40329022_dp
+         a2 = 4.80537871_dp
+      CASE ("TPSSH")
+         s6 = 1.0000_dp
+         s8 = 1.85897750_dp
+         a1 = 0.44286966_dp
+         a2 = 4.60230534_dp
+      CASE ("PWPB95")
+         s6 = 0.8200_dp
+         s8 = -0.34639127_dp
+         a1 = 0.41080636_dp
+         a2 = 3.83878274_dp
+      CASE ("R2SCANH")
+         s6 = 1.0000_dp
+         s8 = 0.8324_dp
+         a1 = 0.4944_dp
+         a2 = 5.9019_dp
+      CASE ("R2SCAN0")
+         s6 = 1.0000_dp
+         s8 = 0.8992_dp
+         a1 = 0.4778_dp
+         a2 = 5.8779_dp
+      CASE ("R2SCAN50")
+         s6 = 1.0000_dp
+         s8 = 1.0471_dp
+         a1 = 0.4574_dp
+         a2 = 5.8969_dp
+      CASE ("R2SCAN-3C", "R2SCAN_3C")
+         s6 = 1.00_dp
+         s8 = 0.00_dp
+         a1 = 0.42_dp
+         a2 = 5.65_dp
+      CASE ("WR2SCAN")
+         s6 = 1.0000_dp
+         s8 = 1.0000_dp
+         a1 = 0.3834_dp
+         a2 = 5.7889_dp
+      CASE ("R2SCAN0-DH", "R2SCAN0DH")
+         s6 = 0.9424_dp
+         s8 = 0.3856_dp
+         a1 = 0.4271_dp
+         a2 = 5.8565_dp
+      CASE ("R2SCAN-CIDH", "R2SCANCIDH")
+         s6 = 0.8666_dp
+         s8 = 0.5336_dp
+         a1 = 0.4171_dp
+         a2 = 5.9125_dp
+      CASE ("R2SCAN-QIDH", "R2SCANQIDH")
+         s6 = 0.7867_dp
+         s8 = 0.2955_dp
+         a1 = 0.4001_dp
+         a2 = 5.8300_dp
+      CASE ("R2SCAN0-2", "R2SCAN02")
+         s6 = 0.7386_dp
+         s8 = 0.0000_dp
+         a1 = 0.4030_dp
+         a2 = 5.5142_dp
+      CASE ("PR2SCAN50")
+         s6 = 0.7964_dp
+         s8 = 0.3421_dp
+         a1 = 0.4663_dp
+         a2 = 5.7916_dp
+      CASE ("PR2SCAN69")
+         s6 = 0.7167_dp
+         s8 = 0.0000_dp
+         a1 = 0.4644_dp
+         a2 = 5.2563_dp
+      CASE ("KPR2SCAN50")
+         s6 = 0.8402_dp
+         s8 = 0.1212_dp
+         a1 = 0.4382_dp
+         a2 = 5.8232_dp
+      CASE ("WPR2SCAN50")
+         s6 = 0.8143_dp
+         s8 = 0.3842_dp
+         a1 = 0.4135_dp
+         a2 = 5.8773_dp
+      CASE ("LH07TSVWN", "LH07T-SVWN")
+         s6 = 1.0000_dp
+         s8 = 2.09333001_dp
+         a1 = 0.35025189_dp
+         a2 = 4.34166515_dp
+      CASE ("LH07SSVWN", "LH07S-SVWN")
+         s6 = 1.0000_dp
+         s8 = 3.16675531_dp
+         a1 = 0.35965552_dp
+         a2 = 4.31947614_dp
+      CASE ("LH12CTSSIRPW92", "LH12CT-SSIRPW92")
+         s6 = 1.0000_dp
+         s8 = 2.48973402_dp
+         a1 = 0.34026075_dp
+         a2 = 3.96948081_dp
+      CASE ("LH12CTSSIFPW92", "LH12CT-SSIFPW92")
+         s6 = 1.0000_dp
+         s8 = 2.68467610_dp
+         a1 = 0.34190416_dp
+         a2 = 3.91039666_dp
+      CASE ("LH14TCALPBE", "LH14T-CALPBE")
+         s6 = 1.0000_dp
+         s8 = 1.28130770_dp
+         a1 = 0.38822021_dp
+         a2 = 4.92501211_dp
+      CASE ("LH20T")
+         s6 = 1.000_dp
+         s8 = 0.113_dp
+         a1 = 0.479_dp
+         a2 = 4.635_dp
+      CASE ("B2PLYP")
+         s6 = 0.6400_dp
+         s8 = 1.16888646_dp
+         a1 = 0.44154604_dp
+         a2 = 4.73114642_dp
+      CASE ("B2GPPLYP", "B2GP-PLYP")
+         s6 = 0.5600_dp
+         s8 = 0.94633372_dp
+         a1 = 0.42907301_dp
+         a2 = 5.18802602_dp
+      CASE ("MPW2PLYP")
+         s6 = 0.7500_dp
+         s8 = 0.45788846_dp
+         a1 = 0.42997704_dp
+         a2 = 5.07650682_dp
+      CASE ("DSDBLYP", "DSD-BLYP")
+         s6 = 0.5400_dp
+         s8 = 0.63018237_dp
+         a1 = 0.47591835_dp
+         a2 = 4.73713781_dp
+      CASE ("DSDPBE", "DSD-PBE")
+         s6 = 0.4500_dp
+         s8 = 0.70584116_dp
+         a1 = 0.45787085_dp
+         a2 = 4.44566742_dp
+      CASE ("DSDPBEB95", "DSD-PBEB95")
+         s6 = 0.5400_dp
+         s8 = -0.14668670_dp
+         a1 = 0.46394587_dp
+         a2 = 3.64913860_dp
+      CASE ("DSDPBEP86", "DSD-PBEP86")
+         s6 = 0.4700_dp
+         s8 = 0.37586675_dp
+         a1 = 0.53698768_dp
+         a2 = 5.13022435_dp
+      CASE ("DSDSVWN", "DSD-SVWN")
+         s6 = 0.4100_dp
+         s8 = 0.72914436_dp
+         a1 = 0.51347412_dp
+         a2 = 5.11858541_dp
+      CASE ("DODBLYP", "DOD-BLYP")
+         s6 = 0.4700_dp
+         s8 = 1.31146043_dp
+         a1 = 0.43407294_dp
+         a2 = 4.27914360_dp
+      CASE ("DODPBE", "DOD-PBE")
+         s6 = 0.4800_dp
+         s8 = 0.92051454_dp
+         a1 = 0.43037052_dp
+         a2 = 4.38067238_dp
+      CASE ("DODPBEB95", "DOD-PBEB95")
+         s6 = 0.5600_dp
+         s8 = 0.01574635_dp
+         a1 = 0.43745720_dp
+         a2 = 3.69180763_dp
+      CASE ("DODPBEP86", "DOD-PBEP86")
+         s6 = 0.4600_dp
+         s8 = 0.71405681_dp
+         a1 = 0.42408665_dp
+         a2 = 4.52884439_dp
+      CASE ("DODSVWN", "DOD-SVWN")
+         s6 = 0.4200_dp
+         s8 = 0.94500207_dp
+         a1 = 0.47449026_dp
+         a2 = 5.05316093_dp
+      CASE ("REVDSDBLYP", "REVDSD-BLYP")
+         s6 = 0.6141_dp
+         s8 = 0.0000_dp
+         a1 = 0.3800_dp
+         a2 = 3.5200_dp
+      CASE ("REVDSDPBE", "REVDSD-PBE", "REVDSD-PBEPBE")
+         s6 = 0.6706_dp
+         s8 = 0.0000_dp
+         a1 = 0.4000_dp
+         a2 = 3.6000_dp
+      CASE ("REVDSDPBEP86", "REVDSD-PBEP86")
+         s6 = 0.5132_dp
+         s8 = 0.0000_dp
+         a1 = 0.4400_dp
+         a2 = 3.6000_dp
+      CASE ("REVDODPBEP86", "REVDOD-PBEP86")
+         s6 = 0.5552_dp
+         s8 = 0.0000_dp
+         a1 = 0.4400_dp
+         a2 = 3.6000_dp
+      END SELECT
+
+   END SUBROUTINE qs_scaling_dftd4
 
 ! **************************************************************************************************
 !> \brief ...
