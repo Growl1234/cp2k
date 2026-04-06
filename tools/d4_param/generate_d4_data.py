@@ -43,7 +43,7 @@ CP2K_HEADER = """\
 # ===========================================================================
 # Fortran formatting helpers
 # ===========================================================================
-def fmt_real(vals, per_line=6, fmt="{:14.7f}_dp"):
+def fmt_real(vals, per_line=4, fmt="{:20.14f}_dp"):
     """Format a flat list of reals as a Fortran DATA value block."""
     lines = []
     for i in range(0, len(vals), per_line):
