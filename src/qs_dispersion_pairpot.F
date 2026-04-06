@@ -60,7 +60,7 @@ MODULE qs_dispersion_pairpot
                                               dftd2_param
    USE qs_dispersion_d3,                ONLY: calculate_dispersion_d3_pairpot,&
                                               dftd3_c6_param
-   USE qs_dispersion_d4,                ONLY: calculate_dispersion_d4_pairpot
+   USE qs_dispersion_d4_method,         ONLY: calculate_dispersion_d4_pairpot
    USE qs_dispersion_types,             ONLY: dftd2_pp,&
                                               dftd3_pp,&
                                               dftd4_pp,&

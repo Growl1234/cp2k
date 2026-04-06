@@ -60,6 +60,7 @@ run_test mypy --strict ./tests/do_regtest.py
 run_test mypy --strict ./docs/generate_input_reference.py
 run_test mypy --strict ./docs/fix_github_links.py
 run_test mypy --strict ./tools/vibronic_spec/
+run_test mypy --strict ./tools/d4_param/generate_d4_data.py
 
 # TODO: Find a way to test generate_dashboard.py without git repository.
 #

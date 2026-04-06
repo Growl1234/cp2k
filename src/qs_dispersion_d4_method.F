@@ -9,7 +9,7 @@
 !> \brief Calculation of dispersion using pair potentials
 !> \author Johann Pototschnig
 ! **************************************************************************************************
-MODULE qs_dispersion_d4
+MODULE qs_dispersion_d4_method
    USE atomic_kind_types, ONLY: atomic_kind_type, &
                                 get_atomic_kind, &
                                 get_atomic_kind_set
@@ -65,7 +65,7 @@ MODULE qs_dispersion_d4
 
    PRIVATE
 
-   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_dispersion_d4'
+   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_dispersion_d4_method'
 
    PUBLIC :: calculate_dispersion_d4_pairpot
 
@@ -1310,4 +1310,4 @@ CONTAINS
 
    END SUBROUTINE verror
 
-END MODULE qs_dispersion_d4
+END MODULE qs_dispersion_d4_method

@@ -556,7 +556,9 @@ list(
   qs_dispersion_nonloc.F
   qs_dispersion_d2.F
   qs_dispersion_d3.F
-  qs_dispersion_d4.F
+  qs_dispersion_d4_data.F
+  qs_dispersion_d4_method.F
+  qs_dispersion_d4_ref.F
   qs_dispersion_pairpot.F
   qs_dispersion_types.F
   qs_dispersion_utils.F
