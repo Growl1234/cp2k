@@ -46,6 +46,9 @@ MODULE qs_diis_types
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER       :: error => NULL()
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER       :: param => NULL()
       REAL(KIND=dp), DIMENSION(:, :), POINTER          :: b_matrix => NULL()
+      ! EDIIS extensions
+      TYPE(cp_fm_type), DIMENSION(:, :), POINTER       :: density => NULL()
+      REAL(KIND=dp), DIMENSION(:), POINTER             :: energy => NULL()
    END TYPE qs_diis_buffer_type
 
 ! **************************************************************************************************
@@ -115,6 +118,10 @@ CONTAINS
       END IF
       CALL cp_fm_release(diis_buffer%error)
       CALL cp_fm_release(diis_buffer%param)
+      CALL cp_fm_release(diis_buffer%density)
+      IF (ASSOCIATED(diis_buffer%energy)) THEN
+         DEALLOCATE (diis_buffer%energy)
+      END IF
 
    END SUBROUTINE qs_diis_b_release
 

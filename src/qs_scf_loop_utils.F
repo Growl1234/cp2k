@@ -211,12 +211,11 @@ CONTAINS
                IF (dft_control%hairy_probes .EQV. .TRUE.) THEN
                   CALL do_general_diag(scf_env, mos, matrix_ks, &
                                        matrix_s, scf_control, scf_section, &
-                                       diis_step, &
-                                       probe)
+                                       diis_step, qs_env=qs_env, probe=probe)
                ELSE
                   CALL do_general_diag(scf_env, mos, matrix_ks, &
                                        matrix_s, scf_control, scf_section, &
-                                       diis_step)
+                                       diis_step, qs_env=qs_env)
                END IF
             END IF
             IF (scf_control%do_diag_sub) THEN
@@ -503,6 +502,11 @@ CONTAINS
          CALL self_consistency_check(rho_ao_kp, scf_env%p_delta, para_env, scf_env%p_mix_new, &
                                      delta=scf_env%iter_delta)
       CASE (no_mixing_nr)
+         IF (.NOT. scf_env%method == ot_method_nr) THEN
+            ! Still compute iter_delta for convergence checking
+            CALL self_consistency_check(rho_ao_kp, scf_env%p_delta, para_env, scf_env%p_mix_new, &
+                                        delta=scf_env%iter_delta)
+         END IF
       CASE DEFAULT
          CALL cp_abort(__LOCATION__, &
                        "unknown scf mixing method: "// &

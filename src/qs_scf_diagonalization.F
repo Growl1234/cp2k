@@ -90,6 +90,7 @@ MODULE qs_scf_diagonalization
    USE qs_diis,                         ONLY: qs_diis_b_calc_err_kp,&
                                               qs_diis_b_info_kp,&
                                               qs_diis_b_step,&
+                                              qs_diis_b_step_ediis,&
                                               qs_diis_b_step_kp
    USE qs_energy_types,                 ONLY: qs_energy_type
    USE qs_environment_types,            ONLY: get_qs_env,&
@@ -153,13 +154,15 @@ CONTAINS
 !> \param scf_control ...
 !> \param scf_section ...
 !> \param diis_step ...
+!> \param total_energy ...
+!> \param ediis_step ...
 !> \par History
 !>      03.2006 created [Joost VandeVondele]
 ! **************************************************************************************************
 
    SUBROUTINE general_eigenproblem(scf_env, mos, matrix_ks, &
                                    matrix_s, scf_control, scf_section, &
-                                   diis_step)
+                                   diis_step, total_energy, ediis_step)
 
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       TYPE(mo_set_type), DIMENSION(:), INTENT(IN)        :: mos
@@ -167,9 +170,12 @@ CONTAINS
       TYPE(scf_control_type), POINTER                    :: scf_control
       TYPE(section_vals_type), POINTER                   :: scf_section
       LOGICAL, INTENT(INOUT)                             :: diis_step
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: total_energy
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: ediis_step
 
       INTEGER                                            :: ispin, nspin
-      LOGICAL                                            :: do_level_shift, owns_ortho, use_jacobi
+      LOGICAL                                            :: do_level_shift, my_ediis_step, &
+                                                            owns_ortho, use_jacobi
       REAL(KIND=dp)                                      :: diis_error, eps_diis
       TYPE(cp_fm_type), POINTER                          :: ortho
       TYPE(dbcsr_type), POINTER                          :: ortho_dbcsr
@@ -183,16 +189,35 @@ CONTAINS
       END DO
 
       eps_diis = scf_control%eps_diis
+      my_ediis_step = .FALSE.
 
       IF (scf_env%iter_count > 1 .AND. .NOT. scf_env%skip_diis) THEN
-         CALL qs_diis_b_step(scf_env%scf_diis_buffer, mos, scf_env%scf_work1, &
-                             scf_env%scf_work2, scf_env%iter_delta, diis_error, diis_step, &
-                             eps_diis, scf_control%nmixing, &
-                             s_matrix=matrix_s, &
-                             scf_section=scf_section)
+         IF (scf_control%ediis_enabled .AND. PRESENT(total_energy)) THEN
+            ! EDIIS path: automatic EDIIS/DIIS selection
+            CALL qs_diis_b_step_ediis(scf_env%scf_diis_buffer, mos, &
+                                      scf_env%scf_work1, scf_env%scf_work2, &
+                                      scf_env%iter_delta, diis_error, &
+                                      diis_step, my_ediis_step, &
+                                      scf_control%nmixing, &
+                                      s_matrix=matrix_s, &
+                                      scf_section=scf_section, &
+                                      total_energy=total_energy, &
+                                      ediis_method=scf_control%ediis_method)
+         ELSE
+            ! Original DIIS path
+            CALL qs_diis_b_step(scf_env%scf_diis_buffer, mos, scf_env%scf_work1, &
+                                scf_env%scf_work2, scf_env%iter_delta, diis_error, &
+                                diis_step, eps_diis, scf_control%nmixing, &
+                                s_matrix=matrix_s, &
+                                scf_section=scf_section)
+            my_ediis_step = .FALSE.
+         END IF
       ELSE
          diis_step = .FALSE.
+         my_ediis_step = .FALSE.
       END IF
+
+      IF (PRESENT(ediis_step)) ediis_step = my_ediis_step
 
       do_level_shift = ((scf_control%level_shift /= 0.0_dp) .AND. &
                         ((scf_control%density_guess == core_guess) .OR. &
@@ -205,7 +230,14 @@ CONTAINS
          use_jacobi = .FALSE.
       END IF
 
-      IF (diis_step) THEN
+      IF (my_ediis_step) THEN
+         scf_env%iter_param = diis_error
+         IF (use_jacobi) THEN
+            scf_env%iter_method = "EDIIS/Jacobi"
+         ELSE
+            scf_env%iter_method = "EDIIS/Diag."
+         END IF
+      ELSE IF (diis_step) THEN
          scf_env%iter_param = diis_error
          IF (use_jacobi) THEN
             scf_env%iter_method = "DIIS/Jacobi"
@@ -365,11 +397,12 @@ CONTAINS
 !> \param scf_control ...
 !> \param scf_section ...
 !> \param diis_step ...
+!> \param qs_env ...
 !> \param probe ...
 ! **************************************************************************************************
    SUBROUTINE do_general_diag(scf_env, mos, matrix_ks, &
                               matrix_s, scf_control, scf_section, &
-                              diis_step, probe)
+                              diis_step, qs_env, probe)
 
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       TYPE(mo_set_type), DIMENSION(:), INTENT(INOUT)     :: mos
@@ -377,13 +410,25 @@ CONTAINS
       TYPE(scf_control_type), POINTER                    :: scf_control
       TYPE(section_vals_type), POINTER                   :: scf_section
       LOGICAL, INTENT(INOUT)                             :: diis_step
+      TYPE(qs_environment_type), OPTIONAL, POINTER       :: qs_env
       TYPE(hairy_probes_type), DIMENSION(:), OPTIONAL, &
          POINTER                                         :: probe
 
       INTEGER                                            :: ispin, nspin
       REAL(KIND=dp)                                      :: total_zeff_corr
+      TYPE(qs_energy_type), POINTER                      :: energy
 
       nspin = SIZE(matrix_ks)
+
+      IF (scf_control%ediis_enabled .AND. PRESENT(qs_env)) THEN
+         CALL get_qs_env(qs_env, energy=energy)
+         CALL general_eigenproblem(scf_env, mos, matrix_ks, &
+                                   matrix_s, scf_control, scf_section, diis_step, &
+                                   total_energy=energy%total)
+      ELSE
+         CALL general_eigenproblem(scf_env, mos, matrix_ks, &
+                                   matrix_s, scf_control, scf_section, diis_step)
+      END IF
 
       CALL general_eigenproblem(scf_env, mos, matrix_ks, &
                                 matrix_s, scf_control, scf_section, diis_step)

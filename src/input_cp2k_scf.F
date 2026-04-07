@@ -47,9 +47,9 @@ MODULE input_cp2k_scf
         outer_scf_optimizer_diis, outer_scf_optimizer_newton, outer_scf_optimizer_newton_ls, &
         outer_scf_optimizer_none, outer_scf_optimizer_sd, outer_scf_optimizer_secant, &
         outer_scf_s2_constraint, radius_covalent, radius_default, radius_single, radius_user, &
-        radius_vdw, random_guess, restart_guess, shape_function_density, shape_function_gaussian, &
-        smear_energy_window, smear_fermi_dirac, smear_gaussian, smear_list, smear_mp, smear_mv, &
-        sparse_guess
+        radius_vdw, random_guess, restart_guess, scf_diis_method_adiis, scf_diis_method_ediis, &
+        shape_function_density, shape_function_gaussian, smear_energy_window, smear_fermi_dirac, &
+        smear_gaussian, smear_list, smear_mp, smear_mv, sparse_guess
    USE input_keyword_types,             ONLY: keyword_create,&
                                               keyword_release,&
                                               keyword_type
@@ -203,6 +203,30 @@ CONTAINS
                           usage="EPS_DIIS 5.0e-2", default_r_val=0.1_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
+
+      ! EDIIS subsection
+      CALL section_create(subsection, __LOCATION__, name="EDIIS", &
+                          description="Enable Energy-DIIS (EDIIS) convergence acceleration. "// &
+                          "When active, EDIIS handles initial SCF convergence and automatically "// &
+                          "switches to Pulay DIIS near convergence. No density mixing is needed. "// &
+                          "EPS_DIIS is ignored (switching is automatic). "// &
+                          "Requires SMEAR for metallic/transition-metal systems.", &
+                          repeats=.FALSE.)
+
+      CALL keyword_create(keyword, __LOCATION__, name="METHOD", &
+                          description="Energy function used for EDIIS coefficient optimization.", &
+                          usage="METHOD EDIIS", &
+                          default_i_val=scf_diis_method_ediis, &
+                          enum_c_vals=s2a("EDIIS", "ADIIS"), &
+                          enum_desc=s2a( &
+                          "Energy-DIIS (Kudin, Scuseria, Cances, JCP 116, 8255, 2002)", &
+                          "Augmented Roothaan-Hall DIIS (Hu, Yang, JCP 132, 054109, 2010)"), &
+                          enum_i_vals=[scf_diis_method_ediis, scf_diis_method_adiis])
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
 
       CALL keyword_create( &
          keyword, __LOCATION__, name="SCF_GUESS", &

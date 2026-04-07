@@ -52,6 +52,7 @@ MODULE qs_diis
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
    USE dm_ls_scf_types,                 ONLY: ls_scf_env_type
+   USE input_constants,                 ONLY: scf_diis_method_ediis
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_string_length,&
                                               dp
@@ -87,7 +88,8 @@ MODULE qs_diis
              qs_diis_b_create_kp, &
              qs_diis_b_step_kp, &
              qs_diis_b_calc_err_kp, &
-             qs_diis_b_info_kp
+             qs_diis_b_info_kp, &
+             qs_diis_b_step_ediis
 
 CONTAINS
 
@@ -1271,4 +1273,658 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE qs_diis_b_step_kp
+
+! **************************************************************************************************
+!> \brief EDIIS+DIIS step with automatic switching.
+!>        Replaces qs_diis_b_step when EDIIS is enabled.
+!>        Stores F, D, E each iteration; builds both EDIIS and DIIS B-matrices;
+!>        automatically selects the better method each step.
+!> \param diis_buffer DIIS buffer (extended with density/energy arrays)
+!> \param mo_array    MO sets (contains C, occ from PREVIOUS diagonalization)
+!> \param kc          KS matrix (in/out: on exit, the EDIIS/DIIS mixed KS)
+!> \param sc          work matrix
+!> \param delta       density change from last iteration
+!> \param error_max   (out) max element of commutator
+!> \param diis_step   (out) TRUE if DIIS was selected
+!> \param ediis_step  (out) TRUE if EDIIS was selected
+!> \param nmixing     min iterations before any acceleration
+!> \param s_matrix    overlap matrix (optional, for non-orthogonal basis)
+!> \param scf_section input section for print control
+!> \param total_energy current total energy E(D_{k-1})
+!> \param ediis_method scf_diis_method_ediis or scf_diis_method_adiis
+! **************************************************************************************************
+   SUBROUTINE qs_diis_b_step_ediis(diis_buffer, mo_array, kc, sc, delta, error_max, &
+                                   diis_step, ediis_step, nmixing, s_matrix, &
+                                   scf_section, total_energy, ediis_method)
+
+      TYPE(qs_diis_buffer_type), POINTER                 :: diis_buffer
+      TYPE(mo_set_type), DIMENSION(:), INTENT(IN)        :: mo_array
+      TYPE(cp_fm_type), DIMENSION(:), POINTER            :: kc
+      TYPE(cp_fm_type), INTENT(IN)                       :: sc
+      REAL(KIND=dp), INTENT(IN)                          :: delta
+      REAL(KIND=dp), INTENT(OUT)                         :: error_max
+      LOGICAL, INTENT(OUT)                               :: diis_step, ediis_step
+      INTEGER, INTENT(IN), OPTIONAL                      :: nmixing
+      TYPE(dbcsr_p_type), DIMENSION(:), OPTIONAL, &
+         POINTER                                         :: s_matrix
+      TYPE(section_vals_type), POINTER                   :: scf_section
+      REAL(KIND=dp), INTENT(IN)                          :: total_energy
+      INTEGER, INTENT(IN)                                :: ediis_method
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_diis_b_step_ediis'
+
+      INTEGER                                            :: handle, homo, ib, ib_prev, ispin, jb, &
+                                                            my_nmixing, nao, nb, nmo, nspin, &
+                                                            output_unit
+      REAL(KIND=dp)                                      :: maxocc, tmp
+      REAL(KIND=dp), ALLOCATABLE                         :: b_diis(:, :), b_ediis(:, :), c_diis(:), &
+                                                            c_ediis(:), e_vec(:), t_mat(:, :)
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: occa
+      TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
+      TYPE(cp_fm_type), POINTER                          :: c, new_errors, old_errors, parameters
+      TYPE(cp_logger_type), POINTER                      :: logger
+
+      CALL timeset(routineN, handle)
+
+      nspin = SIZE(mo_array)
+      diis_step = .FALSE.
+      ediis_step = .FALSE.
+
+      my_nmixing = 2
+      IF (PRESENT(nmixing)) my_nmixing = nmixing
+
+      NULLIFY (c, new_errors, old_errors, parameters, matrix_struct)
+      logger => cp_get_default_logger()
+
+      IF (diis_buffer%nbuffer < 1) THEN
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      ! --- Allocate EDIIS-specific arrays if needed ---
+      CALL cp_fm_get_info(kc(1), matrix_struct=matrix_struct)
+      CALL qs_diis_b_check_i_alloc(diis_buffer, matrix_struct=matrix_struct, &
+                                   nspin=nspin, scf_section=scf_section)
+      ! Also allocate EDIIS arrays (density, energy, b_matrix_ediis)
+      CALL qs_diis_b_check_i_alloc_ediis(diis_buffer, matrix_struct, nspin)
+
+      ! --- Buffer index management (cyclic queue) ---
+      ib = MODULO(diis_buffer%ncall, diis_buffer%nbuffer) + 1
+      diis_buffer%ncall = diis_buffer%ncall + 1
+      nb = MIN(diis_buffer%ncall, diis_buffer%nbuffer)
+
+      ! --- Store current KS matrix, density matrix, and energy ---
+      DO ispin = 1, nspin
+         ! Store KS matrix F_k
+         CALL cp_fm_to_fm(kc(ispin), diis_buffer%param(ib, ispin))
+
+         ! Store density matrix D_{k-1} (from current MOs)
+         ! D = C * diag(occ) * C^T
+         CALL get_mo_set(mo_set=mo_array(ispin), nao=nao, nmo=nmo, homo=homo, &
+                         mo_coeff=c, occupation_numbers=occa, maxocc=maxocc)
+         CALL cp_fm_set_all(diis_buffer%density(ib, ispin), 0.0_dp)
+         ! sc = C scaled by sqrt(occ) ... actually we need D = C*occ*C^T
+         ! Use sc as work: sc = C, scale columns by occ, then D = sc * C^T
+         CALL cp_fm_to_fm(c, sc)
+         CALL cp_fm_column_scale(sc, occa(1:homo))
+         CALL parallel_gemm("N", "T", nao, nao, homo, maxocc, sc, c, &
+                            0.0_dp, diis_buffer%density(ib, ispin))
+      END DO
+
+      ! Store energy
+      diis_buffer%energy(ib) = total_energy
+
+      ! --- Compute commutator error [F, D*S] for DIIS ---
+      error_max = 0.0_dp
+      DO ispin = 1, nspin
+         CALL get_mo_set(mo_set=mo_array(ispin), nao=nao, nmo=nmo, homo=homo, &
+                         mo_coeff=c, occupation_numbers=occa, maxocc=maxocc)
+
+         new_errors => diis_buffer%error(ib, ispin)
+         parameters => diis_buffer%param(ib, ispin)
+
+         ! KC <- K*C
+         CALL cp_fm_symm("L", "U", nao, homo, maxocc, parameters, c, 0.0_dp, kc(ispin))
+
+         IF (PRESENT(s_matrix)) THEN
+            CALL copy_dbcsr_to_fm(s_matrix(1)%matrix, new_errors)
+            CALL cp_fm_symm("L", "U", nao, homo, 2.0_dp, new_errors, c, 0.0_dp, sc)
+            CALL parallel_gemm("N", "T", nao, nao, homo, 1.0_dp, sc, kc(ispin), &
+                               0.0_dp, new_errors)
+            CALL parallel_gemm("N", "T", nao, nao, homo, 1.0_dp, kc(ispin), sc, &
+                               -1.0_dp, new_errors)
+         ELSE
+            CALL parallel_gemm("N", "T", nao, nao, homo, 1.0_dp, c, kc(ispin), &
+                               0.0_dp, new_errors)
+            CALL parallel_gemm("N", "T", nao, nao, homo, 1.0_dp, kc(ispin), c, &
+                               -1.0_dp, new_errors)
+         END IF
+
+         CALL cp_fm_maxabsval(new_errors, tmp)
+         error_max = MAX(error_max, tmp)
+      END DO
+
+      ! --- Build cross-trace matrix T(i,j) = sum_spin Tr(F_i * D_j) ---
+      ALLOCATE (t_mat(nb, nb))
+      t_mat = 0.0_dp
+
+      ! Only need to compute new entries involving ib
+      DO jb = 1, nb
+         DO ispin = 1, nspin
+            ! T(ib, jb) = Tr(F_ib * D_jb)
+            CALL cp_fm_trace(diis_buffer%param(ib, ispin), &
+                             diis_buffer%density(jb, ispin), tmp)
+            t_mat(ib, jb) = t_mat(ib, jb) + tmp
+
+            IF (jb /= ib) THEN
+               ! T(jb, ib) = Tr(F_jb * D_ib)
+               CALL cp_fm_trace(diis_buffer%param(jb, ispin), &
+                                diis_buffer%density(ib, ispin), tmp)
+               t_mat(jb, ib) = t_mat(jb, ib) + tmp
+            END IF
+         END DO
+      END DO
+
+      ! Fill remaining T entries from stored values
+      ! (entries not involving ib were computed in previous steps)
+      DO jb = 1, nb
+         IF (jb == ib) CYCLE
+         DO ispin = 1, nspin
+            ! Recompute — could also cache, but nb is small
+            DO ib_prev = 1, nb
+               IF (ib_prev == ib .OR. ib_prev == jb) CYCLE
+               IF (t_mat(ib_prev, jb) == 0.0_dp) THEN
+                  CALL cp_fm_trace(diis_buffer%param(ib_prev, ispin), &
+                                   diis_buffer%density(jb, ispin), tmp)
+                  t_mat(ib_prev, jb) = t_mat(ib_prev, jb) + tmp
+               END IF
+            END DO
+         END DO
+      END DO
+
+      ! --- Build EDIIS B-matrix ---
+      ALLOCATE (b_ediis(nb, nb), e_vec(nb))
+
+      ! Map buffer indices to contiguous 1..nb
+      ! For simplicity, work with the buffer slots that are occupied
+      ! Build index mapping
+      CALL build_ediis_b_matrix(t_mat, diis_buffer%energy, nb, ib, &
+                                b_ediis, e_vec, ediis_method)
+
+      ! --- Build DIIS B-matrix (commutator inner products) ---
+      ALLOCATE (b_diis(nb, nb))
+      b_diis = 0.0_dp
+
+      ! Update B-matrix entries involving ib
+      DO jb = 1, nb
+         b_diis(jb, ib) = 0.0_dp
+         DO ispin = 1, nspin
+            old_errors => diis_buffer%error(jb, ispin)
+            new_errors => diis_buffer%error(ib, ispin)
+            CALL cp_fm_trace(old_errors, new_errors, tmp)
+            b_diis(jb, ib) = b_diis(jb, ib) + tmp
+         END DO
+         b_diis(ib, jb) = b_diis(jb, ib)
+      END DO
+
+      ! Fill other entries from stored b_matrix
+      DO jb = 1, nb
+         DO ib_prev = 1, nb
+            IF (ib_prev == ib .OR. jb == ib) CYCLE
+            b_diis(ib_prev, jb) = diis_buffer%b_matrix(ib_prev, jb)
+         END DO
+      END DO
+
+      ! Store updated DIIS B-matrix
+      DO jb = 1, nb
+         diis_buffer%b_matrix(jb, ib) = b_diis(jb, ib)
+         diis_buffer%b_matrix(ib, jb) = b_diis(ib, jb)
+      END DO
+
+      ! --- Select EDIIS or DIIS ---
+      ALLOCATE (c_ediis(nb), c_diis(nb))
+
+      IF (diis_buffer%ncall >= my_nmixing) THEN
+         CALL select_ediis_or_diis(b_ediis, b_diis, e_vec, nb, ib, &
+                                   c_ediis, c_diis, diis_step, ediis_step)
+      ELSE
+         ! Too few iterations, just use latest matrix
+         diis_step = .FALSE.
+         ediis_step = .FALSE.
+      END IF
+
+      ! --- Apply coefficients to build mixed KS matrix ---
+      IF (ediis_step) THEN
+         DO ispin = 1, nspin
+            CALL cp_fm_set_all(kc(ispin), 0.0_dp)
+            DO jb = 1, nb
+               CALL cp_fm_scale_and_add(1.0_dp, kc(ispin), c_ediis(jb), &
+                                        diis_buffer%param(jb, ispin))
+            END DO
+         END DO
+      ELSE IF (diis_step) THEN
+         DO ispin = 1, nspin
+            CALL cp_fm_set_all(kc(ispin), 0.0_dp)
+            DO jb = 1, nb
+               CALL cp_fm_scale_and_add(1.0_dp, kc(ispin), c_diis(jb), &
+                                        diis_buffer%param(jb, ispin))
+            END DO
+         END DO
+      ELSE
+         ! Not enough data yet — use current KS matrix (already in kc)
+         DO ispin = 1, nspin
+            CALL cp_fm_to_fm(diis_buffer%param(ib, ispin), kc(ispin))
+         END DO
+      END IF
+
+      ! --- Compute iter_delta (density change) for output ---
+      ! Compare current density with previous
+      IF (nb >= 2) THEN
+         ib_prev = MODULO(diis_buffer%ncall - 2, diis_buffer%nbuffer) + 1
+         ! iter_delta is set by caller from p_mix_new comparison,
+         ! but we provide error_max from commutator for convergence check
+      END IF
+
+      ! --- Print info ---
+      output_unit = cp_print_key_unit_nr(logger, scf_section, "PRINT%DIIS_INFO", &
+                                         extension=".scfLog")
+      IF (output_unit > 0) THEN
+         IF (ediis_step) THEN
+            WRITE (UNIT=output_unit, FMT="(T9,A,ES12.3)") &
+               "EDIIS step, max commutator: ", error_max
+         ELSE IF (diis_step) THEN
+            WRITE (UNIT=output_unit, FMT="(T9,A,ES12.3)") &
+               "DIIS step, max commutator: ", error_max
+         END IF
+      END IF
+      CALL cp_print_key_finished_output(output_unit, logger, scf_section, &
+                                        "PRINT%DIIS_INFO")
+
+      DEALLOCATE (t_mat, b_ediis, b_diis, e_vec, c_ediis, c_diis)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE qs_diis_b_step_ediis
+
+! **************************************************************************************************
+!> \brief Allocate EDIIS-specific arrays in the DIIS buffer
+!> \param diis_buffer ...
+!> \param matrix_struct ...
+!> \param nspin ...
+! **************************************************************************************************
+   SUBROUTINE qs_diis_b_check_i_alloc_ediis(diis_buffer, matrix_struct, nspin)
+      TYPE(qs_diis_buffer_type), INTENT(INOUT)           :: diis_buffer
+      TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
+      INTEGER, INTENT(IN)                                :: nspin
+
+      INTEGER                                            :: ibuffer, ispin, nbuffer
+
+      nbuffer = diis_buffer%nbuffer
+
+      IF (.NOT. ASSOCIATED(diis_buffer%density)) THEN
+         ALLOCATE (diis_buffer%density(nbuffer, nspin))
+         DO ispin = 1, nspin
+            DO ibuffer = 1, nbuffer
+               CALL cp_fm_create(diis_buffer%density(ibuffer, ispin), &
+                                 name="ediis_density", matrix_struct=matrix_struct)
+            END DO
+         END DO
+      END IF
+
+      IF (.NOT. ASSOCIATED(diis_buffer%energy)) THEN
+         ALLOCATE (diis_buffer%energy(nbuffer))
+         diis_buffer%energy = 0.0_dp
+      END IF
+
+   END SUBROUTINE qs_diis_b_check_i_alloc_ediis
+
+! **************************************************************************************************
+!> \brief Build the EDIIS or ADIIS B-matrix and energy vector from cross-traces
+!> \param t_mat   Cross-trace matrix T(i,j) = sum_spin Tr(F_i * D_j)
+!> \param energies Stored total energies
+!> \param nb      Number of active buffer entries
+!> \param ib      Index of latest entry
+!> \param b_out   (out) B-matrix for QP
+!> \param e_out   (out) Energy/gradient vector for QP
+!> \param method  EDIIS or ADIIS selector
+! **************************************************************************************************
+   SUBROUTINE build_ediis_b_matrix(t_mat, energies, nb, ib, b_out, e_out, method)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: t_mat
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: energies
+      INTEGER, INTENT(IN)                                :: nb, ib
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: b_out
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: e_out
+      INTEGER, INTENT(IN)                                :: method
+
+      INTEGER                                            :: i, j
+
+      IF (method == scf_diis_method_ediis) THEN
+         ! EDIIS: f = sum_i c_i E_i - 1/2 sum_ij c_i c_j B_ij
+         ! B_ij = -[T_ii + T_jj - T_ij - T_ji]
+         ! where T_ij = Tr(F_i * D_j)
+         DO j = 1, nb
+            DO i = 1, nb
+               b_out(i, j) = -(t_mat(i, i) + t_mat(j, j) - t_mat(i, j) - t_mat(j, i))
+            END DO
+         END DO
+         e_out(1:nb) = energies(1:nb)
+
+      ELSE  ! scf_diis_method_adiis
+         ! ADIIS: expand around latest point n=ib
+         ! f = E(D_n) + sum_i c_i * 2*(T_ni - T_nn) + sum_ij c_i c_j * (T_ji - T_ni - T_jn + T_nn)
+         ! E vector: e_i = 2*(T_ni - T_nn)   [T_ni = Tr(F_n * D_i)]
+         ! B matrix: B_ij = T_ji - T_ni - T_jn + T_nn
+         DO i = 1, nb
+            e_out(i) = 2.0_dp*(t_mat(ib, i) - t_mat(ib, ib))
+         END DO
+         DO j = 1, nb
+            DO i = 1, nb
+               b_out(i, j) = t_mat(j, i) - t_mat(ib, i) - t_mat(j, ib) + t_mat(ib, ib)
+            END DO
+         END DO
+      END IF
+
+   END SUBROUTINE build_ediis_b_matrix
+
+! **************************************************************************************************
+!> \brief Automatic selection between EDIIS and DIIS coefficients.
+!>        Computes both sets of coefficients, picks the better one based on
+!>        the EDIIS energy function. Includes force_progress for EDIIS.
+!> \param b_ediis ...
+!> \param b_diis ...
+!> \param e_vec ...
+!> \param nb ...
+!> \param ib ...
+!> \param c_ediis ...
+!> \param c_diis ...
+!> \param diis_step ...
+!> \param ediis_step ...
+! **************************************************************************************************
+   SUBROUTINE select_ediis_or_diis(b_ediis, b_diis, e_vec, nb, ib, &
+                                   c_ediis, c_diis, diis_step, ediis_step)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: b_ediis, b_diis
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: e_vec
+      INTEGER, INTENT(IN)                                :: nb, ib
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: c_ediis, c_diis
+      LOGICAL, INTENT(OUT)                               :: diis_step, ediis_step
+
+      REAL(KIND=dp), PARAMETER :: eigenvalue_threshold = 1.0E-12_dp
+
+      LOGICAL                                            :: diis_ok
+      REAL(KIND=dp)                                      :: f_diis_on_ediis, f_ediis_val, max_neg
+
+      diis_step = .FALSE.
+      ediis_step = .FALSE.
+
+      ! --- 1. Solve EDIIS (constrained QP: c_i >= 0, sum = 1) ---
+      CALL solve_constrained_qp(e_vec, b_ediis, nb, c_ediis, f_ediis_val)
+
+      ! Force progress if latest matrix gets zero weight
+      IF (c_ediis(ib) < 1.0E-3_dp) THEN
+         CALL force_progress(e_vec, b_ediis, nb, ib, c_ediis)
+         ! Recompute f_ediis_val
+         f_ediis_val = DOT_PRODUCT(e_vec(1:nb), c_ediis(1:nb)) - &
+                       0.5_dp*DOT_PRODUCT(c_ediis(1:nb), MATMUL(b_ediis(1:nb, 1:nb), c_ediis(1:nb)))
+      END IF
+
+      ! --- 2. Solve standard DIIS (Lagrange multiplier, no sign constraint) ---
+      CALL solve_diis_system(b_diis, nb, c_diis, diis_ok)
+
+      ! --- 3. Select ---
+      IF (.NOT. diis_ok .OR. nb < 3) THEN
+         ! DIIS system singular or too few vectors
+         ediis_step = .TRUE.
+         RETURN
+      END IF
+
+      ! Check DIIS coefficients for wild extrapolation
+      max_neg = MINVAL(c_diis(1:nb))
+      IF (max_neg < -1.0_dp .OR. MAXVAL(c_diis(1:nb)) > 3.0_dp) THEN
+         ! DIIS extrapolating too aggressively
+         ediis_step = .TRUE.
+         RETURN
+      END IF
+
+      ! Evaluate DIIS coefficients on the EDIIS energy function
+      f_diis_on_ediis = DOT_PRODUCT(e_vec(1:nb), c_diis(1:nb)) - &
+                        0.5_dp*DOT_PRODUCT(c_diis(1:nb), MATMUL(b_ediis(1:nb, 1:nb), c_diis(1:nb)))
+
+      IF (f_ediis_val <= f_diis_on_ediis) THEN
+         ediis_step = .TRUE.
+      ELSE
+         diis_step = .TRUE.
+      END IF
+
+   END SUBROUTINE select_ediis_or_diis
+
+! **************************************************************************************************
+!> \brief Solve the constrained QP: min E.c - 1/2 c^T B c, s.t. c>=0, sum(c)=1
+!>        Uses exhaustive enumeration of active constraint subsets.
+!>        Practical for nb <= 12 (2^12 = 4096 subsets).
+!> \param e_vec ...
+!> \param b_mat ...
+!> \param nb ...
+!> \param coeffs ...
+!> \param obj_val ...
+! **************************************************************************************************
+   SUBROUTINE solve_constrained_qp(e_vec, b_mat, nb, coeffs, obj_val)
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: e_vec
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: b_mat
+      INTEGER, INTENT(IN)                                :: nb
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: coeffs
+      REAL(KIND=dp), INTENT(OUT)                         :: obj_val
+
+      INTEGER                                            :: i, imask, info, j, nb1, nfree
+      INTEGER, ALLOCATABLE                               :: ipiv(:)
+      INTEGER                                            :: free_idx(nb)
+      LOGICAL                                            :: feasible
+      REAL(KIND=dp)                                      :: best_coeffs(nb), best_obj, trial_c(nb), &
+                                                            trial_obj
+      REAL(KIND=dp), ALLOCATABLE                         :: a_sys(:, :), rhs(:)
+
+      best_obj = HUGE(1.0_dp)
+      best_coeffs = 0.0_dp
+      ! Fallback: equal weights
+      best_coeffs(1:nb) = 1.0_dp/REAL(nb, dp)
+      best_obj = DOT_PRODUCT(e_vec(1:nb), best_coeffs(1:nb)) - &
+                 0.5_dp*DOT_PRODUCT(best_coeffs(1:nb), MATMUL(b_mat(1:nb, 1:nb), best_coeffs(1:nb)))
+
+      ! Enumerate all 2^nb - 1 non-empty subsets of free variables
+      DO imask = 1, 2**nb - 1
+         nfree = 0
+         DO i = 1, nb
+            IF (BTEST(imask, i - 1)) THEN
+               nfree = nfree + 1
+               free_idx(nfree) = i
+            END IF
+         END DO
+
+         ! Solve Lagrange system for free variables:
+         ! [ B_free  1 ] [ c_free ]   [ E_free ]
+         ! [ 1^T    0 ] [ lambda ] = [ 1      ]
+         nb1 = nfree + 1
+         ALLOCATE (a_sys(nb1, nb1), rhs(nb1), ipiv(nb1))
+
+         DO j = 1, nfree
+            DO i = 1, nfree
+               a_sys(i, j) = b_mat(free_idx(i), free_idx(j))
+            END DO
+            a_sys(nfree + 1, j) = 1.0_dp
+            a_sys(j, nfree + 1) = 1.0_dp
+         END DO
+         a_sys(nb1, nb1) = 0.0_dp
+
+         rhs(1:nfree) = e_vec(free_idx(1:nfree))
+         rhs(nb1) = 1.0_dp
+
+         ! Solve with LAPACK dgesv
+         CALL dgesv(nb1, 1, a_sys, nb1, ipiv, rhs, nb1, info)
+
+         IF (info == 0) THEN
+            ! Check feasibility: all c_free >= 0
+            feasible = .TRUE.
+            DO i = 1, nfree
+               IF (rhs(i) < -1.0E-10_dp) THEN
+                  feasible = .FALSE.
+                  EXIT
+               END IF
+            END DO
+
+            IF (feasible) THEN
+               trial_c = 0.0_dp
+               DO i = 1, nfree
+                  trial_c(free_idx(i)) = MAX(0.0_dp, rhs(i))
+               END DO
+               ! Renormalize (for numerical safety)
+               trial_c = trial_c/SUM(trial_c)
+
+               trial_obj = DOT_PRODUCT(e_vec(1:nb), trial_c(1:nb)) - &
+                           0.5_dp*DOT_PRODUCT(trial_c(1:nb), &
+                                              MATMUL(b_mat(1:nb, 1:nb), trial_c(1:nb)))
+               IF (trial_obj < best_obj) THEN
+                  best_obj = trial_obj
+                  best_coeffs = trial_c
+               END IF
+            END IF
+         END IF
+
+         DEALLOCATE (a_sys, rhs, ipiv)
+      END DO
+
+      coeffs(1:nb) = best_coeffs(1:nb)
+      obj_val = best_obj
+
+   END SUBROUTINE solve_constrained_qp
+
+! **************************************************************************************************
+!> \brief Force progress when EDIIS gives zero weight to the latest matrix.
+!>        Uses pairwise line search starting from c_latest=1, as described
+!>        in Kudin et al. JCP 116, 8255 (2002), Section III.
+!> \param e_vec ...
+!> \param b_mat ...
+!> \param nb ...
+!> \param ib ...
+!> \param coeffs ...
+! **************************************************************************************************
+   SUBROUTINE force_progress(e_vec, b_mat, nb, ib, coeffs)
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: e_vec
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: b_mat
+      INTEGER, INTENT(IN)                                :: nb, ib
+      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: coeffs
+
+      INTEGER                                            :: j
+      REAL(KIND=dp)                                      :: a_coeff, b_coeff, c_coeff, c_j(nb), &
+                                                            c_trial(nb), f0, f1, fhalf, lambda_opt
+
+      ! Start from c_ib = 1
+      c_trial = 0.0_dp
+      c_trial(ib) = 1.0_dp
+
+      ! Pairwise combination with each history vector
+      DO j = nb, 1, -1
+         IF (j == ib) CYCLE
+
+         c_j = 0.0_dp
+         c_j(j) = 1.0_dp
+
+         ! Evaluate f(lambda) = f((1-lambda)*c_trial + lambda*c_j) at 0, 0.5, 1
+         ! f(c) = E.c - 0.5 c^T B c
+         f0 = DOT_PRODUCT(e_vec(1:nb), c_trial(1:nb)) - &
+              0.5_dp*DOT_PRODUCT(c_trial(1:nb), MATMUL(b_mat(1:nb, 1:nb), c_trial(1:nb)))
+         f1 = DOT_PRODUCT(e_vec(1:nb), c_j(1:nb)) - &
+              0.5_dp*DOT_PRODUCT(c_j(1:nb), MATMUL(b_mat(1:nb, 1:nb), c_j(1:nb)))
+
+         c_j = 0.5_dp*c_trial + 0.5_dp*c_j  ! reuse c_j as midpoint
+         fhalf = DOT_PRODUCT(e_vec(1:nb), c_j(1:nb)) - &
+                 0.5_dp*DOT_PRODUCT(c_j(1:nb), MATMUL(b_mat(1:nb, 1:nb), c_j(1:nb)))
+
+         ! Quadratic fit: f(lambda) = a*lambda^2 + b*lambda + c
+         ! f(0) = c_coeff, f(0.5) = a/4 + b/2 + c, f(1) = a + b + c
+         c_coeff = f0
+         a_coeff = 2.0_dp*f0 - 4.0_dp*fhalf + 2.0_dp*f1
+         b_coeff = f1 - f0 - a_coeff
+
+         ! Minimize: lambda_opt = -b/(2a), clamped to [0, 1]
+         IF (ABS(a_coeff) > 1.0E-14_dp) THEN
+            lambda_opt = -b_coeff/(2.0_dp*a_coeff)
+            lambda_opt = MAX(0.0_dp, MIN(1.0_dp, lambda_opt))
+         ELSE IF (f1 < f0) THEN
+            lambda_opt = 1.0_dp
+         ELSE
+            lambda_opt = 0.0_dp
+         END IF
+
+         ! Rebuild c_j as unit vector for slot j
+         c_j = 0.0_dp
+         c_j(j) = 1.0_dp
+
+         ! Update trial
+         c_trial = (1.0_dp - lambda_opt)*c_trial + lambda_opt*c_j
+      END DO
+
+      coeffs(1:nb) = c_trial(1:nb)
+
+   END SUBROUTINE force_progress
+
+! **************************************************************************************************
+!> \brief Solve standard DIIS linear system (Pulay's method).
+!>        [ B  1 ] [ c ]   [ 0 ]
+!>        [ 1  0 ] [ l ] = [ 1 ]
+!>        Uses eigendecomposition with threshold to handle near-singularity.
+!> \param b_mat ...
+!> \param nb ...
+!> \param coeffs ...
+!> \param ok ...
+! **************************************************************************************************
+   SUBROUTINE solve_diis_system(b_mat, nb, coeffs, ok)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: b_mat
+      INTEGER, INTENT(IN)                                :: nb
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: coeffs
+      LOGICAL, INTENT(OUT)                               :: ok
+
+      REAL(KIND=dp), PARAMETER :: eigenvalue_threshold = 1.0E-12_dp
+
+      INTEGER                                            :: jb, nb1
+      REAL(KIND=dp), ALLOCATABLE                         :: a(:, :), b(:, :), ev(:)
+
+      ok = .FALSE.
+      coeffs = 0.0_dp
+
+      IF (nb < 2) THEN
+         coeffs(1) = 1.0_dp
+         RETURN
+      END IF
+
+      nb1 = nb + 1
+      ALLOCATE (a(nb1, nb1), b(nb1, nb1), ev(nb1))
+
+      b(1:nb, 1:nb) = b_mat(1:nb, 1:nb)
+      b(1:nb, nb1) = -1.0_dp
+      b(nb1, 1:nb) = -1.0_dp
+      b(nb1, nb1) = 0.0_dp
+
+      ev = 0.0_dp
+      CALL diamat_all(b(1:nb1, 1:nb1), ev(1:nb1))
+      a(1:nb1, 1:nb1) = b(1:nb1, 1:nb1)
+
+      DO jb = 1, nb1
+         IF (ABS(ev(jb)) < eigenvalue_threshold) THEN
+            a(1:nb1, jb) = 0.0_dp
+         ELSE
+            a(1:nb1, jb) = a(1:nb1, jb)/ev(jb)
+         END IF
+      END DO
+
+      ev(1:nb) = MATMUL(a(1:nb, 1:nb1), b(nb1, 1:nb1))
+      coeffs(1:nb) = -ev(1:nb)
+
+      ! Check if solution is reasonable
+      IF (ABS(SUM(coeffs(1:nb)) - 1.0_dp) < 0.01_dp) THEN
+         ok = .TRUE.
+      END IF
+
+      DEALLOCATE (a, b, ev)
+
+   END SUBROUTINE solve_diis_system
+
 END MODULE qs_diis

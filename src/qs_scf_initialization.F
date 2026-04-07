@@ -418,14 +418,22 @@ CONTAINS
    SUBROUTINE qs_scf_ensure_mixing_store(qs_env, scf_env)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER :: scf_control
 
       TYPE(dft_control_type), POINTER                    :: dft_control
 
       NULLIFY (dft_control)
-      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control)
+      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, scf_control=scf_control)
 
       IF (scf_env%mixing_method > 0) THEN
          CALL mixing_allocate(qs_env, scf_env%mixing_method, scf_env%p_mix_new, &
+                              scf_env%p_delta, dft_control%nspins, &
+                              scf_env%mixing_store)
+      ELSE IF (scf_control%ediis_enabled) THEN
+         ! EDIIS without mixing: still need p_mix_new for density matrix storage
+         ! and p_delta for iter_delta computation.
+         ! Allocate as if direct_mixing, but mixing_store is not used.
+         CALL mixing_allocate(qs_env, direct_mixing_nr, scf_env%p_mix_new, &
                               scf_env%p_delta, dft_control%nspins, &
                               scf_env%mixing_store)
       ELSE
@@ -728,7 +736,9 @@ CONTAINS
       END IF
 
       IF (scf_control%use_diag .AND. scf_env%mixing_method == no_mixing_nr) THEN
-         CPABORT("Diagonalization procedures without mixing are not recommendable")
+         IF (.NOT. scf_control%ediis_enabled) THEN
+            CPABORT("Diagonalization procedures without mixing are not recommendable")
+         END IF
       END IF
 
       IF (scf_env%mixing_method > direct_mixing_nr) THEN
@@ -736,6 +746,15 @@ CONTAINS
          scf_env%p_mix_alpha = scf_env%mixing_store%alpha
          IF (scf_env%mixing_store%beta == 0.0_dp) THEN
             CPABORT("Mixing employing the Kerker damping factor needs BETA /= 0.0")
+         END IF
+      END IF
+
+      ! EDIIS: always enable DIIS buffer, override skip_diis
+      IF (scf_control%ediis_enabled) THEN
+         scf_env%skip_diis = .FALSE.
+         ! Enforce no mixing or error
+         IF (scf_env%mixing_method > no_mixing_nr) THEN
+            CPABORT("EDIIS is incompatible with density mixing.")
          END IF
       END IF
 

@@ -915,7 +915,6 @@ MODULE input_constants
                                                smear_mv = 6
 
    ! Define identifier codes for mixing method
-
    INTEGER, PARAMETER, PUBLIC               :: no_mix = 0, &
                                                direct_p_mix = 1, &
                                                kerker_mix = 2, &
@@ -923,6 +922,11 @@ MODULE input_constants
                                                broy_mix = 4, &
                                                broy_mix_new = 5, &
                                                multisec_mix = 6
+
+   ! SCF DIIS acceleration method
+   INTEGER, PARAMETER, PUBLIC               :: scf_diis_method_pulay = 0, &
+                                               scf_diis_method_ediis = 1, &
+                                               scf_diis_method_adiis = 2
 
    ! FFT library
    ! these might need sync with fft_lib.F

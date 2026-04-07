@@ -27,8 +27,9 @@ MODULE scf_control_types
         outer_scf_ddapc_constraint, outer_scf_none, outer_scf_optimizer_bisect, &
         outer_scf_optimizer_broyden, outer_scf_optimizer_diis, outer_scf_optimizer_newton, &
         outer_scf_optimizer_newton_ls, outer_scf_optimizer_none, outer_scf_optimizer_sd, &
-        outer_scf_optimizer_secant, outer_scf_s2_constraint, smear_energy_window, &
-        smear_fermi_dirac, smear_gaussian, smear_list, smear_mp, smear_mv
+        outer_scf_optimizer_secant, outer_scf_s2_constraint, scf_diis_method_adiis, &
+        scf_diis_method_ediis, scf_diis_method_pulay, smear_energy_window, smear_fermi_dirac, &
+        smear_gaussian, smear_list, smear_mp, smear_mv
    USE input_cp2k_scf,                  ONLY: create_scf_section
    USE input_enumeration_types,         ONLY: enum_i2c,&
                                               enumeration_type
@@ -131,6 +132,8 @@ MODULE scf_control_types
                                                level_shift = -1.0_dp, &
                                                eps_lumos = -1.0_dp, eps_diis = -1.0_dp
       INTEGER                               :: max_iter_lumos = -1, max_diis = -1, nmixing = -1
+      LOGICAL                               :: ediis_enabled = .FALSE.
+      INTEGER                               :: ediis_method = 0   ! 0=pulay, 1=ediis, 2=adiis
       INTEGER                               :: max_scf = -1, max_scf_hist = -1, &
                                                maxl = -1, nkind = -1
       LOGICAL                               :: do_diag_sub = .FALSE., &
@@ -180,6 +183,8 @@ CONTAINS
       scf_control%eps_diis = 0.1_dp
       scf_control%level_shift = 0.0_dp
       scf_control%max_diis = 4
+      scf_control%ediis_enabled = .FALSE.
+      scf_control%ediis_method = scf_diis_method_pulay
       scf_control%max_scf = 50
       scf_control%nmixing = 2
       scf_control%use_cholesky = .TRUE.
@@ -321,8 +326,9 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: added_mos
       LOGICAL                                            :: do_mixing, explicit
       REAL(KIND=dp), DIMENSION(:), POINTER               :: roks_parameter
-      TYPE(section_vals_type), POINTER                   :: mixing_section, outer_scf_section, &
-                                                            scf_section, smear_section
+      TYPE(section_vals_type), POINTER                   :: ediis_section, mixing_section, &
+                                                            outer_scf_section, scf_section, &
+                                                            smear_section
 
       CALL timeset(routineN, handle)
 
@@ -355,6 +361,17 @@ CONTAINS
          END IF
       ELSE
          CALL section_vals_val_get(scf_section, "EPS_DIIS", r_val=scf_control%eps_diis)
+      END IF
+      ! Read EDIIS section
+      NULLIFY (ediis_section)
+      ediis_section => section_vals_get_subs_vals(scf_section, "EDIIS")
+      CALL section_vals_get(ediis_section, explicit=explicit)
+      IF (explicit) THEN
+         scf_control%ediis_enabled = .TRUE.
+         CALL section_vals_val_get(ediis_section, "METHOD", &
+                                   i_val=scf_control%ediis_method)
+         ! Override EPS_DIIS — automatic switching takes over
+         scf_control%eps_diis = HUGE(1.0_dp)
       END IF
       IF (cholesky_flag > 0) THEN
          scf_control%use_cholesky = .TRUE.
@@ -600,6 +617,16 @@ CONTAINS
                   "eps_diis:          ", scf_control%eps_diis, &
                   "eps_eigval:        ", scf_control%eps_eigval, &
                   "level_shift [a.u.]:", scf_control%level_shift
+            END IF
+            IF (scf_control%ediis_enabled) THEN
+               SELECT CASE (scf_control%ediis_method)
+               CASE (scf_diis_method_ediis)
+                  WRITE (UNIT=output_unit, FMT="(T25,A)") &
+                     "EDIIS+DIIS with automatic switching"
+               CASE (scf_diis_method_adiis)
+                  WRITE (UNIT=output_unit, FMT="(T25,A)") &
+                     "ADIIS+DIIS with automatic switching"
+               END SELECT
             END IF
 
             IF (SUM(ABS(scf_control%added_mos)) > 0) THEN
