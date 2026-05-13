@@ -46,6 +46,8 @@ MODULE hfx_types
         dbt_pgrid_destroy, dbt_pgrid_type, dbt_type
    USE hfx_helpers,                     ONLY: count_cells_perd,&
                                               next_image_cell_perd
+   USE hfx_lri_types,                   ONLY: hfx_lri_kp_release,&
+                                              hfx_lri_kp_type
    USE input_constants,                 ONLY: &
         do_hfx_auto_shells, do_potential_coulomb, do_potential_gaussian, do_potential_id, &
         do_potential_long, do_potential_mix_cl, do_potential_mix_cl_trunc, do_potential_mix_lg, &
@@ -475,6 +477,8 @@ MODULE hfx_types
       REAL(dp)       :: dbcsr_time = 0.0_dp
       INTEGER        :: num_pe = 0
       TYPE(hfx_compression_type), DIMENSION(:, :), ALLOCATABLE :: store_3c
+
+      TYPE(hfx_lri_kp_type), POINTER :: lri_kp => NULL()
 
    END TYPE hfx_ri_type
 
@@ -1705,6 +1709,8 @@ CONTAINS
          END DO
          DEALLOCATE (ri_data%iatom_to_subgroup)
       END IF
+
+      CALL hfx_lri_kp_release(ri_data%lri_kp)
 
       CALL timestop(handle)
    END SUBROUTINE hfx_ri_release
