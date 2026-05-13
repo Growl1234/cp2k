@@ -13,6 +13,7 @@ MODULE hfx_lri_kp
    USE basis_set_types,                 ONLY: gto_basis_set_p_type,&
                                               gto_basis_set_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
+   USE cp_control_types,                ONLY: dft_control_type
    USE hfx_lri_types,                   ONLY: hfx_lri_kp_release
    USE hfx_types,                       ONLY: hfx_ri_type
    USE input_constants,                 ONLY: do_potential_short
@@ -22,6 +23,7 @@ MODULE hfx_lri_kp
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_integral_utils,               ONLY: basis_set_list_setup
+   USE qs_interactions,                 ONLY: init_interaction_radii_orb_basis
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_neighbor_list_types,          ONLY: get_iterator_info,&
                                               neighbor_list_iterate,&
@@ -96,8 +98,8 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_pre_scf_kp'
 
       INTEGER :: dbg_iatom, dbg_ikind, dbg_jatom, dbg_jkind, dbg_nao_i, dbg_nao_j, dbg_naux_i, &
-         dbg_naux_j, dbg_naux_pair, handle, iatom, ikind, ilist, jatom, jkind, jneighbor, mepos, &
-         nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, &
+         dbg_naux_j, dbg_naux_pair, handle, iatom, ibasis, ikind, ilist, jatom, jkind, jneighbor, &
+         mepos, nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, &
          npairs_max, npairs_sum
       INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
@@ -109,6 +111,7 @@ CONTAINS
       REAL(dp), DIMENSION(3)                             :: rab
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
@@ -116,7 +119,7 @@ CONTAINS
          POINTER                                         :: soo_list
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (qs_kind_set, soo_list, nl_iterator, para_env)
+      NULLIFY (qs_kind_set, soo_list, nl_iterator, para_env, dft_control)
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
       NULLIFY (basis_set_AO, basis_set_RI)
 
@@ -134,7 +137,8 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind, para_env=para_env)
+      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind, para_env=para_env, &
+                      dft_control=dft_control)
 
       CALL hfx_lri_kp_release(ri_data%lri_kp)
       ALLOCATE (ri_data%lri_kp)
@@ -142,6 +146,19 @@ CONTAINS
       ALLOCATE (basis_set_AO(nkind), basis_set_RI(nkind))
       CALL basis_set_list_setup(basis_set_AO, ri_data%orb_basis_type, qs_kind_set)
       CALL basis_set_list_setup(basis_set_RI, ri_data%ri_basis_type, qs_kind_set)
+
+      ! Use RI-HFX screening radii while building the LRI-HFXk pair list.
+      ! They are restored to the standard QS radii before leaving this routine.
+      DO ibasis = 1, SIZE(basis_set_AO)
+         obas_i => basis_set_AO(ibasis)%gto_basis_set
+         rbas_i => basis_set_RI(ibasis)%gto_basis_set
+         IF (ASSOCIATED(obas_i)) THEN
+            CALL init_interaction_radii_orb_basis(obas_i, ri_data%eps_pgf_orb)
+         END IF
+         IF (ASSOCIATED(rbas_i)) THEN
+            CALL init_interaction_radii_orb_basis(rbas_i, ri_data%eps_pgf_orb)
+         END IF
+      END DO
 
       ! First prototype: AO-AO neighbor list only.
       ! Later this cutoff should be tightened for HSE short-range LRI.
@@ -204,6 +221,20 @@ CONTAINS
 
       CALL neighbor_list_iterator_release(nl_iterator)
       CALL release_neighbor_list_sets(soo_list)
+
+      ! Restore the standard QS screening radii after the LRI-HFXk setup.
+      IF (ASSOCIATED(dft_control)) THEN
+         DO ibasis = 1, SIZE(basis_set_AO)
+            obas_i => basis_set_AO(ibasis)%gto_basis_set
+            rbas_i => basis_set_RI(ibasis)%gto_basis_set
+            IF (ASSOCIATED(obas_i)) THEN
+               CALL init_interaction_radii_orb_basis(obas_i, dft_control%qs_control%eps_pgf_orb)
+            END IF
+            IF (ASSOCIATED(rbas_i)) THEN
+               CALL init_interaction_radii_orb_basis(rbas_i, dft_control%qs_control%eps_pgf_orb)
+            END IF
+         END DO
+      END IF
 
       IF (ASSOCIATED(basis_set_AO)) DEALLOCATE (basis_set_AO)
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
