@@ -1282,6 +1282,12 @@ CONTAINS
 
          IF (x_data(irep, 1)%do_hfx_ri) THEN
 
+            IF (x_data(irep, 1)%ri_data%kp_ri_method == hfx_ri_kp_lri) THEN
+               CALL cp_abort(__LOCATION__, "The LRI-HFX backend is currently only available "// &
+                             "for k-point calculations. Use KPOINTS or select the default "// &
+                             "RI-HFX backend for Gamma-only HFX.")
+            END IF
+
             CALL hfx_ri_update_ks(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
                                   mo_array, rho_ao_orb, &
                                   s_mstruct_changed, nspins, &
