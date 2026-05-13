@@ -42,9 +42,10 @@ MODULE input_cp2k_hfx
    IMPLICIT NONE
    PRIVATE
 
-   LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .FALSE.
-   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'input_cp2k_hfx'
+   LOGICAL, PRIVATE, PARAMETER                :: debug_this_module = .FALSE.
+   CHARACTER(len=*), PARAMETER, PRIVATE       :: moduleN = 'input_cp2k_hfx'
    INTEGER, PARAMETER, PUBLIC                 :: ri_mo = 1, ri_pmat = 2
+   INTEGER, PARAMETER, PUBLIC                 :: hfx_ri_kp_extended = 1, hfx_ri_kp_lri = 2
 
    PUBLIC :: create_hfx_section
 
@@ -585,6 +586,21 @@ CONTAINS
                           "Only valid when doing a mixed potential calculation. "// &
                           "Default if SCALE_LONGRANGE from INTERACTION_POTENTIAL", &
                           usage="SCALE_LONGRANGE 1.0", default_r_val=1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_RI_METHOD", &
+                          description="Selects the RI-HFX backend used for k-point calculations. "// &
+                          "EXTENDED is the current image/extended-RI implementation. "// &
+                          "LRI selects the new pair-local LRI backend. The LRI backend is initially "// &
+                          "a development path for short-range HSE exchange only.", &
+                          usage="KP_RI_METHOD {EXTENDED|LRI}", &
+                          repeats=.FALSE., &
+                          default_i_val=hfx_ri_kp_extended, &
+                          enum_c_vals=s2a("EXTENDED", "LRI"), &
+                          enum_desc=s2a("Current extended-RI k-point HFX backend", &
+                                        "Pair-local LRI k-point HFX backend"), &
+                          enum_i_vals=[hfx_ri_kp_extended, hfx_ri_kp_lri])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
