@@ -100,8 +100,7 @@ CONTAINS
                                                             nlist, nneighbor
       INTEGER(int_8)                                     :: c_nreal
       REAL(dp), DIMENSION(3)                             :: rab
-      TYPE(gto_basis_set_p_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: basis_set_AO, basis_set_RI
+      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
@@ -111,6 +110,7 @@ CONTAINS
 
       NULLIFY (qs_kind_set, soo_list, nl_iterator)
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
+      NULLIFY (basis_set_AO, basis_set_RI)
 
       CALL timeset(routineN, handle)
 
@@ -171,7 +171,8 @@ CONTAINS
       CALL neighbor_list_iterator_release(nl_iterator)
       CALL release_neighbor_list_sets(soo_list)
 
-      DEALLOCATE (basis_set_AO, basis_set_RI)
+      IF (ASSOCIATED(basis_set_AO)) DEALLOCATE (basis_set_AO)
+      IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
       ri_data%lri_kp%c_mem_mib_est = &
          REAL(ri_data%lri_kp%c_nreal_est, KIND=dp)*REAL(dp, KIND=dp)/1024.0_dp**2
