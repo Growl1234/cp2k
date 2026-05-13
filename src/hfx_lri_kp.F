@@ -95,11 +95,15 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_pre_scf_kp'
 
-      INTEGER :: handle, iatom, ikind, ilist, jatom, jkind, jneighbor, mepos, nao_i, nao_j, &
-         naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, npairs_max, npairs_sum
+      INTEGER :: dbg_iatom, dbg_ikind, dbg_jatom, dbg_jkind, dbg_nao_i, dbg_nao_j, dbg_naux_i, &
+         dbg_naux_j, dbg_naux_pair, handle, iatom, ikind, ilist, jatom, jkind, jneighbor, mepos, &
+         nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, &
+         npairs_max, npairs_sum
       INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
          sum_naux_pair_sum
+      INTEGER, DIMENSION(3)                              :: cell_j, dbg_cell
+      LOGICAL                                            :: dbg_pair_found
       REAL(dp)                                           :: c_mem_mib_local, c_mem_mib_max, &
                                                             c_mem_mib_sum
       REAL(dp), DIMENSION(3)                             :: rab
@@ -115,6 +119,18 @@ CONTAINS
       NULLIFY (qs_kind_set, soo_list, nl_iterator, para_env)
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
       NULLIFY (basis_set_AO, basis_set_RI)
+
+      dbg_pair_found = .FALSE.
+      dbg_iatom = 0
+      dbg_jatom = 0
+      dbg_ikind = 0
+      dbg_jkind = 0
+      dbg_nao_i = 0
+      dbg_nao_j = 0
+      dbg_naux_i = 0
+      dbg_naux_j = 0
+      dbg_naux_pair = 0
+      dbg_cell(:) = 0
 
       CALL timeset(routineN, handle)
 
@@ -138,7 +154,7 @@ CONTAINS
 
          CALL get_iterator_info(nl_iterator, mepos=mepos, ikind=ikind, jkind=jkind, &
                                 nlist=nlist, ilist=ilist, nnode=nneighbor, inode=jneighbor, &
-                                iatom=iatom, jatom=jatom, r=rab)
+                                iatom=iatom, jatom=jatom, r=rab, cell=cell_j)
 
          obas_i => basis_set_AO(ikind)%gto_basis_set
          obas_j => basis_set_AO(jkind)%gto_basis_set
@@ -161,6 +177,20 @@ CONTAINS
             naux_pair = naux_i
          ELSE
             naux_pair = naux_i + naux_j
+         END IF
+
+         IF (.NOT. dbg_pair_found) THEN
+            dbg_pair_found = .TRUE.
+            dbg_iatom = iatom
+            dbg_jatom = jatom
+            dbg_ikind = ikind
+            dbg_jkind = jkind
+            dbg_nao_i = nao_i
+            dbg_nao_j = nao_j
+            dbg_naux_i = naux_i
+            dbg_naux_j = naux_j
+            dbg_naux_pair = naux_pair
+            dbg_cell(:) = cell_j(:)
          END IF
 
          c_nreal = INT(nao_i, int_8)*INT(nao_j, int_8)*INT(naux_pair, int_8)
@@ -212,29 +242,42 @@ CONTAINS
 
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk pair-local setup"
-         WRITE (ri_data%unit_nr, "(T4,A,T46,A)") "orbital basis type", TRIM(ri_data%orb_basis_type)
-         WRITE (ri_data%unit_nr, "(T4,A,T46,A)") "RI basis type", TRIM(ri_data%ri_basis_type)
-         WRITE (ri_data%unit_nr, "(/,T4,A)") &
-            "                                   local rank 0          global sum        max per rank"
-         WRITE (ri_data%unit_nr, "(T4,A,T36,I16,T56,I16,T76,I16)") &
-            "number of AO atom pairs", npairs_local, npairs_sum, npairs_max
-         WRITE (ri_data%unit_nr, "(T4,A,T36,I16,T56,I16,T76,I16)") &
-            "sum AO-pair block size", sum_nao_pair_local, sum_nao_pair_sum, sum_nao_pair_max
-         WRITE (ri_data%unit_nr, "(T4,A,T36,I16,T56,I16,T76,I16)") &
-            "sum pair-local aux size", sum_naux_pair_local, sum_naux_pair_sum, sum_naux_pair_max
-         WRITE (ri_data%unit_nr, "(T4,A,T36,ES16.6,T56,ES16.6,T76,ES16.6)") &
-            "estimated C storage / MiB", c_mem_mib_local, c_mem_mib_sum, c_mem_mib_max
+         WRITE (ri_data%unit_nr, "(T4,A,T28,A)") "orbital basis", TRIM(ri_data%orb_basis_type)
+         WRITE (ri_data%unit_nr, "(T4,A,T28,A)") "RI basis", TRIM(ri_data%ri_basis_type)
+         WRITE (ri_data%unit_nr, "(/,T4,A,T30,A,T43,A,T56,A)") &
+            "quantity", "local", "global", "max/rank"
+         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
+            "AO pairs", npairs_local, npairs_sum, npairs_max
+         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
+            "AO-pair size", sum_nao_pair_local, sum_nao_pair_sum, sum_nao_pair_max
+         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
+            "pair aux size", sum_naux_pair_local, sum_naux_pair_sum, sum_naux_pair_max
+         WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
+            "C storage/MiB", c_mem_mib_local, c_mem_mib_sum, c_mem_mib_max
          IF (npairs_sum > 0) THEN
-            WRITE (ri_data%unit_nr, "(T4,A,T36,F16.2,T56,F16.2,T76,F16.2)") &
-               "avg AO-pair block size", &
+            WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
+               "avg AO-pair", &
                REAL(sum_nao_pair_local, KIND=dp)/MAX(1.0_dp, REAL(npairs_local, KIND=dp)), &
                REAL(sum_nao_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
                REAL(sum_nao_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
-            WRITE (ri_data%unit_nr, "(T4,A,T36,F16.2,T56,F16.2,T76,F16.2)") &
-               "avg pair-local aux size", &
+            WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
+               "avg pair aux", &
                REAL(sum_naux_pair_local, KIND=dp)/MAX(1.0_dp, REAL(npairs_local, KIND=dp)), &
                REAL(sum_naux_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
                REAL(sum_naux_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
+         END IF
+         IF (dbg_pair_found) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") "debug local AO pair"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "atoms", dbg_iatom, dbg_jatom
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "kinds", dbg_ikind, dbg_jkind
+            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
+               "cell", dbg_cell
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "AO functions", dbg_nao_i, dbg_nao_j
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
+               "RI functions", dbg_naux_i, dbg_naux_j, dbg_naux_pair
          END IF
       END IF
 
