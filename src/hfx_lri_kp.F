@@ -10,16 +10,27 @@
 !> \author SY Wang (05.2026)
 ! **************************************************************************************************
 MODULE hfx_lri_kp
-   USE basis_set_types,                 ONLY: gto_basis_set_p_type,&
+   USE basis_set_types,                 ONLY: get_gto_basis_set,&
+                                              gto_basis_set_p_type,&
                                               gto_basis_set_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
    USE cp_control_types,                ONLY: dft_control_type
+   USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
+   USE gamma,                           ONLY: init_md_ftable
    USE hfx_lri_types,                   ONLY: hfx_lri_kp_release
    USE hfx_types,                       ONLY: hfx_ri_type
    USE input_constants,                 ONLY: do_potential_short
    USE kinds,                           ONLY: dp,&
                                               int_8
+   USE libint_2c_3c,                    ONLY: eri_2center,&
+                                              eri_3center
+   USE libint_wrapper,                  ONLY: cp_libint_cleanup_2eri,&
+                                              cp_libint_cleanup_3eri,&
+                                              cp_libint_init_2eri,&
+                                              cp_libint_init_3eri,&
+                                              cp_libint_set_contrdepth,&
+                                              cp_libint_t
    USE message_passing,                 ONLY: mp_para_env_type
+   USE orbital_pointers,                ONLY: ncoset
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_integral_utils,               ONLY: basis_set_list_setup
@@ -97,21 +108,22 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_pre_scf_kp'
 
-      INTEGER :: dbg_iatom, dbg_ikind, dbg_jatom, dbg_jkind, dbg_nao_i, dbg_nao_j, dbg_naux_i, &
-         dbg_naux_j, dbg_naux_pair, handle, iatom, ibasis, ikind, ilist, jatom, jkind, jneighbor, &
-         mepos, nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, &
-         npairs_max, npairs_sum
+      INTEGER :: dbg_iatom, dbg_ikind, dbg_jatom, dbg_ji_ncart, dbg_jj_ncart, dbg_jkind, &
+         dbg_m_ncart, dbg_nao_i, dbg_nao_j, dbg_naux_i, dbg_naux_j, dbg_naux_pair, handle, iatom, &
+         ibasis, ikind, ilist, jatom, jkind, jneighbor, mepos, nao_i, nao_j, naux_i, naux_j, &
+         naux_pair, nkind, nlist, nneighbor, npairs_local, npairs_max, npairs_sum
       INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
          sum_naux_pair_sum
       INTEGER, DIMENSION(3)                              :: cell_j, dbg_cell
-      LOGICAL                                            :: dbg_pair_found
+      LOGICAL                                            :: dbg_integrals_done, dbg_pair_found
       REAL(dp)                                           :: c_mem_mib_local, c_mem_mib_max, &
-                                                            c_mem_mib_sum
-      REAL(dp), DIMENSION(3)                             :: rab
+                                                            c_mem_mib_sum, dbg_ji_norm, &
+                                                            dbg_jj_norm, dbg_m_norm
+      REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
-      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
@@ -134,6 +146,14 @@ CONTAINS
       dbg_naux_j = 0
       dbg_naux_pair = 0
       dbg_cell(:) = 0
+      dbg_rab(:) = 0.0_dp
+      dbg_integrals_done = .FALSE.
+      dbg_m_ncart = 0
+      dbg_ji_ncart = 0
+      dbg_jj_ncart = 0
+      dbg_m_norm = 0.0_dp
+      dbg_ji_norm = 0.0_dp
+      dbg_jj_norm = 0.0_dp
 
       CALL timeset(routineN, handle)
 
@@ -208,6 +228,7 @@ CONTAINS
             dbg_naux_j = naux_j
             dbg_naux_pair = naux_pair
             dbg_cell(:) = cell_j(:)
+            dbg_rab(:) = rab(:)
          END IF
 
          c_nreal = INT(nao_i, int_8)*INT(nao_j, int_8)*INT(naux_pair, int_8)
@@ -221,6 +242,13 @@ CONTAINS
 
       CALL neighbor_list_iterator_release(nl_iterator)
       CALL release_neighbor_list_sets(soo_list)
+
+      IF (dbg_pair_found) THEN
+         CALL hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, dbg_ikind, dbg_jkind, &
+                                           dbg_rab, ri_data, dbg_m_ncart, dbg_ji_ncart, &
+                                           dbg_jj_ncart, dbg_m_norm, dbg_ji_norm, dbg_jj_norm)
+         dbg_integrals_done = .TRUE.
+      END IF
 
       ! Restore the standard QS screening radii after the LRI-HFXk setup.
       IF (ASSOCIATED(dft_control)) THEN
@@ -309,11 +337,240 @@ CONTAINS
                "AO functions", dbg_nao_i, dbg_nao_j
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
                "RI functions", dbg_naux_i, dbg_naux_j, dbg_naux_pair
+            IF (dbg_integrals_done) THEN
+               WRITE (ri_data%unit_nr, "(/,T4,A)") "debug pair short-range integrals"
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+                  "metric ncart/norm", dbg_m_ncart, dbg_m_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+                  "3c aux-i ncart/norm", dbg_ji_ncart, dbg_ji_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+                  "3c aux-j ncart/norm", dbg_jj_ncart, dbg_jj_norm
+            END IF
          END IF
       END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE hfx_lri_pre_scf_kp
+
+! **************************************************************************************************
+!> \brief ...
+!> \param basis_set_AO ...
+!> \param basis_set_RI ...
+!> \param ikind ...
+!> \param jkind ...
+!> \param rab ...
+!> \param ri_data ...
+!> \param metric_ncart ...
+!> \param threec_i_ncart ...
+!> \param threec_j_ncart ...
+!> \param metric_norm ...
+!> \param threec_i_norm ...
+!> \param threec_j_norm ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
+                                           metric_ncart, threec_i_ncart, threec_j_ncart, &
+                                           metric_norm, threec_i_norm, threec_j_norm)
+
+      TYPE(gto_basis_set_p_type), DIMENSION(:), &
+         INTENT(IN)                                      :: basis_set_AO, basis_set_RI
+      INTEGER, INTENT(IN)                                :: ikind, jkind
+      REAL(dp), DIMENSION(3), INTENT(IN)                 :: rab
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      INTEGER, INTENT(OUT)                               :: metric_ncart, threec_i_ncart, &
+                                                            threec_j_ncart
+      REAL(dp), INTENT(OUT)                              :: metric_norm, threec_i_norm, threec_j_norm
+
+      INTEGER                                            :: maxl_ai, maxl_aj, maxl_ri, maxl_rj, mmax
+      LOGICAL                                            :: onsite_aux
+      REAL(dp)                                           :: metric_norm2, threec_i_norm2, &
+                                                            threec_j_norm2
+      REAL(dp), DIMENSION(3)                             :: r0
+      TYPE(cp_libint_t)                                  :: lib2, lib3
+      TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
+
+      NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
+
+      obas_i => basis_set_AO(ikind)%gto_basis_set
+      obas_j => basis_set_AO(jkind)%gto_basis_set
+      rbas_i => basis_set_RI(ikind)%gto_basis_set
+      rbas_j => basis_set_RI(jkind)%gto_basis_set
+
+      metric_ncart = 0
+      threec_i_ncart = 0
+      threec_j_ncart = 0
+      metric_norm = 0.0_dp
+      threec_i_norm = 0.0_dp
+      threec_j_norm = 0.0_dp
+
+      IF (.NOT. ASSOCIATED(obas_i)) RETURN
+      IF (.NOT. ASSOCIATED(obas_j)) RETURN
+      IF (.NOT. ASSOCIATED(rbas_i)) RETURN
+      IF (.NOT. ASSOCIATED(rbas_j)) RETURN
+
+      CALL get_gto_basis_set(obas_i, maxl=maxl_ai)
+      CALL get_gto_basis_set(obas_j, maxl=maxl_aj)
+      CALL get_gto_basis_set(rbas_i, maxl=maxl_ri)
+      CALL get_gto_basis_set(rbas_j, maxl=maxl_rj)
+
+      mmax = MAX(maxl_ri + maxl_rj, maxl_ai + maxl_aj + MAX(maxl_ri, maxl_rj))
+      CALL init_md_ftable(nmax=mmax)
+
+      CALL cp_libint_init_2eri(lib2, MAX(maxl_ri, maxl_rj))
+      CALL cp_libint_set_contrdepth(lib2, 1)
+      CALL cp_libint_init_3eri(lib3, MAX(maxl_ai, maxl_aj, maxl_ri, maxl_rj))
+      CALL cp_libint_set_contrdepth(lib3, 1)
+
+      r0(:) = 0.0_dp
+      metric_norm2 = 0.0_dp
+      threec_i_norm2 = 0.0_dp
+      threec_j_norm2 = 0.0_dp
+      onsite_aux = (NORM2(rab) <= 1.0E-12_dp .AND. ikind == jkind)
+
+      CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_i, r0, r0, lib2, ri_data, metric_ncart, &
+                                      metric_norm2)
+      IF (.NOT. onsite_aux) THEN
+         CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_j, r0, rab, lib2, ri_data, metric_ncart, &
+                                         metric_norm2, prefactor=2.0_dp)
+         CALL hfx_lri_accumulate_2c_norm(rbas_j, rbas_j, rab, rab, lib2, ri_data, metric_ncart, &
+                                         metric_norm2)
+      END IF
+
+      CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_i, r0, rab, r0, lib3, ri_data, &
+                                      threec_i_ncart, threec_i_norm2)
+      IF (.NOT. onsite_aux) THEN
+         CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_j, r0, rab, rab, lib3, ri_data, &
+                                         threec_j_ncart, threec_j_norm2)
+      END IF
+
+      CALL cp_libint_cleanup_2eri(lib2)
+      CALL cp_libint_cleanup_3eri(lib3)
+
+      metric_norm = SQRT(metric_norm2)
+      threec_i_norm = SQRT(threec_i_norm2)
+      threec_j_norm = SQRT(threec_j_norm2)
+
+   END SUBROUTINE hfx_lri_debug_pair_integrals
+
+! **************************************************************************************************
+!> \brief ...
+!> \param basis_a ...
+!> \param basis_b ...
+!> \param ra ...
+!> \param rb ...
+!> \param lib ...
+!> \param ri_data ...
+!> \param ncart_total ...
+!> \param norm2_total ...
+!> \param prefactor ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_accumulate_2c_norm(basis_a, basis_b, ra, rb, lib, ri_data, ncart_total, &
+                                         norm2_total, prefactor)
+
+      TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b
+      REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb
+      TYPE(cp_libint_t), INTENT(INOUT)                   :: lib
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      INTEGER, INTENT(INOUT)                             :: ncart_total
+      REAL(dp), INTENT(INOUT)                            :: norm2_total
+      REAL(dp), INTENT(IN), OPTIONAL                     :: prefactor
+
+      INTEGER                                            :: iset, jset, ncoa, ncob, nseta, nsetb
+      INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmin_a, lmin_b, npgf_a, &
+                                                            npgf_b
+      REAL(dp)                                           :: dab, pfac
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sij
+      REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, zeta_a, zeta_b
+
+      CALL get_gto_basis_set(basis_a, lmax=lmax_a, lmin=lmin_a, npgf=npgf_a, nset=nseta, &
+                             pgf_radius=rpgf_a, zet=zeta_a)
+      CALL get_gto_basis_set(basis_b, lmax=lmax_b, lmin=lmin_b, npgf=npgf_b, nset=nsetb, &
+                             pgf_radius=rpgf_b, zet=zeta_b)
+
+      pfac = 1.0_dp
+      IF (PRESENT(prefactor)) pfac = prefactor
+      dab = NORM2(rb - ra)
+
+      DO iset = 1, nseta
+         ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
+         DO jset = 1, nsetb
+            ncob = npgf_b(jset)*ncoset(lmax_b(jset))
+            IF (ncoa*ncob == 0) CYCLE
+            ALLOCATE (sij(ncoa, ncob), SOURCE=0.0_dp)
+            CALL eri_2center(sij, lmin_a(iset), lmax_a(iset), npgf_a(iset), zeta_a(:, iset), &
+                             rpgf_a(:, iset), ra, lmin_b(jset), lmax_b(jset), npgf_b(jset), &
+                             zeta_b(:, jset), rpgf_b(:, jset), rb, dab, lib, ri_data%hfx_pot)
+            ncart_total = ncart_total + SIZE(sij)
+            norm2_total = norm2_total + pfac*SUM(sij*sij)
+            DEALLOCATE (sij)
+         END DO
+      END DO
+
+   END SUBROUTINE hfx_lri_accumulate_2c_norm
+
+! **************************************************************************************************
+!> \brief ...
+!> \param basis_a ...
+!> \param basis_b ...
+!> \param basis_c ...
+!> \param ra ...
+!> \param rb ...
+!> \param rc ...
+!> \param lib ...
+!> \param ri_data ...
+!> \param ncart_total ...
+!> \param norm2_total ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_accumulate_3c_norm(basis_a, basis_b, basis_c, ra, rb, rc, lib, ri_data, &
+                                         ncart_total, norm2_total)
+
+      TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b, basis_c
+      REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb, rc
+      TYPE(cp_libint_t), INTENT(INOUT)                   :: lib
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      INTEGER, INTENT(INOUT)                             :: ncart_total
+      REAL(dp), INTENT(INOUT)                            :: norm2_total
+
+      INTEGER                                            :: iset, jset, kset, ncoa, ncob, ncoc, &
+                                                            nseta, nsetb, nsetc
+      INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmax_c, lmin_a, lmin_b, &
+                                                            lmin_c, npgf_a, npgf_b, npgf_c
+      REAL(dp)                                           :: dab, dac, dbc
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: sijk
+      REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, rpgf_c, zeta_a, zeta_b, &
+                                                            zeta_c
+
+      CALL get_gto_basis_set(basis_a, lmax=lmax_a, lmin=lmin_a, npgf=npgf_a, nset=nseta, &
+                             pgf_radius=rpgf_a, zet=zeta_a)
+      CALL get_gto_basis_set(basis_b, lmax=lmax_b, lmin=lmin_b, npgf=npgf_b, nset=nsetb, &
+                             pgf_radius=rpgf_b, zet=zeta_b)
+      CALL get_gto_basis_set(basis_c, lmax=lmax_c, lmin=lmin_c, npgf=npgf_c, nset=nsetc, &
+                             pgf_radius=rpgf_c, zet=zeta_c)
+
+      dab = NORM2(rb - ra)
+      dac = NORM2(rc - ra)
+      dbc = NORM2(rc - rb)
+
+      DO iset = 1, nseta
+         ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
+         DO jset = 1, nsetb
+            ncob = npgf_b(jset)*ncoset(lmax_b(jset))
+            DO kset = 1, nsetc
+               ncoc = npgf_c(kset)*ncoset(lmax_c(kset))
+               IF (ncoa*ncob*ncoc == 0) CYCLE
+               ALLOCATE (sijk(ncoa, ncob, ncoc), SOURCE=0.0_dp)
+               CALL eri_3center(sijk, lmin_a(iset), lmax_a(iset), npgf_a(iset), zeta_a(:, iset), &
+                                rpgf_a(:, iset), ra, lmin_b(jset), lmax_b(jset), npgf_b(jset), &
+                                zeta_b(:, jset), rpgf_b(:, jset), rb, lmin_c(kset), lmax_c(kset), &
+                                npgf_c(kset), zeta_c(:, kset), rpgf_c(:, kset), rc, dab, dac, dbc, &
+                                lib, ri_data%hfx_pot)
+               ncart_total = ncart_total + SIZE(sijk)
+               norm2_total = norm2_total + SUM(sijk*sijk)
+               DEALLOCATE (sijk)
+            END DO
+         END DO
+      END DO
+
+   END SUBROUTINE hfx_lri_accumulate_3c_norm
 
 END MODULE hfx_lri_kp
