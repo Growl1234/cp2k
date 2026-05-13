@@ -1,0 +1,43 @@
+!--------------------------------------------------------------------------------------------------!
+!   CP2K: A general program to perform molecular dynamics simulations                              !
+!   Copyright 2000-2026 CP2K developers group <https://cp2k.org>                                   !
+!                                                                                                  !
+!   SPDX-License-Identifier: GPL-2.0-or-later                                                      !
+!--------------------------------------------------------------------------------------------------!
+
+MODULE hfx_lri_types
+   USE kinds,                           ONLY: dp,&
+                                              int_8
+
+   IMPLICIT NONE
+   PRIVATE
+
+   PUBLIC :: hfx_lri_kp_type, hfx_lri_kp_release
+
+   TYPE hfx_lri_kp_type
+      LOGICAL :: initialized = .FALSE.
+
+      INTEGER :: npairs = 0
+
+      INTEGER(int_8) :: sum_nao_pair = 0_int_8
+      INTEGER(int_8) :: sum_naux_pair = 0_int_8
+      INTEGER(int_8) :: c_nreal_est = 0_int_8
+
+      REAL(dp) :: c_mem_mib_est = 0.0_dp
+   END TYPE hfx_lri_kp_type
+
+CONTAINS
+
+! **************************************************************************************************
+!> \brief ...
+!> \param lri_kp ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_kp_release(lri_kp)
+      TYPE(hfx_lri_kp_type), POINTER                     :: lri_kp
+
+      IF (ASSOCIATED(lri_kp)) THEN
+         DEALLOCATE (lri_kp)
+      END IF
+   END SUBROUTINE hfx_lri_kp_release
+
+END MODULE hfx_lri_types
