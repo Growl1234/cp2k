@@ -119,7 +119,7 @@ CONTAINS
       LOGICAL                                            :: dbg_integrals_done, dbg_pair_found
       REAL(dp)                                           :: c_mem_mib_local, c_mem_mib_max, &
                                                             c_mem_mib_sum, dbg_ji_norm, &
-                                                            dbg_jj_norm, dbg_m_norm
+                                                            dbg_jj_norm, dbg_m_norm, dbg_r2
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -146,6 +146,7 @@ CONTAINS
       dbg_naux_j = 0
       dbg_naux_pair = 0
       dbg_cell(:) = 0
+      dbg_r2 = HUGE(1.0_dp)
       dbg_rab(:) = 0.0_dp
       dbg_integrals_done = .FALSE.
       dbg_m_ncart = 0
@@ -216,8 +217,9 @@ CONTAINS
             naux_pair = naux_i + naux_j
          END IF
 
-         IF (.NOT. dbg_pair_found) THEN
+         IF ((.NOT. dbg_pair_found) .OR. SUM(rab*rab) < dbg_r2) THEN
             dbg_pair_found = .TRUE.
+            dbg_r2 = SUM(rab*rab)
             dbg_iatom = iatom
             dbg_jatom = jatom
             dbg_ikind = ikind
@@ -333,6 +335,8 @@ CONTAINS
                "kinds", dbg_ikind, dbg_jkind
             WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
                "cell", dbg_cell
+            WRITE (ri_data%unit_nr, "(T6,A,T28,F10.4)") &
+               "distance", SQRT(dbg_r2)
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
                "AO functions", dbg_nao_i, dbg_nao_j
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
