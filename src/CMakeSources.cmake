@@ -264,6 +264,7 @@ list(
   hfx_helpers.F
   hfx_load_balance_methods.F
   hfx_lri_kp.F
+  hfx_lri_types.F
   hfx_pair_list_methods.F
   hfx_pw_methods.F
   hfx_ri.F
