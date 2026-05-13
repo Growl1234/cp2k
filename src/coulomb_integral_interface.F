@@ -9,7 +9,8 @@
 !> \brief Common interface for two- and three-center Coulomb integrals.
 ! **************************************************************************************************
 MODULE coulomb_integral_interface
-   USE integral_library_types,          ONLY: coulomb_operator_type
+   USE integral_library_types,          ONLY: coulomb_cutoff_screen_factor => cutoff_screen_factor,&
+                                              coulomb_operator_type
    USE libint_2c_3c,                    ONLY: compute_coulomb_2c,&
                                               compute_coulomb_2c_derivs,&
                                               compute_coulomb_3c,&
@@ -21,7 +22,7 @@ MODULE coulomb_integral_interface
 
    IMPLICIT NONE
    PRIVATE
-   PUBLIC :: coulomb_operator_type, coulomb_integral_context_type, &
+   PUBLIC :: coulomb_cutoff_screen_factor, coulomb_operator_type, coulomb_integral_context_type, &
              coulomb_integral_init, coulomb_integral_cleanup, coulomb_integral_max_am, &
              compute_coulomb_2c, compute_coulomb_3c, &
              compute_coulomb_2c_derivs, compute_coulomb_3c_derivs
