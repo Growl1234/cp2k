@@ -263,6 +263,10 @@ list(
   hfx_exx.F
   hfx_helpers.F
   hfx_load_balance_methods.F
+  hfx_lri_contract.F
+  hfx_lri_kp.F
+  hfx_lri_lattice.F
+  hfx_lri_types.F
   hfx_pair_list_methods.F
   hfx_pw_methods.F
   hfx_ri.F
@@ -1645,6 +1649,7 @@ set(CP2K_PROGS_F
     topology_snapshot_unittest.F
     topology_phasons.F
     kpsym_unittest.F
+    hfx_lri_contract_unittest.F
     qs_ot_minimizer_unittest.F
     optbas_frontier_orbitals_utils_unittest.F
     low_rank_preconditioner_unittest.F
