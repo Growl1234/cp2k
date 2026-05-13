@@ -18,6 +18,7 @@ MODULE hfx_lri_kp
    USE input_constants,                 ONLY: do_potential_short
    USE kinds,                           ONLY: dp,&
                                               int_8
+   USE message_passing,                 ONLY: mp_para_env_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_integral_utils,               ONLY: basis_set_list_setup
@@ -94,27 +95,30 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_pre_scf_kp'
 
-      INTEGER                                            :: handle, iatom, ikind, ilist, jatom, &
-                                                            jkind, jneighbor, mepos, nao_i, nao_j, &
-                                                            naux_i, naux_j, naux_pair, nkind, &
-                                                            nlist, nneighbor
-      INTEGER(int_8)                                     :: c_nreal
+      INTEGER :: handle, iatom, ikind, ilist, jatom, jkind, jneighbor, mepos, nao_i, nao_j, &
+         naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, npairs_max, npairs_sum
+      INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
+         sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
+         sum_naux_pair_sum
+      REAL(dp)                                           :: c_mem_mib_local, c_mem_mib_max, &
+                                                            c_mem_mib_sum
       REAL(dp), DIMENSION(3)                             :: rab
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
+      TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: soo_list
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (qs_kind_set, soo_list, nl_iterator)
+      NULLIFY (qs_kind_set, soo_list, nl_iterator, para_env)
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
       NULLIFY (basis_set_AO, basis_set_RI)
 
       CALL timeset(routineN, handle)
 
-      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind)
+      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind, para_env=para_env)
 
       CALL hfx_lri_kp_release(ri_data%lri_kp)
       ALLOCATE (ri_data%lri_kp)
@@ -174,17 +178,64 @@ CONTAINS
       IF (ASSOCIATED(basis_set_AO)) DEALLOCATE (basis_set_AO)
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
-      ri_data%lri_kp%c_mem_mib_est = &
-         REAL(ri_data%lri_kp%c_nreal_est, KIND=dp)*REAL(dp, KIND=dp)/1024.0_dp**2
+      npairs_local = ri_data%lri_kp%npairs
+      sum_nao_pair_local = ri_data%lri_kp%sum_nao_pair
+      sum_naux_pair_local = ri_data%lri_kp%sum_naux_pair
+      c_nreal_local = ri_data%lri_kp%c_nreal_est
+      c_mem_mib_local = REAL(c_nreal_local, KIND=dp)*8.0_dp/1024.0_dp**2
 
+      npairs_sum = npairs_local
+      npairs_max = npairs_local
+      sum_nao_pair_sum = sum_nao_pair_local
+      sum_nao_pair_max = sum_nao_pair_local
+      sum_naux_pair_sum = sum_naux_pair_local
+      sum_naux_pair_max = sum_naux_pair_local
+      c_nreal_sum = c_nreal_local
+      c_nreal_max = c_nreal_local
+
+      IF (ASSOCIATED(para_env)) THEN
+         CALL para_env%sum(npairs_sum)
+         CALL para_env%max(npairs_max)
+         CALL para_env%sum(sum_nao_pair_sum)
+         CALL para_env%max(sum_nao_pair_max)
+         CALL para_env%sum(sum_naux_pair_sum)
+         CALL para_env%max(sum_naux_pair_max)
+         CALL para_env%sum(c_nreal_sum)
+         CALL para_env%max(c_nreal_max)
+      END IF
+
+      c_mem_mib_sum = REAL(c_nreal_sum, KIND=dp)*8.0_dp/1024.0_dp**2
+      c_mem_mib_max = REAL(c_nreal_max, KIND=dp)*8.0_dp/1024.0_dp**2
+
+      ri_data%lri_kp%c_mem_mib_est = c_mem_mib_local
       ri_data%lri_kp%initialized = .TRUE.
 
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk pair-local setup"
-         WRITE (ri_data%unit_nr, "(T4,A,T46,I12)") "number of AO atom pairs", ri_data%lri_kp%npairs
-         WRITE (ri_data%unit_nr, "(T4,A,T46,I12)") "sum AO-pair block size", ri_data%lri_kp%sum_nao_pair
-         WRITE (ri_data%unit_nr, "(T4,A,T46,I12)") "sum pair-local aux size", ri_data%lri_kp%sum_naux_pair
-         WRITE (ri_data%unit_nr, "(T4,A,T46,ES12.4)") "estimated C storage / MiB", ri_data%lri_kp%c_mem_mib_est
+         WRITE (ri_data%unit_nr, "(T4,A,T46,A)") "orbital basis type", TRIM(ri_data%orb_basis_type)
+         WRITE (ri_data%unit_nr, "(T4,A,T46,A)") "RI basis type", TRIM(ri_data%ri_basis_type)
+         WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "                                   local rank 0          global sum        max per rank"
+         WRITE (ri_data%unit_nr, "(T4,A,T36,I16,T56,I16,T76,I16)") &
+            "number of AO atom pairs", npairs_local, npairs_sum, npairs_max
+         WRITE (ri_data%unit_nr, "(T4,A,T36,I16,T56,I16,T76,I16)") &
+            "sum AO-pair block size", sum_nao_pair_local, sum_nao_pair_sum, sum_nao_pair_max
+         WRITE (ri_data%unit_nr, "(T4,A,T36,I16,T56,I16,T76,I16)") &
+            "sum pair-local aux size", sum_naux_pair_local, sum_naux_pair_sum, sum_naux_pair_max
+         WRITE (ri_data%unit_nr, "(T4,A,T36,ES16.6,T56,ES16.6,T76,ES16.6)") &
+            "estimated C storage / MiB", c_mem_mib_local, c_mem_mib_sum, c_mem_mib_max
+         IF (npairs_sum > 0) THEN
+            WRITE (ri_data%unit_nr, "(T4,A,T36,F16.2,T56,F16.2,T76,F16.2)") &
+               "avg AO-pair block size", &
+               REAL(sum_nao_pair_local, KIND=dp)/MAX(1.0_dp, REAL(npairs_local, KIND=dp)), &
+               REAL(sum_nao_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
+               REAL(sum_nao_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
+            WRITE (ri_data%unit_nr, "(T4,A,T36,F16.2,T56,F16.2,T76,F16.2)") &
+               "avg pair-local aux size", &
+               REAL(sum_naux_pair_local, KIND=dp)/MAX(1.0_dp, REAL(npairs_local, KIND=dp)), &
+               REAL(sum_naux_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
+               REAL(sum_naux_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
+         END IF
       END IF
 
       CALL timestop(handle)
