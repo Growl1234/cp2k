@@ -14,18 +14,6 @@ MODULE hfx_lri_types
 
    PUBLIC :: hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release
 
-   TYPE hfx_lri_kp_type
-      LOGICAL :: initialized = .FALSE.
-
-      INTEGER :: npairs = 0
-
-      INTEGER(int_8) :: sum_nao_pair = 0_int_8
-      INTEGER(int_8) :: sum_naux_pair = 0_int_8
-      INTEGER(int_8) :: c_nreal_est = 0_int_8
-
-      REAL(dp) :: c_mem_mib_est = 0.0_dp
-   END TYPE hfx_lri_kp_type
-
    TYPE hfx_lri_pair_block_type
       INTEGER                                            :: iatom = 0, ikind = 0, jatom = 0, &
                                                             jkind = 0, nao_i = 0, nao_j = 0, &
@@ -33,6 +21,23 @@ MODULE hfx_lri_types
       INTEGER, DIMENSION(3)                              :: cell = 0
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
    END TYPE hfx_lri_pair_block_type
+
+   TYPE hfx_lri_kp_type
+      LOGICAL :: initialized = .FALSE.
+
+      INTEGER :: npairs = 0
+      INTEGER :: npair_blocks = 0
+
+      INTEGER(int_8) :: sum_nao_pair = 0_int_8
+      INTEGER(int_8) :: sum_naux_pair = 0_int_8
+      INTEGER(int_8) :: c_nreal_est = 0_int_8
+      INTEGER(int_8) :: c_nreal_stored = 0_int_8
+
+      REAL(dp) :: c_mem_mib_est = 0.0_dp
+      REAL(dp) :: c_mem_mib_stored = 0.0_dp
+
+      TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
+   END TYPE hfx_lri_kp_type
 
 CONTAINS
 
@@ -43,7 +48,17 @@ CONTAINS
    SUBROUTINE hfx_lri_kp_release(lri_kp)
       TYPE(hfx_lri_kp_type), POINTER                     :: lri_kp
 
+      INTEGER                                            :: ipair
+
       IF (ASSOCIATED(lri_kp)) THEN
+         IF (ALLOCATED(lri_kp%pair_blocks)) THEN
+            DO ipair = 1, SIZE(lri_kp%pair_blocks)
+               IF (ALLOCATED(lri_kp%pair_blocks(ipair)%c_fit)) THEN
+                  DEALLOCATE (lri_kp%pair_blocks(ipair)%c_fit)
+               END IF
+            END DO
+            DEALLOCATE (lri_kp%pair_blocks)
+         END IF
          DEALLOCATE (lri_kp)
       END IF
    END SUBROUTINE hfx_lri_kp_release

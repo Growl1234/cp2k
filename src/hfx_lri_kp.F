@@ -52,6 +52,8 @@ MODULE hfx_lri_kp
 
    PUBLIC :: hfx_lri_update_ks_kp
 
+   INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
+
 CONTAINS
 
 ! **************************************************************************************************
@@ -112,17 +114,19 @@ CONTAINS
       INTEGER :: dbg_iatom, dbg_ikind, dbg_j_cols, dbg_j_rows, dbg_jatom, dbg_ji_ncart, &
          dbg_jj_ncart, dbg_jkind, dbg_m_dim, dbg_m_eig_small, dbg_m_ncart, dbg_nao_i, dbg_nao_j, &
          dbg_naux_i, dbg_naux_j, dbg_naux_pair, dbg_sph_j_cols, dbg_sph_j_rows, dbg_sph_m_dim, &
-         handle, iatom, ibasis, ikind, ilist, jatom, jkind, jneighbor, mepos, nao_i, nao_j, &
-         naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, npairs_max, npairs_sum
-      INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
+         handle, iatom, ibasis, ikind, ilist, ipair_block, jatom, jkind, jneighbor, mepos, nao_i, &
+         nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npair_blocks_local, &
+         npair_blocks_max, npair_blocks_sum, npairs_local, npairs_max, npairs_sum
+      INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_stored_local, &
+         c_nreal_stored_max, c_nreal_stored_sum, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
          sum_naux_pair_sum
       INTEGER, DIMENSION(3)                              :: cell_j, dbg_cell
       LOGICAL                                            :: dbg_integrals_done, dbg_pair_found
-      REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, &
-         dbg_ji_norm, dbg_jj_norm, dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, &
-         dbg_m_eig_max, dbg_m_eig_min, dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_j_norm, &
-         dbg_sph_m_norm
+      REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_stored_local, c_mem_mib_stored_max, &
+         c_mem_mib_stored_sum, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, dbg_ji_norm, dbg_jj_norm, &
+         dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, dbg_m_eig_max, dbg_m_eig_min, &
+         dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_j_norm, dbg_sph_m_norm
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -185,6 +189,7 @@ CONTAINS
 
       CALL hfx_lri_kp_release(ri_data%lri_kp)
       ALLOCATE (ri_data%lri_kp)
+      ALLOCATE (ri_data%lri_kp%pair_blocks(lri_debug_max_pair_blocks))
 
       ALLOCATE (basis_set_AO(nkind), basis_set_RI(nkind))
       CALL basis_set_list_setup(basis_set_AO, ri_data%orb_basis_type, qs_kind_set)
@@ -257,6 +262,27 @@ CONTAINS
 
          c_nreal = INT(nao_i, int_8)*INT(nao_j, int_8)*INT(naux_pair, int_8)
 
+         IF (ri_data%lri_kp%npair_blocks < lri_debug_max_pair_blocks) THEN
+            ipair_block = ri_data%lri_kp%npair_blocks + 1
+            CALL hfx_lri_init_pair_block(ri_data%lri_kp%pair_blocks(ipair_block), iatom, jatom, &
+                                         ikind, jkind, cell_j, nao_i, nao_j, naux_pair)
+            CALL hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, &
+                                              ri_data, ri_data%lri_kp%pair_blocks(ipair_block), &
+                                              dbg_m_ncart, dbg_ji_ncart, dbg_jj_ncart, &
+                                              dbg_m_norm, dbg_ji_norm, dbg_jj_norm, dbg_m_dim, &
+                                              dbg_j_rows, dbg_j_cols, dbg_m_dense_norm, &
+                                              dbg_j_norm, dbg_m_cond_diag, dbg_m_eig_min, &
+                                              dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
+                                              dbg_c_norm, dbg_sph_m_dim, dbg_sph_j_rows, &
+                                              dbg_sph_j_cols, dbg_sph_m_norm, dbg_sph_j_norm, &
+                                              dbg_sph_c_norm)
+            IF (ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit)) THEN
+               ri_data%lri_kp%npair_blocks = ipair_block
+               ri_data%lri_kp%c_nreal_stored = ri_data%lri_kp%c_nreal_stored + &
+                                               INT(SIZE(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit), int_8)
+            END IF
+         END IF
+
          ri_data%lri_kp%npairs = ri_data%lri_kp%npairs + 1
          ri_data%lri_kp%sum_nao_pair = ri_data%lri_kp%sum_nao_pair + INT(nao_i, int_8)*INT(nao_j, int_8)
          ri_data%lri_kp%sum_naux_pair = ri_data%lri_kp%sum_naux_pair + INT(naux_pair, int_8)
@@ -303,7 +329,10 @@ CONTAINS
       sum_nao_pair_local = ri_data%lri_kp%sum_nao_pair
       sum_naux_pair_local = ri_data%lri_kp%sum_naux_pair
       c_nreal_local = ri_data%lri_kp%c_nreal_est
+      c_nreal_stored_local = ri_data%lri_kp%c_nreal_stored
+      npair_blocks_local = ri_data%lri_kp%npair_blocks
       c_mem_mib_local = REAL(c_nreal_local, KIND=dp)*8.0_dp/1024.0_dp**2
+      c_mem_mib_stored_local = REAL(c_nreal_stored_local, KIND=dp)*8.0_dp/1024.0_dp**2
 
       npairs_sum = npairs_local
       npairs_max = npairs_local
@@ -313,6 +342,10 @@ CONTAINS
       sum_naux_pair_max = sum_naux_pair_local
       c_nreal_sum = c_nreal_local
       c_nreal_max = c_nreal_local
+      c_nreal_stored_sum = c_nreal_stored_local
+      c_nreal_stored_max = c_nreal_stored_local
+      npair_blocks_sum = npair_blocks_local
+      npair_blocks_max = npair_blocks_local
 
       IF (ASSOCIATED(para_env)) THEN
          CALL para_env%sum(npairs_sum)
@@ -323,12 +356,19 @@ CONTAINS
          CALL para_env%max(sum_naux_pair_max)
          CALL para_env%sum(c_nreal_sum)
          CALL para_env%max(c_nreal_max)
+         CALL para_env%sum(c_nreal_stored_sum)
+         CALL para_env%max(c_nreal_stored_max)
+         CALL para_env%sum(npair_blocks_sum)
+         CALL para_env%max(npair_blocks_max)
       END IF
 
       c_mem_mib_sum = REAL(c_nreal_sum, KIND=dp)*8.0_dp/1024.0_dp**2
       c_mem_mib_max = REAL(c_nreal_max, KIND=dp)*8.0_dp/1024.0_dp**2
+      c_mem_mib_stored_sum = REAL(c_nreal_stored_sum, KIND=dp)*8.0_dp/1024.0_dp**2
+      c_mem_mib_stored_max = REAL(c_nreal_stored_max, KIND=dp)*8.0_dp/1024.0_dp**2
 
       ri_data%lri_kp%c_mem_mib_est = c_mem_mib_local
+      ri_data%lri_kp%c_mem_mib_stored = c_mem_mib_stored_local
       ri_data%lri_kp%initialized = .TRUE.
 
       IF (ri_data%unit_nr > 0) THEN
@@ -345,6 +385,10 @@ CONTAINS
             "pair aux size", sum_naux_pair_local, sum_naux_pair_sum, sum_naux_pair_max
          WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
             "C storage/MiB", c_mem_mib_local, c_mem_mib_sum, c_mem_mib_max
+         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
+            "stored blocks", npair_blocks_local, npair_blocks_sum, npair_blocks_max
+         WRITE (ri_data%unit_nr, "(T4,A,T28,F10.4,T41,F10.4,T54,F10.4)") &
+            "stored C/MiB", c_mem_mib_stored_local, c_mem_mib_stored_sum, c_mem_mib_stored_max
          IF (npairs_sum > 0) THEN
             WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
                "avg AO-pair", &
