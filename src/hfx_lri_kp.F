@@ -1406,8 +1406,6 @@ CONTAINS
       k_norm2_accum = 0.0_dp
       DO ipair = 1, ri_data%lri_kp%npair_blocks
          IF (naccum >= lri_debug_max_accum_pairs) EXIT
-         IF (ri_data%lri_kp%pair_blocks(ipair)%iatom /= &
-             ri_data%lri_kp%pair_blocks(ipair)%jatom) CYCLE
          IF (ANY(ri_data%lri_kp%pair_blocks(ipair)%cell /= 0)) CYCLE
          IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
          IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%v_fit)) CYCLE
@@ -1461,7 +1459,7 @@ CONTAINS
             "rho/C norm", rho_norm, c_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "real K norm", k_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug onsite K accumulation"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug same-cell K accumulation"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "used/max pairs", naccum, lri_debug_max_accum_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
