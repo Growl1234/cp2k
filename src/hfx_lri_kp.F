@@ -100,6 +100,7 @@ CONTAINS
       END IF
 
       CALL hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
+      CALL hfx_lri_debug_ks_writeback_probe(qs_env, ri_data, ks_matrix, hf_fraction)
 
       CPABORT("LRI-HFXk pair-local contraction is not implemented yet")
 
@@ -1517,6 +1518,87 @@ CONTAINS
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
    END SUBROUTINE hfx_lri_debug_density_block
+
+
+! **************************************************************************************************
+!> \brief Probes whether the stored debug K block can be located in the k-point KS matrix.
+!> \param qs_env ...
+!> \param ri_data ...
+!> \param ks_matrix ...
+!> \param hf_fraction ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_debug_ks_writeback_probe(qs_env, ri_data, ks_matrix, hf_fraction)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
+      REAL(dp), INTENT(IN)                               :: hf_fraction
+
+      INTEGER                                            :: img, lb1, lb2, lb3, ub1, ub2, ub3
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: found
+      REAL(dp)                                           :: add_norm, k_norm, ks_norm
+      REAL(dp), DIMENSION(:, :), POINTER                 :: ks_block
+      TYPE(kpoint_type), POINTER                         :: kpoints
+
+      NULLIFY (cell_to_index, kpoints, ks_block)
+
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) RETURN
+      IF (.NOT. ASSOCIATED(ks_matrix)) RETURN
+
+      CALL get_qs_env(qs_env=qs_env, kpoints=kpoints)
+      IF (ASSOCIATED(kpoints)) THEN
+         CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index)
+      END IF
+
+      img = 1
+      IF (ASSOCIATED(cell_to_index)) THEN
+         lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+         lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+         lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+         IF (ALL(ri_data%lri_kp%debug_k_block%cell >= [lb1, lb2, lb3]) .AND. &
+             ALL(ri_data%lri_kp%debug_k_block%cell <= [ub1, ub2, ub3])) THEN
+            img = cell_to_index(ri_data%lri_kp%debug_k_block%cell(1), &
+                                ri_data%lri_kp%debug_k_block%cell(2), &
+                                ri_data%lri_kp%debug_k_block%cell(3))
+         END IF
+      END IF
+      IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) RETURN
+
+      CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
+                             row=ri_data%lri_kp%debug_k_block%iatom, &
+                             col=ri_data%lri_kp%debug_k_block%jatom, &
+                             block=ks_block, found=found)
+
+      k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block*&
+                        ri_data%lri_kp%debug_k_block%k_block))
+      add_norm = ABS(hf_fraction)*k_norm
+      ks_norm = 0.0_dp
+      IF (found) ks_norm = SQRT(SUM(ks_block*ks_block))
+
+      IF (ri_data%unit_nr > 0) THEN
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback probe"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "pair/image", ri_data%lri_kp%debug_k_block%pair_index, img
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "atoms", ri_data%lri_kp%debug_k_block%iatom, &
+            ri_data%lri_kp%debug_k_block%jatom
+         WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
+            "cell", ri_data%lri_kp%debug_k_block%cell
+         IF (found) THEN
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "KS dims", SIZE(ks_block, 1), SIZE(ks_block, 2)
+         ELSE
+            WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
+         END IF
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "KS/K norm", ks_norm, k_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "scaled add norm", add_norm
+      END IF
+
+   END SUBROUTINE hfx_lri_debug_ks_writeback_probe
 
 ! **************************************************************************************************
 !> \brief Contracts a target pair with a density pair and a real pair-pair auxiliary metric.
