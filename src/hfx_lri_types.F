@@ -19,6 +19,7 @@ MODULE hfx_lri_types
                                                             jkind = 0, nao_i = 0, nao_j = 0, &
                                                             naux_pair = 0
       INTEGER, DIMENSION(3)                              :: cell = 0
+      REAL(dp), DIMENSION(3)                             :: rab = 0.0_dp
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_fit
    END TYPE hfx_lri_pair_block_type
