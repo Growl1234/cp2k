@@ -128,7 +128,7 @@ CONTAINS
          c_mem_mib_stored_sum, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, dbg_ji_norm, dbg_jj_norm, &
          dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, dbg_m_eig_max, dbg_m_eig_min, &
          dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_cvc_norm, dbg_sph_j_norm, dbg_sph_m_norm, &
-         dbg_stored_c_norm
+         dbg_sph_toy_k_norm, dbg_stored_c_norm
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -184,6 +184,7 @@ CONTAINS
       dbg_sph_j_norm = 0.0_dp
       dbg_sph_c_norm = 0.0_dp
       dbg_sph_cvc_norm = 0.0_dp
+      dbg_sph_toy_k_norm = 0.0_dp
       dbg_stored_index = 0
       dbg_stored_c_norm = 0.0_dp
 
@@ -280,7 +281,7 @@ CONTAINS
                                               dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
                                               dbg_c_norm, dbg_sph_m_dim, dbg_sph_j_rows, &
                                               dbg_sph_j_cols, dbg_sph_m_norm, dbg_sph_j_norm, &
-                                              dbg_sph_c_norm, dbg_sph_cvc_norm, debug_probe=.FALSE.)
+                                              dbg_sph_c_norm, dbg_sph_cvc_norm, dbg_sph_toy_k_norm, debug_probe=.FALSE.)
             IF (ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit)) THEN
                ri_data%lri_kp%npair_blocks = ipair_block
                ri_data%lri_kp%c_nreal_stored = ri_data%lri_kp%c_nreal_stored + &
@@ -309,7 +310,7 @@ CONTAINS
                                            dbg_m_eig_min, dbg_m_eig_max, dbg_m_eig_cond, &
                                            dbg_m_eig_small, dbg_c_norm, dbg_sph_m_dim, &
                                            dbg_sph_j_rows, dbg_sph_j_cols, dbg_sph_m_norm, &
-                                           dbg_sph_j_norm, dbg_sph_c_norm, dbg_sph_cvc_norm)
+                                           dbg_sph_j_norm, dbg_sph_c_norm, dbg_sph_cvc_norm, dbg_sph_toy_k_norm)
          dbg_integrals_done = .TRUE.
       END IF
 
@@ -464,6 +465,8 @@ CONTAINS
                   "C=J Minv norm", dbg_sph_c_norm
                WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                   "CVC self norm", dbg_sph_cvc_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "toy K(I) norm", dbg_sph_toy_k_norm
                IF (ALLOCATED(dbg_pair_block%c_fit)) THEN
                   WRITE (ri_data%unit_nr, "(/,T4,A)") "debug pair coefficient block"
                   WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
@@ -517,6 +520,7 @@ CONTAINS
 !> \param sph_j_norm ...
 !> \param sph_c_norm ...
 !> \param sph_cvc_norm ...
+!> \param sph_toy_k_norm ...
 !> \param debug_probe ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
@@ -526,7 +530,7 @@ CONTAINS
                                            metric_diag_cond, metric_eig_min, metric_eig_max, &
                                            metric_eig_cond, metric_eig_small, c_norm, sph_metric_dim, &
                                            sph_j_rows, sph_j_cols, sph_metric_norm, sph_j_norm, &
-                                           sph_c_norm, sph_cvc_norm, debug_probe)
+                                           sph_c_norm, sph_cvc_norm, sph_toy_k_norm, debug_probe)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -545,7 +549,7 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: c_norm
       INTEGER, INTENT(OUT)                               :: sph_metric_dim, sph_j_rows, sph_j_cols
       REAL(dp), INTENT(OUT)                              :: sph_metric_norm, sph_j_norm, sph_c_norm, &
-                                                            sph_cvc_norm
+                                                            sph_cvc_norm, sph_toy_k_norm
       LOGICAL, INTENT(IN), OPTIONAL                      :: debug_probe
 
       INTEGER                                            :: idim, maxl_ai, maxl_aj, maxl_ri, &
@@ -555,6 +559,7 @@ CONTAINS
       LOGICAL                                            :: do_debug_probe, onsite_aux
       REAL(dp) :: diag_abs, diag_max, diag_min, metric_norm2, sph_eig_cond, sph_eig_max, &
          sph_eig_min, threec_i_norm2, threec_j_norm2
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: toy_density, toy_k
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: c_sph, cvc_block, j_block, j_sph, metric_block, &
          metric_sph, sphi_aux, sphi_i, sphi_j, sphi_pair, sphi_ri_i, sphi_ri_j, tmp_cvc, tmp_sph
       REAL(dp), DIMENSION(3)                             :: r0
@@ -729,6 +734,11 @@ CONTAINS
                ALLOCATE (cvc_block(SIZE(c_sph, 1), SIZE(c_sph, 1)), SOURCE=0.0_dp)
                cvc_block = MATMUL(tmp_cvc, TRANSPOSE(c_sph))
                sph_cvc_norm = SQRT(SUM(cvc_block*cvc_block))
+               CALL hfx_lri_build_toy_identity_density(SIZE(sphi_i, 2), SIZE(sphi_j, 2), toy_density)
+               ALLOCATE (toy_k(SIZE(cvc_block, 1)), SOURCE=0.0_dp)
+               toy_k = MATMUL(cvc_block, toy_density)
+               sph_toy_k_norm = SQRT(SUM(toy_k*toy_k))
+               DEALLOCATE (toy_k, toy_density)
                DEALLOCATE (cvc_block, tmp_cvc)
             END IF
             CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, SIZE(sphi_i, 2), &
@@ -1098,6 +1108,27 @@ CONTAINS
       END DO
 
    END SUBROUTINE hfx_lri_build_pair_sphi
+
+! **************************************************************************************************
+!> \brief Builds a toy identity density vector in pair-row ordering.
+!> \param nao_i ...
+!> \param nao_j ...
+!> \param density_vec ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_build_toy_identity_density(nao_i, nao_j, density_vec)
+
+      INTEGER, INTENT(IN)                                :: nao_i, nao_j
+      REAL(dp), ALLOCATABLE, DIMENSION(:), INTENT(OUT)   :: density_vec
+
+      INTEGER                                            :: iao, ndiag
+
+      ALLOCATE (density_vec(nao_i*nao_j), SOURCE=0.0_dp)
+      ndiag = MIN(nao_i, nao_j)
+      DO iao = 1, ndiag
+         density_vec((iao - 1)*nao_j + iao) = 1.0_dp
+      END DO
+
+   END SUBROUTINE hfx_lri_build_toy_identity_density
 
 ! **************************************************************************************************
 !> \brief Diagonalizes a debug metric block and probes C = J M^-1.
