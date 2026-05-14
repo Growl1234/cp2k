@@ -14,7 +14,8 @@ MODULE hfx_lri_kp
                                               gto_basis_set_p_type,&
                                               gto_basis_set_type
    USE cp_control_types,                ONLY: dft_control_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
+   USE cp_dbcsr_api,                    ONLY: dbcsr_get_block_p,&
+                                              dbcsr_p_type
    USE gamma,                           ONLY: init_md_ftable
    USE hfx_lri_types,                   ONLY: hfx_lri_kp_release,&
                                               hfx_lri_pair_block_type
@@ -22,6 +23,8 @@ MODULE hfx_lri_kp
    USE input_constants,                 ONLY: do_potential_short
    USE kinds,                           ONLY: dp,&
                                               int_8
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_type
    USE libint_2c_3c,                    ONLY: eri_2center,&
                                               eri_3center
    USE libint_wrapper,                  ONLY: cp_libint_cleanup_2eri,&
@@ -94,6 +97,8 @@ CONTAINS
       IF (geometry_did_change .OR. .NOT. ASSOCIATED(ri_data%lri_kp)) THEN
          CALL hfx_lri_pre_scf_kp(qs_env, ri_data)
       END IF
+
+      CALL hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
 
       CPABORT("LRI-HFXk pair-local contraction is not implemented yet")
 
@@ -1293,6 +1298,95 @@ CONTAINS
       END DO
 
    END SUBROUTINE hfx_lri_pack_pair_coefficients
+
+! **************************************************************************************************
+!> \brief Reads a stored-pair density block from the current real-space density matrices.
+!> \param qs_env ...
+!> \param ri_data ...
+!> \param rho_ao ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+
+      INTEGER                                            :: img, ipair, ipair_sel, lb1, lb2, lb3, &
+                                                            ub1, ub2, ub3
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: found
+      REAL(dp)                                           :: c_norm, rho_norm
+      REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
+      TYPE(kpoint_type), POINTER                         :: kpoints
+
+      NULLIFY (cell_to_index, kpoints, rho_block)
+
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) RETURN
+      IF (ri_data%lri_kp%npair_blocks <= 0) RETURN
+      IF (.NOT. ASSOCIATED(rho_ao)) RETURN
+
+      ipair_sel = 0
+      DO ipair = 1, ri_data%lri_kp%npair_blocks
+         IF (ri_data%lri_kp%pair_blocks(ipair)%iatom == &
+             ri_data%lri_kp%pair_blocks(ipair)%jatom .AND. &
+             ALL(ri_data%lri_kp%pair_blocks(ipair)%cell == 0)) THEN
+            ipair_sel = ipair
+            EXIT
+         END IF
+      END DO
+      IF (ipair_sel == 0) ipair_sel = 1
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit)) RETURN
+
+      CALL get_qs_env(qs_env=qs_env, kpoints=kpoints)
+      IF (ASSOCIATED(kpoints)) THEN
+         CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index)
+      END IF
+
+      img = 1
+      IF (ASSOCIATED(cell_to_index)) THEN
+         lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+         lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+         lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+         IF (ALL(ri_data%lri_kp%pair_blocks(ipair_sel)%cell >= [lb1, lb2, lb3]) .AND. &
+             ALL(ri_data%lri_kp%pair_blocks(ipair_sel)%cell <= [ub1, ub2, ub3])) THEN
+            img = cell_to_index(ri_data%lri_kp%pair_blocks(ipair_sel)%cell(1), &
+                                ri_data%lri_kp%pair_blocks(ipair_sel)%cell(2), &
+                                ri_data%lri_kp%pair_blocks(ipair_sel)%cell(3))
+         END IF
+      END IF
+      IF (img < 1 .OR. img > SIZE(rho_ao, 2)) RETURN
+
+      CALL dbcsr_get_block_p(matrix=rho_ao(1, img)%matrix, &
+                             row=ri_data%lri_kp%pair_blocks(ipair_sel)%iatom, &
+                             col=ri_data%lri_kp%pair_blocks(ipair_sel)%jatom, &
+                             block=rho_block, found=found)
+
+      rho_norm = 0.0_dp
+      IF (found) rho_norm = SQRT(SUM(rho_block*rho_block))
+      c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit* &
+                        ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit))
+
+      IF (ri_data%unit_nr > 0) THEN
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "pair/image", ipair_sel, img
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "atoms", ri_data%lri_kp%pair_blocks(ipair_sel)%iatom, &
+            ri_data%lri_kp%pair_blocks(ipair_sel)%jatom
+         WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
+            "cell", ri_data%lri_kp%pair_blocks(ipair_sel)%cell
+         IF (found) THEN
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "rho dims", SIZE(rho_block, 1), SIZE(rho_block, 2)
+         ELSE
+            WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "rho dims", "not found"
+         END IF
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "rho/C norm", rho_norm, c_norm
+      END IF
+
+   END SUBROUTINE hfx_lri_debug_density_block
 
 ! **************************************************************************************************
 !> \brief Finds a stored pair-local LRI coefficient block by atom pair and cell.
