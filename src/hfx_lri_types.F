@@ -20,6 +20,7 @@ MODULE hfx_lri_types
                                                             naux_pair = 0
       INTEGER, DIMENSION(3)                              :: cell = 0
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_fit
    END TYPE hfx_lri_pair_block_type
 
    TYPE hfx_lri_kp_type
@@ -55,6 +56,9 @@ CONTAINS
             DO ipair = 1, SIZE(lri_kp%pair_blocks)
                IF (ALLOCATED(lri_kp%pair_blocks(ipair)%c_fit)) THEN
                   DEALLOCATE (lri_kp%pair_blocks(ipair)%c_fit)
+               END IF
+               IF (ALLOCATED(lri_kp%pair_blocks(ipair)%v_fit)) THEN
+                  DEALLOCATE (lri_kp%pair_blocks(ipair)%v_fit)
                END IF
             END DO
             DEALLOCATE (lri_kp%pair_blocks)
