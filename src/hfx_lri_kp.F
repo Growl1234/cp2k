@@ -748,6 +748,7 @@ CONTAINS
             END IF
             CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, SIZE(sphi_i, 2), &
                                                 SIZE(sphi_j, 2), sph_metric_dim)
+            CALL hfx_lri_store_pair_metric(pair_block, metric_sph)
             DEALLOCATE (c_sph)
 
             DEALLOCATE (j_sph, metric_sph, sphi_aux, sphi_pair)
@@ -1246,6 +1247,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: nao_i, nao_j, naux_pair
 
       IF (ALLOCATED(pair_block%c_fit)) DEALLOCATE (pair_block%c_fit)
+      IF (ALLOCATED(pair_block%v_fit)) DEALLOCATE (pair_block%v_fit)
 
       pair_block%iatom = iatom
       pair_block%jatom = jatom
@@ -1300,6 +1302,27 @@ CONTAINS
    END SUBROUTINE hfx_lri_pack_pair_coefficients
 
 ! **************************************************************************************************
+!> \brief Stores the spherical auxiliary coupling metric for a pair block.
+!> \param pair_block ...
+!> \param metric_sph ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_store_pair_metric(pair_block, metric_sph)
+
+      TYPE(hfx_lri_pair_block_type), INTENT(INOUT)       :: pair_block
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: metric_sph
+
+      IF (SIZE(metric_sph, 1) /= pair_block%naux_pair .OR. &
+          SIZE(metric_sph, 2) /= pair_block%naux_pair) THEN
+         CPABORT("Inconsistent metric dimension while storing LRI-HFXk pair metric")
+      END IF
+
+      IF (ALLOCATED(pair_block%v_fit)) DEALLOCATE (pair_block%v_fit)
+      ALLOCATE (pair_block%v_fit(pair_block%naux_pair, pair_block%naux_pair))
+      pair_block%v_fit(:, :) = metric_sph(:, :)
+
+   END SUBROUTINE hfx_lri_store_pair_metric
+
+! **************************************************************************************************
 !> \brief Reads a stored-pair density block from the current real-space density matrices.
 !> \param qs_env ...
 !> \param ri_data ...
@@ -1315,7 +1338,8 @@ CONTAINS
                                                             ub1, ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
-      REAL(dp)                                           :: c_norm, rho_norm
+      REAL(dp)                                           :: c_norm, k_norm, rho_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(kpoint_type), POINTER                         :: kpoints
 
@@ -1363,7 +1387,14 @@ CONTAINS
                              block=rho_block, found=found)
 
       rho_norm = 0.0_dp
+      k_norm = 0.0_dp
       IF (found) rho_norm = SQRT(SUM(rho_block*rho_block))
+      IF (found .AND. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_sel)%v_fit)) THEN
+         CALL hfx_lri_contract_real_density_self(ri_data%lri_kp%pair_blocks(ipair_sel), rho_block, &
+                                                 k_block)
+         k_norm = SQRT(SUM(k_block*k_block))
+         DEALLOCATE (k_block)
+      END IF
       c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit* &
                         ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit))
 
@@ -1384,9 +1415,64 @@ CONTAINS
          END IF
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/C norm", rho_norm, c_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "real K norm", k_norm
       END IF
 
    END SUBROUTINE hfx_lri_debug_density_block
+
+! **************************************************************************************************
+!> \brief Contracts a stored self-pair C/V block with a real density block.
+!> \param pair_block ...
+!> \param rho_block ...
+!> \param k_block ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_contract_real_density_self(pair_block, rho_block, k_block)
+
+      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_block
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: rho_block
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: k_block
+
+      INTEGER                                            :: iao, jao, jaux, nao_i, nao_j, naux
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: aux_density, v_aux
+
+      IF (.NOT. ALLOCATED(pair_block%c_fit)) THEN
+         CPABORT("Missing C block in LRI-HFXk density contraction probe")
+      END IF
+      IF (.NOT. ALLOCATED(pair_block%v_fit)) THEN
+         CPABORT("Missing V block in LRI-HFXk density contraction probe")
+      END IF
+
+      nao_i = pair_block%nao_i
+      nao_j = pair_block%nao_j
+      naux = pair_block%naux_pair
+      IF (SIZE(rho_block, 1) < nao_i .OR. SIZE(rho_block, 2) < nao_j) THEN
+         CPABORT("Inconsistent density block dimension in LRI-HFXk contraction probe")
+      END IF
+
+      ALLOCATE (aux_density(naux), v_aux(naux), k_block(nao_i, nao_j), SOURCE=0.0_dp)
+
+      DO jaux = 1, naux
+         DO jao = 1, nao_j
+            DO iao = 1, nao_i
+               aux_density(jaux) = aux_density(jaux) + &
+                                   pair_block%c_fit(iao, jao, jaux)*rho_block(iao, jao)
+            END DO
+         END DO
+      END DO
+
+      v_aux = MATMUL(pair_block%v_fit, aux_density)
+
+      DO jao = 1, nao_j
+         DO iao = 1, nao_i
+            k_block(iao, jao) = SUM(pair_block%c_fit(iao, jao, :)*v_aux(:))
+         END DO
+      END DO
+
+      DEALLOCATE (v_aux, aux_density)
+
+   END SUBROUTINE hfx_lri_contract_real_density_self
 
 ! **************************************************************************************************
 !> \brief Finds a stored pair-local LRI coefficient block by atom pair and cell.
