@@ -56,6 +56,7 @@ MODULE hfx_lri_kp
    PUBLIC :: hfx_lri_update_ks_kp
 
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
+   INTEGER, PARAMETER :: lri_debug_max_k_blocks = 500
    REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
 
 CONTAINS
@@ -1334,6 +1335,117 @@ CONTAINS
    END SUBROUTINE hfx_lri_store_debug_k_block
 
 ! **************************************************************************************************
+!> \brief Accumulates a debug K block for one target pair using nearest-origin density pairs.
+!> \param basis_set_RI ...
+!> \param rho_ao ...
+!> \param cell_to_index ...
+!> \param ipair_target ...
+!> \param ri_data ...
+!> \param k_accum_block ...
+!> \param used_pairs ...
+!> \param candidate_pairs ...
+!> \param rho_accum_norm ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_accumulate_target_k_block(basis_set_RI, rho_ao, cell_to_index, ipair_target, &
+                                                ri_data, k_accum_block, used_pairs, &
+                                                candidate_pairs, rho_accum_norm)
+
+      TYPE(gto_basis_set_p_type), DIMENSION(:), &
+         INTENT(IN)                                      :: basis_set_RI
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      INTEGER, INTENT(IN)                                :: ipair_target
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: k_accum_block
+      INTEGER, INTENT(OUT)                               :: used_pairs, candidate_pairs
+      REAL(dp), INTENT(OUT)                              :: rho_accum_norm
+
+      INTEGER                                            :: img_pair, ipair, ipair_best, lb1, lb2, &
+                                                            lb3, search_iter, ub1, ub2, ub3
+      LOGICAL                                            :: found
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
+      REAL(dp)                                           :: best_r2, pair_r2, rho_norm2_accum, &
+                                                            rho_pair_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_pair_block
+      REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
+
+      NULLIFY (rho_block)
+
+      used_pairs = 0
+      candidate_pairs = 0
+      rho_accum_norm = 0.0_dp
+
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) RETURN
+      IF (ipair_target < 1 .OR. ipair_target > ri_data%lri_kp%npair_blocks) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) RETURN
+      IF (.NOT. ASSOCIATED(rho_ao)) RETURN
+
+      ALLOCATE (k_accum_block(ri_data%lri_kp%pair_blocks(ipair_target)%nao_i, &
+                              ri_data%lri_kp%pair_blocks(ipair_target)%nao_j), SOURCE=0.0_dp)
+      ALLOCATE (tried_density_pair(ri_data%lri_kp%npair_blocks), SOURCE=.FALSE.)
+      rho_norm2_accum = 0.0_dp
+
+      DO search_iter = 1, ri_data%lri_kp%npair_blocks
+         ipair_best = 0
+         best_r2 = HUGE(1.0_dp)
+         DO ipair = 1, ri_data%lri_kp%npair_blocks
+            IF (tried_density_pair(ipair)) CYCLE
+            IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
+            IF (ri_data%lri_kp%pair_blocks(ipair)%iatom /= &
+                ri_data%lri_kp%pair_blocks(ipair_target)%iatom) CYCLE
+            pair_r2 = SUM((ri_data%lri_kp%pair_blocks(ipair)%rab - &
+                           ri_data%lri_kp%pair_blocks(ipair_target)%rab)**2)
+            IF (pair_r2 >= best_r2) CYCLE
+            ipair_best = ipair
+            best_r2 = pair_r2
+         END DO
+         IF (ipair_best == 0) EXIT
+         tried_density_pair(ipair_best) = .TRUE.
+         candidate_pairs = candidate_pairs + 1
+
+         img_pair = 1
+         IF (ASSOCIATED(cell_to_index)) THEN
+            lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+            lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+            lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+            IF (.NOT. (ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell >= [lb1, lb2, lb3]) .AND. &
+                       ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell <= [ub1, ub2, ub3]))) CYCLE
+            img_pair = cell_to_index(ri_data%lri_kp%pair_blocks(ipair_best)%cell(1), &
+                                     ri_data%lri_kp%pair_blocks(ipair_best)%cell(2), &
+                                     ri_data%lri_kp%pair_blocks(ipair_best)%cell(3))
+         END IF
+         IF (img_pair < 1 .OR. img_pair > SIZE(rho_ao, 2)) CYCLE
+
+         CALL dbcsr_get_block_p(matrix=rho_ao(1, img_pair)%matrix, &
+                                row=ri_data%lri_kp%pair_blocks(ipair_best)%iatom, &
+                                col=ri_data%lri_kp%pair_blocks(ipair_best)%jatom, &
+                                block=rho_block, found=found)
+         IF (.NOT. found) CYCLE
+         rho_pair_norm = SQRT(SUM(rho_block*rho_block))
+         IF (rho_pair_norm < lri_debug_rho_threshold) CYCLE
+
+         CALL hfx_lri_contract_pair_pair_density_realv(basis_set_RI, &
+                                                       ri_data%lri_kp%pair_blocks(ipair_target), &
+                                                       ri_data%lri_kp%pair_blocks(ipair_best), &
+                                                       ri_data, rho_block, k_pair_block)
+         IF (.NOT. ALLOCATED(k_pair_block)) CYCLE
+         k_accum_block(:, :) = k_accum_block(:, :) + k_pair_block(:, :)
+         rho_norm2_accum = rho_norm2_accum + rho_pair_norm*rho_pair_norm
+         used_pairs = used_pairs + 1
+         DEALLOCATE (k_pair_block)
+      END DO
+
+      IF (ALLOCATED(tried_density_pair)) DEALLOCATE (tried_density_pair)
+      rho_accum_norm = SQRT(rho_norm2_accum)
+      IF (used_pairs <= 0) THEN
+         IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
+      END IF
+
+   END SUBROUTINE hfx_lri_accumulate_target_k_block
+
+! **************************************************************************************************
 !> \brief ...
 !> \param qs_env ...
 !> \param ri_data ...
@@ -1345,17 +1457,16 @@ CONTAINS
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
 
-      INTEGER                                            :: candidate_pairs, img, img_pair, ipair, &
-                                                            ipair_best, ipair_sel, lb1, lb2, lb3, &
-                                                            nkind, search_iter, ub1, ub2, ub3, &
-                                                            used_pairs
+      INTEGER :: candidate_pairs, candidate_pairs_tmp, img, img_pair, ipair, ipair_best, &
+         ipair_sel, ipair_target, lb1, lb2, lb3, max_k_blocks, multi_candidate_pairs, &
+         multi_used_pairs, nkind, search_iter, ub1, ub2, ub3, used_pairs, used_pairs_tmp
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
-      REAL(dp)                                           :: best_r2, c_norm, k_accum_norm, k_norm, &
-                                                            pair_r2, rho_accum_norm, rho_norm, &
-                                                            rho_norm2_accum, rho_pair_norm
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_accum_block, k_block, k_pair_block
+      REAL(dp) :: best_r2, c_norm, k_accum_norm, k_blocks_norm, k_norm, pair_r2, rho_accum_norm, &
+         rho_blocks_norm, rho_norm, rho_norm2_accum, rho_pair_norm, rho_tmp_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_accum_block, k_block, k_pair_block, &
+                                                            k_tmp_block
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_RI
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -1363,10 +1474,26 @@ CONTAINS
 
       NULLIFY (basis_set_RI, cell_to_index, kpoints, qs_kind_set, rho_block)
 
-      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
-      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) RETURN
-      IF (ri_data%lri_kp%npair_blocks <= 0) RETURN
-      IF (.NOT. ASSOCIATED(rho_ao)) RETURN
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug density block skipped: LRI-HFXk state is not associated"
+         RETURN
+      END IF
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug density block skipped: pair blocks are not allocated"
+         RETURN
+      END IF
+      IF (ri_data%lri_kp%npair_blocks <= 0) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug density block skipped: no pair blocks are available"
+         RETURN
+      END IF
+      IF (.NOT. ASSOCIATED(rho_ao)) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug density block skipped: rho_ao is not associated"
+         RETURN
+      END IF
 
       ipair_sel = 0
       DO ipair = 1, ri_data%lri_kp%npair_blocks
@@ -1378,7 +1505,14 @@ CONTAINS
          END IF
       END DO
       IF (ipair_sel == 0) ipair_sel = 1
-      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit)) THEN
+         IF (ri_data%unit_nr > 0) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") &
+               "debug density block skipped: selected C block is not allocated"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") "pair index", ipair_sel
+         END IF
+         RETURN
+      END IF
 
       CALL get_qs_env(qs_env=qs_env, kpoints=kpoints, qs_kind_set=qs_kind_set, nkind=nkind)
       IF (ASSOCIATED(kpoints)) THEN
@@ -1400,7 +1534,17 @@ CONTAINS
                                 ri_data%lri_kp%pair_blocks(ipair_sel)%cell(3))
          END IF
       END IF
-      IF (img < 1 .OR. img > SIZE(rho_ao, 2)) RETURN
+      IF (img < 1 .OR. img > SIZE(rho_ao, 2)) THEN
+         IF (ri_data%unit_nr > 0) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") &
+               "debug density block skipped: invalid image index"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") "img/nimages", img, SIZE(rho_ao, 2)
+            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") "cell", &
+               ri_data%lri_kp%pair_blocks(ipair_sel)%cell
+         END IF
+         IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
+         RETURN
+      END IF
 
       CALL dbcsr_get_block_p(matrix=rho_ao(1, img)%matrix, &
                              row=ri_data%lri_kp%pair_blocks(ipair_sel)%iatom, &
@@ -1481,6 +1625,47 @@ CONTAINS
                                        ri_data%lri_kp%pair_blocks(ipair_sel), &
                                        ipair_sel, k_accum_block)
 
+      IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
+         DO ipair = 1, SIZE(ri_data%lri_kp%debug_k_blocks)
+            IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks(ipair)%k_block)) THEN
+               DEALLOCATE (ri_data%lri_kp%debug_k_blocks(ipair)%k_block)
+            END IF
+         END DO
+         DEALLOCATE (ri_data%lri_kp%debug_k_blocks)
+      END IF
+      ri_data%lri_kp%ndebug_k_blocks = 0
+      max_k_blocks = MIN(lri_debug_max_k_blocks, ri_data%lri_kp%npair_blocks)
+      IF (max_k_blocks > 0) THEN
+         ALLOCATE (ri_data%lri_kp%debug_k_blocks(max_k_blocks))
+      END IF
+      multi_used_pairs = 0
+      multi_candidate_pairs = 0
+      rho_blocks_norm = 0.0_dp
+      k_blocks_norm = 0.0_dp
+      DO ipair_target = 1, ri_data%lri_kp%npair_blocks
+         IF (ri_data%lri_kp%ndebug_k_blocks >= max_k_blocks) EXIT
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) CYCLE
+         CALL hfx_lri_accumulate_target_k_block(basis_set_RI, rho_ao, cell_to_index, ipair_target, &
+                                                ri_data, k_tmp_block, used_pairs_tmp, &
+                                                candidate_pairs_tmp, rho_tmp_norm)
+         IF (.NOT. ALLOCATED(k_tmp_block)) CYCLE
+         IF (used_pairs_tmp <= 0) THEN
+            DEALLOCATE (k_tmp_block)
+            CYCLE
+         END IF
+         ri_data%lri_kp%ndebug_k_blocks = ri_data%lri_kp%ndebug_k_blocks + 1
+         CALL hfx_lri_store_debug_k_block( &
+            ri_data%lri_kp%debug_k_blocks(ri_data%lri_kp%ndebug_k_blocks), &
+            ri_data%lri_kp%pair_blocks(ipair_target), ipair_target, k_tmp_block)
+         multi_used_pairs = multi_used_pairs + used_pairs_tmp
+         multi_candidate_pairs = multi_candidate_pairs + candidate_pairs_tmp
+         rho_blocks_norm = rho_blocks_norm + rho_tmp_norm*rho_tmp_norm
+         k_blocks_norm = k_blocks_norm + SUM(k_tmp_block*k_tmp_block)
+         DEALLOCATE (k_tmp_block)
+      END DO
+      rho_blocks_norm = SQRT(rho_blocks_norm)
+      k_blocks_norm = SQRT(k_blocks_norm)
+
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1512,6 +1697,13 @@ CONTAINS
             SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
             "stored K pair", ri_data%lri_kp%debug_k_block%pair_index
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug multi-K block accumulation"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "stored/max blocks", ri_data%lri_kp%ndebug_k_blocks, max_k_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "used/candidates", multi_used_pairs, multi_candidate_pairs
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "rho/K norm", rho_blocks_norm, k_blocks_norm
       END IF
 
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
@@ -1533,18 +1725,33 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      INTEGER                                            :: img, lb1, lb2, lb3, ub1, ub2, ub3
+      INTEGER                                            :: added_blocks, img, ipair, lb1, lb2, lb3, &
+                                                            ub1, ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
-      REAL(dp)                                           :: after_norm, before_norm, k_norm, scale
+      REAL(dp)                                           :: after_norm, before_norm, k_norm, &
+                                                            multi_add_norm2, multi_after_norm2, &
+                                                            multi_before_norm2, scale
       REAL(dp), DIMENSION(:, :), POINTER                 :: ks_block
       TYPE(kpoint_type), POINTER                         :: kpoints
 
       NULLIFY (cell_to_index, kpoints, ks_block)
 
-      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
-      IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) RETURN
-      IF (.NOT. ASSOCIATED(ks_matrix)) RETURN
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug KS writeback skipped: LRI-HFXk state is not associated"
+         RETURN
+      END IF
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug KS writeback skipped: debug K block is not allocated"
+         RETURN
+      END IF
+      IF (.NOT. ASSOCIATED(ks_matrix)) THEN
+         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
+            "debug KS writeback skipped: KS matrix is not associated"
+         RETURN
+      END IF
 
       CALL get_qs_env(qs_env=qs_env, kpoints=kpoints)
       IF (ASSOCIATED(kpoints)) THEN
@@ -1563,7 +1770,15 @@ CONTAINS
                                 ri_data%lri_kp%debug_k_block%cell(3))
          END IF
       END IF
-      IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) RETURN
+      IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) THEN
+         IF (ri_data%unit_nr > 0) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") &
+               "debug KS writeback skipped: invalid image index"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") "img/nimages", img, SIZE(ks_matrix, 2)
+            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") "cell", ri_data%lri_kp%debug_k_block%cell
+         END IF
+         RETURN
+      END IF
 
       CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
                              row=ri_data%lri_kp%debug_k_block%iatom, &
@@ -1583,6 +1798,43 @@ CONTAINS
          before_norm = SQRT(SUM(ks_block*ks_block))
          ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_block%k_block(:, :)
          after_norm = SQRT(SUM(ks_block*ks_block))
+      END IF
+
+      added_blocks = 0
+      multi_before_norm2 = 0.0_dp
+      multi_add_norm2 = 0.0_dp
+      multi_after_norm2 = 0.0_dp
+      IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
+         DO ipair = 1, ri_data%lri_kp%ndebug_k_blocks
+            IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_blocks(ipair)%k_block)) CYCLE
+            IF (ri_data%lri_kp%debug_k_blocks(ipair)%pair_index == &
+                ri_data%lri_kp%debug_k_block%pair_index) CYCLE
+            img = 1
+            IF (ASSOCIATED(cell_to_index)) THEN
+               IF (.NOT. (ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
+                          ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell <= [ub1, ub2, ub3]))) CYCLE
+               img = cell_to_index(ri_data%lri_kp%debug_k_blocks(ipair)%cell(1), &
+                                   ri_data%lri_kp%debug_k_blocks(ipair)%cell(2), &
+                                   ri_data%lri_kp%debug_k_blocks(ipair)%cell(3))
+            END IF
+            IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) CYCLE
+            CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
+                                   row=ri_data%lri_kp%debug_k_blocks(ipair)%iatom, &
+                                   col=ri_data%lri_kp%debug_k_blocks(ipair)%jatom, &
+                                   block=ks_block, found=found)
+            IF (.NOT. found) CYCLE
+            IF (SIZE(ks_block, 1) /= SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 1) .OR. &
+                SIZE(ks_block, 2) /= SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 2)) THEN
+               CPABORT("Inconsistent KS block size in LRI-HFXk multi-block debug writeback")
+            END IF
+            k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_blocks(ipair)%k_block* &
+                              ri_data%lri_kp%debug_k_blocks(ipair)%k_block))
+            multi_before_norm2 = multi_before_norm2 + SUM(ks_block*ks_block)
+            multi_add_norm2 = multi_add_norm2 + (ABS(scale)*k_norm)**2
+            ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_blocks(ipair)%k_block(:, :)
+            multi_after_norm2 = multi_after_norm2 + SUM(ks_block*ks_block)
+            added_blocks = added_blocks + 1
+         END DO
       END IF
 
       IF (ri_data%unit_nr > 0) THEN
@@ -1606,6 +1858,13 @@ CONTAINS
             "scale/add norm", scale, ABS(scale)*k_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "after norm", after_norm
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug multi-K writeback prototype"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "added/stored", added_blocks, ri_data%lri_kp%ndebug_k_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "before/add norm", SQRT(multi_before_norm2), SQRT(multi_add_norm2)
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "after norm", SQRT(multi_after_norm2)
       END IF
 
    END SUBROUTINE hfx_lri_debug_ks_writeback_probe
