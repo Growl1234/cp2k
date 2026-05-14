@@ -56,7 +56,6 @@ MODULE hfx_lri_kp
    PUBLIC :: hfx_lri_update_ks_kp
 
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
-   INTEGER, PARAMETER :: lri_debug_max_density_pairs = 10
    REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
 
 CONTAINS
@@ -1310,12 +1309,13 @@ CONTAINS
    SUBROUTINE hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
 
-      INTEGER                                            :: img, img_pair, ipair, ipair_best, &
-                                                            ipair_sel, lb1, lb2, lb3, nkind, &
-                                                            search_iter, ub1, ub2, ub3, used_pairs
+      INTEGER                                            :: candidate_pairs, img, img_pair, ipair, &
+                                                            ipair_best, ipair_sel, lb1, lb2, lb3, &
+                                                            nkind, search_iter, ub1, ub2, ub3, &
+                                                            used_pairs
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
@@ -1387,13 +1387,13 @@ CONTAINS
                         ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit))
 
       used_pairs = 0
+      candidate_pairs = 0
       rho_norm2_accum = 0.0_dp
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
       ALLOCATE (k_accum_block(ri_data%lri_kp%pair_blocks(ipair_sel)%nao_i, &
                               ri_data%lri_kp%pair_blocks(ipair_sel)%nao_j), SOURCE=0.0_dp)
       ALLOCATE (tried_density_pair(ri_data%lri_kp%npair_blocks), SOURCE=.FALSE.)
       DO search_iter = 1, ri_data%lri_kp%npair_blocks
-         IF (used_pairs >= lri_debug_max_density_pairs) EXIT
 
          ipair_best = 0
          best_r2 = HUGE(1.0_dp)
@@ -1410,6 +1410,7 @@ CONTAINS
          END DO
          IF (ipair_best == 0) EXIT
          tried_density_pair(ipair_best) = .TRUE.
+         candidate_pairs = candidate_pairs + 1
 
          img_pair = 1
          IF (ASSOCIATED(cell_to_index)) THEN
@@ -1443,6 +1444,11 @@ CONTAINS
       rho_accum_norm = SQRT(rho_norm2_accum)
       k_accum_norm = SQRT(SUM(k_accum_block*k_accum_block))
 
+      IF (ALLOCATED(ri_data%lri_kp%debug_k_block)) DEALLOCATE (ri_data%lri_kp%debug_k_block)
+      ALLOCATE (ri_data%lri_kp%debug_k_block(SIZE(k_accum_block, 1), SIZE(k_accum_block, 2)))
+      ri_data%lri_kp%debug_k_block(:, :) = k_accum_block(:, :)
+      ri_data%lri_kp%debug_k_pair_index = ipair_sel
+
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1464,11 +1470,14 @@ CONTAINS
             "real K norm", k_norm
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug nearest-origin K accumulation"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "used/max density", used_pairs, lri_debug_max_density_pairs
+            "used/candidates", used_pairs, candidate_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "rho threshold", lri_debug_rho_threshold
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_accum_norm, k_accum_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "stored K dims", SIZE(ri_data%lri_kp%debug_k_block, 1), &
+            SIZE(ri_data%lri_kp%debug_k_block, 2)
       END IF
 
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
