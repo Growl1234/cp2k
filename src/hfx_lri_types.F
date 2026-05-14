@@ -12,7 +12,7 @@ MODULE hfx_lri_types
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release
+   PUBLIC :: hfx_lri_k_block_type, hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release
 
    TYPE hfx_lri_pair_block_type
       INTEGER                                            :: iatom = 0, ikind = 0, jatom = 0, &
@@ -23,6 +23,14 @@ MODULE hfx_lri_types
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_fit
    END TYPE hfx_lri_pair_block_type
+
+   TYPE hfx_lri_k_block_type
+      INTEGER                                            :: pair_index = 0
+      INTEGER                                            :: iatom = 0, ikind = 0, jatom = 0, &
+                                                            jkind = 0, nao_i = 0, nao_j = 0
+      INTEGER, DIMENSION(3)                              :: cell = 0
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
+   END TYPE hfx_lri_k_block_type
 
    TYPE hfx_lri_kp_type
       LOGICAL :: initialized = .FALSE.
@@ -40,8 +48,7 @@ MODULE hfx_lri_types
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
 
-      INTEGER :: debug_k_pair_index = 0
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: debug_k_block
+      TYPE(hfx_lri_k_block_type) :: debug_k_block
    END TYPE hfx_lri_kp_type
 
 CONTAINS
@@ -56,8 +63,8 @@ CONTAINS
       INTEGER                                            :: ipair
 
       IF (ASSOCIATED(lri_kp)) THEN
-         IF (ALLOCATED(lri_kp%debug_k_block)) THEN
-            DEALLOCATE (lri_kp%debug_k_block)
+         IF (ALLOCATED(lri_kp%debug_k_block%k_block)) THEN
+            DEALLOCATE (lri_kp%debug_k_block%k_block)
          END IF
          IF (ALLOCATED(lri_kp%pair_blocks)) THEN
             DO ipair = 1, SIZE(lri_kp%pair_blocks)
