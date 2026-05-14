@@ -114,9 +114,10 @@ CONTAINS
       INTEGER :: dbg_iatom, dbg_ikind, dbg_j_cols, dbg_j_rows, dbg_jatom, dbg_ji_ncart, &
          dbg_jj_ncart, dbg_jkind, dbg_m_dim, dbg_m_eig_small, dbg_m_ncart, dbg_nao_i, dbg_nao_j, &
          dbg_naux_i, dbg_naux_j, dbg_naux_pair, dbg_sph_j_cols, dbg_sph_j_rows, dbg_sph_m_dim, &
-         handle, iatom, ibasis, ikind, ilist, ipair_block, jatom, jkind, jneighbor, mepos, nao_i, &
-         nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npair_blocks_local, &
-         npair_blocks_max, npair_blocks_sum, npairs_local, npairs_max, npairs_sum
+         dbg_stored_index, handle, iatom, ibasis, ikind, ilist, ipair_block, jatom, jkind, &
+         jneighbor, mepos, nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, &
+         npair_blocks_local, npair_blocks_max, npair_blocks_sum, npairs_local, npairs_max, &
+         npairs_sum
       INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_stored_local, &
          c_nreal_stored_max, c_nreal_stored_sum, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
@@ -126,7 +127,7 @@ CONTAINS
       REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_stored_local, c_mem_mib_stored_max, &
          c_mem_mib_stored_sum, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, dbg_ji_norm, dbg_jj_norm, &
          dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, dbg_m_eig_max, dbg_m_eig_min, &
-         dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_j_norm, dbg_sph_m_norm
+         dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_j_norm, dbg_sph_m_norm, dbg_stored_c_norm
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -181,6 +182,8 @@ CONTAINS
       dbg_sph_m_norm = 0.0_dp
       dbg_sph_j_norm = 0.0_dp
       dbg_sph_c_norm = 0.0_dp
+      dbg_stored_index = 0
+      dbg_stored_c_norm = 0.0_dp
 
       CALL timeset(routineN, handle)
 
@@ -306,6 +309,18 @@ CONTAINS
                                            dbg_sph_j_rows, dbg_sph_j_cols, dbg_sph_m_norm, &
                                            dbg_sph_j_norm, dbg_sph_c_norm)
          dbg_integrals_done = .TRUE.
+      END IF
+
+      IF (dbg_pair_found .AND. ri_data%lri_kp%npair_blocks > 0) THEN
+         dbg_stored_index = hfx_lri_find_pair_block(ri_data%lri_kp%pair_blocks, &
+                                                    ri_data%lri_kp%npair_blocks, &
+                                                    dbg_iatom, dbg_jatom, dbg_cell)
+         IF (dbg_stored_index > 0) THEN
+            IF (ALLOCATED(ri_data%lri_kp%pair_blocks(dbg_stored_index)%c_fit)) THEN
+               dbg_stored_c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(dbg_stored_index)%c_fit* &
+                                            ri_data%lri_kp%pair_blocks(dbg_stored_index)%c_fit))
+            END IF
+         END IF
       END IF
 
       ! Restore the standard QS screening radii after the LRI-HFXk setup.
@@ -454,6 +469,9 @@ CONTAINS
                      "C norm/MiB", SQRT(SUM(dbg_pair_block%c_fit*dbg_pair_block%c_fit)), &
                      REAL(SIZE(dbg_pair_block%c_fit), KIND=dp)*8.0_dp/1024.0_dp**2
                END IF
+               WRITE (ri_data%unit_nr, "(/,T4,A)") "debug stored pair lookup"
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+                  "index/C norm", dbg_stored_index, dbg_stored_c_norm
             END IF
          END IF
       END IF
@@ -1232,5 +1250,34 @@ CONTAINS
       END DO
 
    END SUBROUTINE hfx_lri_pack_pair_coefficients
+
+! **************************************************************************************************
+!> \brief Finds a stored pair-local LRI coefficient block by atom pair and cell.
+!> \param pair_blocks ...
+!> \param npair_blocks ...
+!> \param iatom ...
+!> \param jatom ...
+!> \param cell ...
+!> \return ...
+! **************************************************************************************************
+   INTEGER FUNCTION hfx_lri_find_pair_block(pair_blocks, npair_blocks, iatom, jatom, cell) RESULT(ipair_found)
+
+      TYPE(hfx_lri_pair_block_type), DIMENSION(:), &
+         INTENT(IN)                                      :: pair_blocks
+      INTEGER, INTENT(IN)                                :: npair_blocks, iatom, jatom
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
+
+      INTEGER                                            :: ipair
+
+      ipair_found = 0
+      DO ipair = 1, MIN(npair_blocks, SIZE(pair_blocks))
+         IF (pair_blocks(ipair)%iatom == iatom .AND. pair_blocks(ipair)%jatom == jatom .AND. &
+             ALL(pair_blocks(ipair)%cell == cell)) THEN
+            ipair_found = ipair
+            RETURN
+         END IF
+      END DO
+
+   END FUNCTION hfx_lri_find_pair_block
 
 END MODULE hfx_lri_kp
