@@ -1730,14 +1730,13 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      INTEGER                                            :: added_blocks, debug_img, img, ipair, lb1, lb2, &
-                                                            lb3, skipped_blocks, ub1, ub2, ub3
+      INTEGER                                            :: added_blocks, debug_img, img, ipair, &
+                                                            lb1, lb2, lb3, skipped_blocks, ub1, &
+                                                            ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: debug_found, found
-      REAL(dp)                                           :: after_norm, before_norm, debug_add_norm, &
-                                                            debug_after_norm, debug_before_norm, &
-                                                            debug_k_norm, k_norm, multi_add_norm2, &
-                                                            multi_after_norm2, multi_before_norm2, scale
+      REAL(dp) :: debug_add_norm, debug_before_norm, debug_k_norm, k_norm, multi_add_norm2, &
+         multi_after_norm2, multi_before_norm2, scale
       REAL(dp), DIMENSION(:, :), POINTER                 :: ks_block
       TYPE(kpoint_type), POINTER                         :: kpoints
 
@@ -1746,11 +1745,6 @@ CONTAINS
       IF (.NOT. ASSOCIATED(ri_data%lri_kp)) THEN
          IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
             "debug KS writeback skipped: LRI-HFXk state is not associated"
-         RETURN
-      END IF
-      IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) THEN
-         IF (ri_data%unit_nr > 0) WRITE (ri_data%unit_nr, "(/,T4,A)") &
-            "debug KS writeback skipped: debug K block is not allocated"
          RETURN
       END IF
       IF (.NOT. ASSOCIATED(ks_matrix)) THEN
@@ -1764,54 +1758,47 @@ CONTAINS
          CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index)
       END IF
 
-      img = 1
-      IF (ASSOCIATED(cell_to_index)) THEN
-         lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
-         lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
-         lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
-         IF (ALL(ri_data%lri_kp%debug_k_block%cell >= [lb1, lb2, lb3]) .AND. &
-             ALL(ri_data%lri_kp%debug_k_block%cell <= [ub1, ub2, ub3])) THEN
-            img = cell_to_index(ri_data%lri_kp%debug_k_block%cell(1), &
-                                ri_data%lri_kp%debug_k_block%cell(2), &
-                                ri_data%lri_kp%debug_k_block%cell(3))
-         END IF
-      END IF
-      IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) THEN
-         IF (ri_data%unit_nr > 0) THEN
-            WRITE (ri_data%unit_nr, "(/,T4,A)") &
-               "debug KS writeback skipped: invalid image index"
-            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") "img/nimages", img, SIZE(ks_matrix, 2)
-            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") "cell", ri_data%lri_kp%debug_k_block%cell
-         END IF
-         RETURN
-      END IF
-
-      CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
-                             row=ri_data%lri_kp%debug_k_block%iatom, &
-                             col=ri_data%lri_kp%debug_k_block%jatom, &
-                             block=ks_block, found=found)
-
-      k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block* &
-                        ri_data%lri_kp%debug_k_block%k_block))
       scale = hf_fraction
-      before_norm = 0.0_dp
-      after_norm = 0.0_dp
-      IF (found) THEN
-         IF (SIZE(ks_block, 1) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 1) .OR. &
-             SIZE(ks_block, 2) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)) THEN
-            CPABORT("Inconsistent KS block size in LRI-HFXk debug writeback")
-         END IF
-         before_norm = SQRT(SUM(ks_block*ks_block))
-         ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_block%k_block(:, :)
-         after_norm = SQRT(SUM(ks_block*ks_block))
-      END IF
+      debug_img = 0
+      debug_found = .FALSE.
+      debug_before_norm = 0.0_dp
+      debug_k_norm = 0.0_dp
+      debug_add_norm = 0.0_dp
 
-      debug_img = img
-      debug_found = found
-      debug_k_norm = k_norm
-      debug_add_norm = ABS(scale)*debug_k_norm
-      debug_before_norm = before_norm
-      debug_after_norm = after_norm
+      ! Keep the single debug K block as a diagnostic only. The actual prototype
+      ! writeback below uses the rank-local multi-K block list exclusively.
+      IF (ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) THEN
+         img = 1
+         IF (ASSOCIATED(cell_to_index)) THEN
+            lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+            lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+            lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+            IF (ALL(ri_data%lri_kp%debug_k_block%cell >= [lb1, lb2, lb3]) .AND. &
+                ALL(ri_data%lri_kp%debug_k_block%cell <= [ub1, ub2, ub3])) THEN
+               img = cell_to_index(ri_data%lri_kp%debug_k_block%cell(1), &
+                                   ri_data%lri_kp%debug_k_block%cell(2), &
+                                   ri_data%lri_kp%debug_k_block%cell(3))
+            END IF
+         END IF
+         debug_img = img
+         IF (img >= 1 .AND. img <= SIZE(ks_matrix, 2)) THEN
+            CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
+                                   row=ri_data%lri_kp%debug_k_block%iatom, &
+                                   col=ri_data%lri_kp%debug_k_block%jatom, &
+                                   block=ks_block, found=found)
+            debug_found = found
+            IF (found) THEN
+               IF (SIZE(ks_block, 1) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 1) .OR. &
+                   SIZE(ks_block, 2) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)) THEN
+                  CPABORT("Inconsistent KS block size in LRI-HFXk debug writeback")
+               END IF
+               debug_before_norm = SQRT(SUM(ks_block*ks_block))
+            END IF
+         END IF
+         debug_k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block* &
+                                 ri_data%lri_kp%debug_k_block%k_block))
+         debug_add_norm = ABS(scale)*debug_k_norm
+      END IF
 
       added_blocks = 0
       multi_before_norm2 = 0.0_dp
@@ -1820,8 +1807,6 @@ CONTAINS
       IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
          DO ipair = 1, ri_data%lri_kp%ndebug_k_blocks
             IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_blocks(ipair)%k_block)) CYCLE
-            IF (ri_data%lri_kp%debug_k_blocks(ipair)%pair_index == &
-                ri_data%lri_kp%debug_k_block%pair_index) CYCLE
             img = 1
             IF (ASSOCIATED(cell_to_index)) THEN
                IF (.NOT. (ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
@@ -1856,31 +1841,33 @@ CONTAINS
       END IF
 
       IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback prototype"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "pair/image", ri_data%lri_kp%debug_k_block%pair_index, debug_img
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "atoms", ri_data%lri_kp%debug_k_block%iatom, &
-            ri_data%lri_kp%debug_k_block%jatom
-         WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
-            "cell", ri_data%lri_kp%debug_k_block%cell
-         IF (debug_found) THEN
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback diagnostic"
+         IF (ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) THEN
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "KS dims", SIZE(ri_data%lri_kp%debug_k_block%k_block, 1), &
-               SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
+               "pair/image", ri_data%lri_kp%debug_k_block%pair_index, debug_img
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "atoms", ri_data%lri_kp%debug_k_block%iatom, &
+               ri_data%lri_kp%debug_k_block%jatom
+            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
+               "cell", ri_data%lri_kp%debug_k_block%cell
+            IF (debug_found) THEN
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+                  "KS dims", SIZE(ri_data%lri_kp%debug_k_block%k_block, 1), &
+                  SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
+            ELSE
+               WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
+            END IF
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+               "before norm", debug_before_norm
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+               "debug K norm", debug_k_norm
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+               "scale", scale
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+               "would-add norm", debug_add_norm
          ELSE
-            WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
+            WRITE (ri_data%unit_nr, "(T6,A)") "debug K block is not allocated"
          END IF
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "before norm", debug_before_norm
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "debug K norm", debug_k_norm
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "scale", scale
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "add norm", debug_add_norm
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "after norm", debug_after_norm
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug multi-K writeback prototype"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "added/stored", added_blocks, ri_data%lri_kp%ndebug_k_blocks
