@@ -110,9 +110,9 @@ CONTAINS
 
       INTEGER :: dbg_iatom, dbg_ikind, dbg_j_cols, dbg_j_rows, dbg_jatom, dbg_ji_ncart, &
          dbg_jj_ncart, dbg_jkind, dbg_m_dim, dbg_m_eig_small, dbg_m_ncart, dbg_nao_i, dbg_nao_j, &
-         dbg_naux_i, dbg_naux_j, dbg_naux_pair, handle, iatom, ibasis, ikind, ilist, jatom, jkind, &
-         jneighbor, mepos, nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, &
-         npairs_local, npairs_max, npairs_sum
+         dbg_naux_i, dbg_naux_j, dbg_naux_pair, dbg_sph_j_cols, dbg_sph_j_rows, dbg_sph_m_dim, &
+         handle, iatom, ibasis, ikind, ilist, jatom, jkind, jneighbor, mepos, nao_i, nao_j, &
+         naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, npairs_max, npairs_sum
       INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
          sum_naux_pair_sum
@@ -120,7 +120,8 @@ CONTAINS
       LOGICAL                                            :: dbg_integrals_done, dbg_pair_found
       REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, &
          dbg_ji_norm, dbg_jj_norm, dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, &
-         dbg_m_eig_max, dbg_m_eig_min, dbg_m_norm, dbg_r2
+         dbg_m_eig_max, dbg_m_eig_min, dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_j_norm, &
+         dbg_sph_m_norm
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -156,6 +157,9 @@ CONTAINS
       dbg_m_dim = 0
       dbg_j_rows = 0
       dbg_j_cols = 0
+      dbg_sph_m_dim = 0
+      dbg_sph_j_rows = 0
+      dbg_sph_j_cols = 0
       dbg_m_norm = 0.0_dp
       dbg_ji_norm = 0.0_dp
       dbg_jj_norm = 0.0_dp
@@ -167,6 +171,9 @@ CONTAINS
       dbg_m_eig_cond = 0.0_dp
       dbg_m_eig_small = 0
       dbg_c_norm = 0.0_dp
+      dbg_sph_m_norm = 0.0_dp
+      dbg_sph_j_norm = 0.0_dp
+      dbg_sph_c_norm = 0.0_dp
 
       CALL timeset(routineN, handle)
 
@@ -264,7 +271,9 @@ CONTAINS
                                            dbg_m_dim, dbg_j_rows, dbg_j_cols, dbg_m_dense_norm, &
                                            dbg_j_norm, dbg_m_cond_diag, dbg_m_eig_min, &
                                            dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
-                                           dbg_c_norm)
+                                           dbg_c_norm, dbg_sph_m_dim, dbg_sph_j_rows, &
+                                           dbg_sph_j_cols, dbg_sph_m_norm, dbg_sph_j_norm, &
+                                           dbg_sph_c_norm)
          dbg_integrals_done = .TRUE.
       END IF
 
@@ -378,6 +387,15 @@ CONTAINS
                   "eig cond/small", dbg_m_eig_cond, dbg_m_eig_small
                WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                   "C=J Minv norm", dbg_c_norm
+               WRITE (ri_data%unit_nr, "(/,T4,A)") "debug spherical contracted blocks"
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+                  "metric dim/norm", dbg_sph_m_dim, dbg_sph_m_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+                  "J rows/cols", dbg_sph_j_rows, dbg_sph_j_cols
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "J norm", dbg_sph_j_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "C=J Minv norm", dbg_sph_c_norm
             END IF
          END IF
       END IF
@@ -411,13 +429,20 @@ CONTAINS
 !> \param metric_eig_cond ...
 !> \param metric_eig_small ...
 !> \param c_norm ...
+!> \param sph_metric_dim ...
+!> \param sph_j_rows ...
+!> \param sph_j_cols ...
+!> \param sph_metric_norm ...
+!> \param sph_j_norm ...
+!> \param sph_c_norm ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
                                            metric_ncart, threec_i_ncart, threec_j_ncart, &
                                            metric_norm, threec_i_norm, threec_j_norm, metric_dim, &
                                            threec_rows, threec_cols, metric_dense_norm, threec_norm, &
                                            metric_diag_cond, metric_eig_min, metric_eig_max, &
-                                           metric_eig_cond, metric_eig_small, c_norm)
+                                           metric_eig_cond, metric_eig_small, c_norm, sph_metric_dim, sph_j_rows, sph_j_cols, &
+                                           sph_metric_norm, sph_j_norm, sph_c_norm)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -433,15 +458,20 @@ CONTAINS
                                                             metric_eig_max, metric_eig_cond
       INTEGER, INTENT(OUT)                               :: metric_eig_small
       REAL(dp), INTENT(OUT)                              :: c_norm
+      INTEGER, INTENT(OUT)                               :: sph_metric_dim, sph_j_rows, sph_j_cols
+      REAL(dp), INTENT(OUT)                              :: sph_metric_norm, sph_j_norm, sph_c_norm
 
       INTEGER                                            :: idim, maxl_ai, maxl_aj, maxl_ri, &
                                                             maxl_rj, mmax, ncart_ai, ncart_aj, &
-                                                            ncart_ri, ncart_rj, offset_j
+                                                            ncart_ri, ncart_rj, offset_j, &
+                                                            sph_eig_small
       LOGICAL                                            :: onsite_aux
-      REAL(dp)                                           :: diag_abs, diag_max, diag_min, &
-                                                            metric_norm2, threec_i_norm2, &
-                                                            threec_j_norm2
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: j_block, metric_block
+      REAL(dp) :: diag_abs, diag_max, diag_min, metric_norm2, sph_eig_cond, sph_eig_max, &
+         sph_eig_min, threec_i_norm2, threec_j_norm2
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: j_block, j_sph, metric_block, &
+                                                            metric_sph, sphi_aux, sphi_i, sphi_j, &
+                                                            sphi_pair, sphi_ri_i, sphi_ri_j, &
+                                                            tmp_sph
       REAL(dp), DIMENSION(3)                             :: r0
       TYPE(cp_libint_t)                                  :: lib2, lib3
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
@@ -470,6 +500,12 @@ CONTAINS
       metric_eig_cond = 0.0_dp
       metric_eig_small = 0
       c_norm = 0.0_dp
+      sph_metric_dim = 0
+      sph_j_rows = 0
+      sph_j_cols = 0
+      sph_metric_norm = 0.0_dp
+      sph_j_norm = 0.0_dp
+      sph_c_norm = 0.0_dp
 
       IF (.NOT. ASSOCIATED(obas_i)) RETURN
       IF (.NOT. ASSOCIATED(obas_j)) RETURN
@@ -493,6 +529,10 @@ CONTAINS
       metric_norm2 = 0.0_dp
       threec_i_norm2 = 0.0_dp
       threec_j_norm2 = 0.0_dp
+      sph_eig_min = 0.0_dp
+      sph_eig_max = 0.0_dp
+      sph_eig_cond = 0.0_dp
+      sph_eig_small = 0
       onsite_aux = (NORM2(rab) <= 1.0E-12_dp .AND. ikind == jkind)
 
       CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_i, r0, r0, lib2, ri_data, metric_ncart, &
@@ -550,6 +590,49 @@ CONTAINS
 
          CALL hfx_lri_probe_metric_inverse(metric_block, j_block, metric_eig_min, metric_eig_max, &
                                            metric_eig_cond, metric_eig_small, c_norm)
+
+         CALL hfx_lri_build_sphi_matrix(obas_i, sphi_i)
+         CALL hfx_lri_build_sphi_matrix(obas_j, sphi_j)
+         CALL hfx_lri_build_sphi_matrix(rbas_i, sphi_ri_i)
+         IF (.NOT. onsite_aux) THEN
+            CALL hfx_lri_build_sphi_matrix(rbas_j, sphi_ri_j)
+         ELSE
+            ALLOCATE (sphi_ri_j(0, 0))
+         END IF
+
+         sph_metric_dim = SIZE(sphi_ri_i, 2)
+         IF (.NOT. onsite_aux) sph_metric_dim = sph_metric_dim + SIZE(sphi_ri_j, 2)
+         sph_j_rows = SIZE(sphi_i, 2)*SIZE(sphi_j, 2)
+         sph_j_cols = sph_metric_dim
+
+         IF (sph_metric_dim > 0 .AND. sph_j_rows > 0) THEN
+            ALLOCATE (sphi_aux(metric_dim, sph_metric_dim), SOURCE=0.0_dp)
+            sphi_aux(1:ncart_ri, 1:SIZE(sphi_ri_i, 2)) = sphi_ri_i
+            IF (.NOT. onsite_aux) THEN
+               sphi_aux(ncart_ri + 1:metric_dim, SIZE(sphi_ri_i, 2) + 1:sph_metric_dim) = sphi_ri_j
+            END IF
+            CALL hfx_lri_build_pair_sphi(sphi_i, sphi_j, sphi_pair)
+
+            ALLOCATE (tmp_sph(metric_dim, sph_metric_dim), SOURCE=0.0_dp)
+            tmp_sph = MATMUL(metric_block, sphi_aux)
+            ALLOCATE (metric_sph(sph_metric_dim, sph_metric_dim), SOURCE=0.0_dp)
+            metric_sph = MATMUL(TRANSPOSE(sphi_aux), tmp_sph)
+            DEALLOCATE (tmp_sph)
+
+            ALLOCATE (tmp_sph(threec_rows, sph_metric_dim), SOURCE=0.0_dp)
+            tmp_sph = MATMUL(j_block, sphi_aux)
+            ALLOCATE (j_sph(sph_j_rows, sph_j_cols), SOURCE=0.0_dp)
+            j_sph = MATMUL(TRANSPOSE(sphi_pair), tmp_sph)
+            DEALLOCATE (tmp_sph)
+
+            sph_metric_norm = SQRT(SUM(metric_sph*metric_sph))
+            sph_j_norm = SQRT(SUM(j_sph*j_sph))
+            CALL hfx_lri_probe_metric_inverse(metric_sph, j_sph, sph_eig_min, sph_eig_max, &
+                                              sph_eig_cond, sph_eig_small, sph_c_norm)
+
+            DEALLOCATE (j_sph, metric_sph, sphi_aux, sphi_pair)
+         END IF
+         DEALLOCATE (sphi_ri_j, sphi_ri_i, sphi_j, sphi_i)
 
          DEALLOCATE (j_block, metric_block)
       END IF
@@ -844,6 +927,72 @@ CONTAINS
       END DO
 
    END SUBROUTINE hfx_lri_fill_3c_block
+
+! **************************************************************************************************
+!> \brief Builds the raw-Cartesian to spherical/contracted transformation for one basis.
+!> \param basis ...
+!> \param transform ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_build_sphi_matrix(basis, transform)
+
+      TYPE(gto_basis_set_type), POINTER                  :: basis
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: transform
+
+      INTEGER                                            :: cart0, iset, ncart_set, nset, nsgf, sgf0
+      INTEGER, DIMENSION(:), POINTER                     :: lmax, npgf, nsgf_set
+      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf
+      REAL(dp), DIMENSION(:, :), POINTER                 :: sphi
+
+      CALL get_gto_basis_set(basis, first_sgf=first_sgf, lmax=lmax, npgf=npgf, nset=nset, &
+                             nsgf=nsgf, nsgf_set=nsgf_set, sphi=sphi)
+      ALLOCATE (transform(hfx_lri_count_cart_functions(basis), nsgf), SOURCE=0.0_dp)
+      cart0 = 0
+      DO iset = 1, nset
+         ncart_set = npgf(iset)*ncoset(lmax(iset))
+         sgf0 = first_sgf(1, iset)
+         IF (ncart_set > 0 .AND. nsgf_set(iset) > 0) THEN
+            transform(cart0 + 1:cart0 + ncart_set, sgf0:sgf0 + nsgf_set(iset) - 1) = &
+               sphi(1:ncart_set, sgf0:sgf0 + nsgf_set(iset) - 1)
+         END IF
+         cart0 = cart0 + ncart_set
+      END DO
+
+   END SUBROUTINE hfx_lri_build_sphi_matrix
+
+! **************************************************************************************************
+!> \brief Builds the product transformation for an AO pair.
+!> \param sphi_a ...
+!> \param sphi_b ...
+!> \param pair_sphi ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_build_pair_sphi(sphi_a, sphi_b, pair_sphi)
+
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: sphi_a, sphi_b
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: pair_sphi
+
+      INTEGER                                            :: ca, cb, ncart_a, ncart_b, nsgf_a, &
+                                                            nsgf_b, sa, sb
+
+      ncart_a = SIZE(sphi_a, 1)
+      ncart_b = SIZE(sphi_b, 1)
+      nsgf_a = SIZE(sphi_a, 2)
+      nsgf_b = SIZE(sphi_b, 2)
+      ALLOCATE (pair_sphi(ncart_a*ncart_b, nsgf_a*nsgf_b), SOURCE=0.0_dp)
+
+      DO sa = 1, nsgf_a
+         DO sb = 1, nsgf_b
+            DO ca = 1, ncart_a
+               DO cb = 1, ncart_b
+                  pair_sphi((ca - 1)*ncart_b + cb, (sa - 1)*nsgf_b + sb) = &
+                     sphi_a(ca, sa)*sphi_b(cb, sb)
+               END DO
+            END DO
+         END DO
+      END DO
+
+   END SUBROUTINE hfx_lri_build_pair_sphi
 
 ! **************************************************************************************************
 !> \brief Diagonalizes a debug metric block and probes C = J M^-1.
