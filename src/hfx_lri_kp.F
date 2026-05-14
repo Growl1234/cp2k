@@ -57,6 +57,7 @@ MODULE hfx_lri_kp
 
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
    INTEGER, PARAMETER :: lri_debug_max_accum_pairs = 10
+   REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
 
 CONTAINS
 
@@ -1341,7 +1342,8 @@ CONTAINS
       LOGICAL                                            :: found
       REAL(dp)                                           :: c_norm, k_accum_norm, k_norm, &
                                                             k_norm2_accum, rho_accum_norm, &
-                                                            rho_norm, rho_norm2_accum
+                                                            rho_norm, rho_norm2_accum, &
+                                                            rho_pair_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -1406,7 +1408,6 @@ CONTAINS
       k_norm2_accum = 0.0_dp
       DO ipair = 1, ri_data%lri_kp%npair_blocks
          IF (naccum >= lri_debug_max_accum_pairs) EXIT
-         IF (ANY(ri_data%lri_kp%pair_blocks(ipair)%cell /= 0)) CYCLE
          IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
          IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%v_fit)) CYCLE
 
@@ -1430,9 +1431,12 @@ CONTAINS
                                 block=rho_block, found=found)
          IF (.NOT. found) CYCLE
 
+         rho_pair_norm = SQRT(SUM(rho_block*rho_block))
+         IF (rho_pair_norm < lri_debug_rho_threshold) CYCLE
+
          CALL hfx_lri_contract_real_density_self(ri_data%lri_kp%pair_blocks(ipair), rho_block, &
                                                  k_block)
-         rho_norm2_accum = rho_norm2_accum + SUM(rho_block*rho_block)
+         rho_norm2_accum = rho_norm2_accum + rho_pair_norm*rho_pair_norm
          k_norm2_accum = k_norm2_accum + SUM(k_block*k_block)
          DEALLOCATE (k_block)
          naccum = naccum + 1
@@ -1459,9 +1463,11 @@ CONTAINS
             "rho/C norm", rho_norm, c_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "real K norm", k_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug same-cell K accumulation"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug rho-selected K accumulation"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "used/max pairs", naccum, lri_debug_max_accum_pairs
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "rho threshold", lri_debug_rho_threshold
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_accum_norm, k_accum_norm
       END IF
