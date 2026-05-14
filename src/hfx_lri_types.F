@@ -39,6 +39,9 @@ MODULE hfx_lri_types
       REAL(dp) :: c_mem_mib_stored = 0.0_dp
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
+
+      INTEGER :: debug_k_pair_index = 0
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: debug_k_block
    END TYPE hfx_lri_kp_type
 
 CONTAINS
@@ -53,6 +56,9 @@ CONTAINS
       INTEGER                                            :: ipair
 
       IF (ASSOCIATED(lri_kp)) THEN
+         IF (ALLOCATED(lri_kp%debug_k_block)) THEN
+            DEALLOCATE (lri_kp%debug_k_block)
+         END IF
          IF (ALLOCATED(lri_kp%pair_blocks)) THEN
             DO ipair = 1, SIZE(lri_kp%pair_blocks)
                IF (ALLOCATED(lri_kp%pair_blocks(ipair)%c_fit)) THEN
