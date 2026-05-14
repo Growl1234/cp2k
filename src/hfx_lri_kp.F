@@ -1302,6 +1302,38 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Reads a stored-pair density block from the current real-space density matrices.
+!> \brief Stores a debug K block together with its target pair metadata.
+!> \param k_pair ...
+!> \param pair_block ...
+!> \param pair_index ...
+!> \param k_block ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_store_debug_k_block(k_pair, pair_block, pair_index, k_block)
+
+      USE hfx_lri_types, ONLY: hfx_lri_k_block_type
+      TYPE(hfx_lri_k_block_type), INTENT(INOUT)          :: k_pair
+      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_block
+      INTEGER, INTENT(IN)                                :: pair_index
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: k_block
+
+      IF (ALLOCATED(k_pair%k_block)) DEALLOCATE (k_pair%k_block)
+
+      k_pair%pair_index = pair_index
+      k_pair%iatom = pair_block%iatom
+      k_pair%jatom = pair_block%jatom
+      k_pair%ikind = pair_block%ikind
+      k_pair%jkind = pair_block%jkind
+      k_pair%cell(:) = pair_block%cell(:)
+      k_pair%nao_i = SIZE(k_block, 1)
+      k_pair%nao_j = SIZE(k_block, 2)
+
+      ALLOCATE (k_pair%k_block(SIZE(k_block, 1), SIZE(k_block, 2)))
+      k_pair%k_block(:, :) = k_block(:, :)
+
+   END SUBROUTINE hfx_lri_store_debug_k_block
+
+! **************************************************************************************************
+!> \brief ...
 !> \param qs_env ...
 !> \param ri_data ...
 !> \param rho_ao ...
@@ -1444,10 +1476,9 @@ CONTAINS
       rho_accum_norm = SQRT(rho_norm2_accum)
       k_accum_norm = SQRT(SUM(k_accum_block*k_accum_block))
 
-      IF (ALLOCATED(ri_data%lri_kp%debug_k_block)) DEALLOCATE (ri_data%lri_kp%debug_k_block)
-      ALLOCATE (ri_data%lri_kp%debug_k_block(SIZE(k_accum_block, 1), SIZE(k_accum_block, 2)))
-      ri_data%lri_kp%debug_k_block(:, :) = k_accum_block(:, :)
-      ri_data%lri_kp%debug_k_pair_index = ipair_sel
+      CALL hfx_lri_store_debug_k_block(ri_data%lri_kp%debug_k_block, &
+                                       ri_data%lri_kp%pair_blocks(ipair_sel), &
+                                       ipair_sel, k_accum_block)
 
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
@@ -1476,8 +1507,10 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_accum_norm, k_accum_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "stored K dims", SIZE(ri_data%lri_kp%debug_k_block, 1), &
-            SIZE(ri_data%lri_kp%debug_k_block, 2)
+            "stored K dims", SIZE(ri_data%lri_kp%debug_k_block%k_block, 1), &
+            SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+            "stored K pair", ri_data%lri_kp%debug_k_block%pair_index
       END IF
 
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
