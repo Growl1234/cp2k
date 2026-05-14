@@ -12,7 +12,7 @@ MODULE hfx_lri_types
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_kp_type, hfx_lri_kp_release
+   PUBLIC :: hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release
 
    TYPE hfx_lri_kp_type
       LOGICAL :: initialized = .FALSE.
@@ -25,6 +25,14 @@ MODULE hfx_lri_types
 
       REAL(dp) :: c_mem_mib_est = 0.0_dp
    END TYPE hfx_lri_kp_type
+
+   TYPE hfx_lri_pair_block_type
+      INTEGER                                            :: iatom = 0, ikind = 0, jatom = 0, &
+                                                            jkind = 0, nao_i = 0, nao_j = 0, &
+                                                            naux_pair = 0
+      INTEGER, DIMENSION(3)                              :: cell = 0
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
+   END TYPE hfx_lri_pair_block_type
 
 CONTAINS
 
