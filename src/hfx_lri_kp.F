@@ -109,17 +109,18 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_pre_scf_kp'
 
       INTEGER :: dbg_iatom, dbg_ikind, dbg_j_cols, dbg_j_rows, dbg_jatom, dbg_ji_ncart, &
-         dbg_jj_ncart, dbg_jkind, dbg_m_dim, dbg_m_ncart, dbg_nao_i, dbg_nao_j, dbg_naux_i, &
-         dbg_naux_j, dbg_naux_pair, handle, iatom, ibasis, ikind, ilist, jatom, jkind, jneighbor, &
-         mepos, nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, npairs_local, &
-         npairs_max, npairs_sum
+         dbg_jj_ncart, dbg_jkind, dbg_m_dim, dbg_m_eig_small, dbg_m_ncart, dbg_nao_i, dbg_nao_j, &
+         dbg_naux_i, dbg_naux_j, dbg_naux_pair, handle, iatom, ibasis, ikind, ilist, jatom, jkind, &
+         jneighbor, mepos, nao_i, nao_j, naux_i, naux_j, naux_pair, nkind, nlist, nneighbor, &
+         npairs_local, npairs_max, npairs_sum
       INTEGER(int_8) :: c_nreal, c_nreal_local, c_nreal_max, c_nreal_sum, sum_nao_pair_local, &
          sum_nao_pair_max, sum_nao_pair_sum, sum_naux_pair_local, sum_naux_pair_max, &
          sum_naux_pair_sum
       INTEGER, DIMENSION(3)                              :: cell_j, dbg_cell
       LOGICAL                                            :: dbg_integrals_done, dbg_pair_found
-      REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_sum, dbg_j_norm, dbg_ji_norm, &
-         dbg_jj_norm, dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_norm, dbg_r2
+      REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, &
+         dbg_ji_norm, dbg_jj_norm, dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, &
+         dbg_m_eig_max, dbg_m_eig_min, dbg_m_norm, dbg_r2
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -161,6 +162,11 @@ CONTAINS
       dbg_m_dense_norm = 0.0_dp
       dbg_j_norm = 0.0_dp
       dbg_m_cond_diag = 0.0_dp
+      dbg_m_eig_min = 0.0_dp
+      dbg_m_eig_max = 0.0_dp
+      dbg_m_eig_cond = 0.0_dp
+      dbg_m_eig_small = 0
+      dbg_c_norm = 0.0_dp
 
       CALL timeset(routineN, handle)
 
@@ -256,7 +262,9 @@ CONTAINS
                                            dbg_rab, ri_data, dbg_m_ncart, dbg_ji_ncart, &
                                            dbg_jj_ncart, dbg_m_norm, dbg_ji_norm, dbg_jj_norm, &
                                            dbg_m_dim, dbg_j_rows, dbg_j_cols, dbg_m_dense_norm, &
-                                           dbg_j_norm, dbg_m_cond_diag)
+                                           dbg_j_norm, dbg_m_cond_diag, dbg_m_eig_min, &
+                                           dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
+                                           dbg_c_norm)
          dbg_integrals_done = .TRUE.
       END IF
 
@@ -364,6 +372,12 @@ CONTAINS
                   "J rows/cols", dbg_j_rows, dbg_j_cols
                WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
                   "J norm/diag cond", dbg_j_norm, dbg_m_cond_diag
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+                  "eig min/max", dbg_m_eig_min, dbg_m_eig_max
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,I10)") &
+                  "eig cond/small", dbg_m_eig_cond, dbg_m_eig_small
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "C=J Minv norm", dbg_c_norm
             END IF
          END IF
       END IF
@@ -392,12 +406,18 @@ CONTAINS
 !> \param metric_dense_norm ...
 !> \param threec_norm ...
 !> \param metric_diag_cond ...
+!> \param metric_eig_min ...
+!> \param metric_eig_max ...
+!> \param metric_eig_cond ...
+!> \param metric_eig_small ...
+!> \param c_norm ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
                                            metric_ncart, threec_i_ncart, threec_j_ncart, &
                                            metric_norm, threec_i_norm, threec_j_norm, metric_dim, &
                                            threec_rows, threec_cols, metric_dense_norm, threec_norm, &
-                                           metric_diag_cond)
+                                           metric_diag_cond, metric_eig_min, metric_eig_max, &
+                                           metric_eig_cond, metric_eig_small, c_norm)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -409,7 +429,10 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: metric_norm, threec_i_norm, threec_j_norm
       INTEGER, INTENT(OUT)                               :: metric_dim, threec_rows, threec_cols
       REAL(dp), INTENT(OUT)                              :: metric_dense_norm, threec_norm, &
-                                                            metric_diag_cond
+                                                            metric_diag_cond, metric_eig_min, &
+                                                            metric_eig_max, metric_eig_cond
+      INTEGER, INTENT(OUT)                               :: metric_eig_small
+      REAL(dp), INTENT(OUT)                              :: c_norm
 
       INTEGER                                            :: idim, maxl_ai, maxl_aj, maxl_ri, &
                                                             maxl_rj, mmax, ncart_ai, ncart_aj, &
@@ -442,6 +465,11 @@ CONTAINS
       metric_dense_norm = 0.0_dp
       threec_norm = 0.0_dp
       metric_diag_cond = 0.0_dp
+      metric_eig_min = 0.0_dp
+      metric_eig_max = 0.0_dp
+      metric_eig_cond = 0.0_dp
+      metric_eig_small = 0
+      c_norm = 0.0_dp
 
       IF (.NOT. ASSOCIATED(obas_i)) RETURN
       IF (.NOT. ASSOCIATED(obas_j)) RETURN
@@ -519,6 +547,9 @@ CONTAINS
             IF (diag_abs > 1.0E-300_dp) diag_min = MIN(diag_min, diag_abs)
          END DO
          IF (diag_min < HUGE(1.0_dp)) metric_diag_cond = diag_max/diag_min
+
+         CALL hfx_lri_probe_metric_inverse(metric_block, j_block, metric_eig_min, metric_eig_max, &
+                                           metric_eig_cond, metric_eig_small, c_norm)
 
          DEALLOCATE (j_block, metric_block)
       END IF
@@ -813,5 +844,87 @@ CONTAINS
       END DO
 
    END SUBROUTINE hfx_lri_fill_3c_block
+
+! **************************************************************************************************
+!> \brief Diagonalizes a debug metric block and probes C = J M^-1.
+!> \param metric_block ...
+!> \param j_block ...
+!> \param eig_min ...
+!> \param eig_max ...
+!> \param eig_cond ...
+!> \param eig_small ...
+!> \param c_norm ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_probe_metric_inverse(metric_block, j_block, eig_min, eig_max, eig_cond, &
+                                           eig_small, c_norm)
+
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: metric_block, j_block
+      REAL(dp), INTENT(OUT)                              :: eig_min, eig_max, eig_cond
+      INTEGER, INTENT(OUT)                               :: eig_small
+      REAL(dp), INTENT(OUT)                              :: c_norm
+
+      INTEGER                                            :: i, info, lwork, ncol, nrow
+      REAL(dp)                                           :: eig_abs, eig_cutoff
+      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: eigenvalues, work
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_block, eigvec, tmp
+
+      eig_min = 0.0_dp
+      eig_max = 0.0_dp
+      eig_cond = 0.0_dp
+      eig_small = 0
+      c_norm = 0.0_dp
+
+      ncol = SIZE(metric_block, 1)
+      nrow = SIZE(j_block, 1)
+      IF (ncol == 0 .OR. nrow == 0) RETURN
+
+      ALLOCATE (eigvec(ncol, ncol), eigenvalues(ncol))
+      eigvec(:, :) = 0.5_dp*(metric_block + TRANSPOSE(metric_block))
+
+      lwork = -1
+      ALLOCATE (work(1))
+      CALL dsyev('V', 'L', ncol, eigvec, ncol, eigenvalues, work, lwork, info)
+      IF (info /= 0) THEN
+         CPABORT("DSYEV workspace query failed in LRI-HFXk debug metric")
+      END IF
+      lwork = MAX(1, INT(work(1)))
+      DEALLOCATE (work)
+
+      ALLOCATE (work(lwork))
+      CALL dsyev('V', 'L', ncol, eigvec, ncol, eigenvalues, work, lwork, info)
+      DEALLOCATE (work)
+      IF (info /= 0) THEN
+         CPABORT("DSYEV failed in LRI-HFXk debug metric")
+      END IF
+
+      eig_max = MAXVAL(ABS(eigenvalues))
+      eig_cutoff = MAX(1.0E-12_dp*MAX(1.0_dp, eig_max), 1.0E-14_dp)
+      eig_min = HUGE(1.0_dp)
+      DO i = 1, ncol
+         eig_abs = ABS(eigenvalues(i))
+         IF (eig_abs <= eig_cutoff) THEN
+            eig_small = eig_small + 1
+         ELSE
+            eig_min = MIN(eig_min, eig_abs)
+         END IF
+      END DO
+      IF (eig_min < HUGE(1.0_dp) .AND. eig_max > 0.0_dp) eig_cond = eig_max/eig_min
+
+      ALLOCATE (tmp(nrow, ncol), c_block(nrow, ncol))
+      tmp(:, :) = MATMUL(j_block, eigvec)
+      DO i = 1, ncol
+         eig_abs = ABS(eigenvalues(i))
+         IF (eig_abs > eig_cutoff) THEN
+            tmp(:, i) = tmp(:, i)/eigenvalues(i)
+         ELSE
+            tmp(:, i) = 0.0_dp
+         END IF
+      END DO
+      c_block(:, :) = MATMUL(tmp, TRANSPOSE(eigvec))
+      c_norm = SQRT(SUM(c_block*c_block))
+
+      DEALLOCATE (c_block, tmp, eigenvalues, eigvec)
+
+   END SUBROUTINE hfx_lri_probe_metric_inverse
 
 END MODULE hfx_lri_kp
