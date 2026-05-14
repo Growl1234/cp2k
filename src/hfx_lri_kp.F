@@ -58,6 +58,7 @@ MODULE hfx_lri_kp
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
    INTEGER, PARAMETER :: lri_debug_max_k_blocks = 500
    REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
+   LOGICAL, PARAMETER :: lri_debug_abort_after_writeback = .FALSE.
 
 CONTAINS
 
@@ -103,7 +104,11 @@ CONTAINS
       CALL hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
       CALL hfx_lri_debug_ks_writeback_probe(qs_env, ri_data, ks_matrix, hf_fraction)
 
-      CPABORT("LRI-HFXk pair-local contraction is not implemented yet")
+      IF (lri_debug_abort_after_writeback) THEN
+         ! CPABORT may terminate MPI ranks before buffered debug output is written.
+         IF (ri_data%unit_nr > 0) FLUSH (ri_data%unit_nr)
+         CPABORT("LRI-HFXk pair-local contraction is not implemented yet")
+      END IF
 
    END SUBROUTINE hfx_lri_update_ks_kp
 
@@ -1725,13 +1730,14 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      INTEGER                                            :: added_blocks, img, ipair, lb1, lb2, lb3, &
-                                                            ub1, ub2, ub3
+      INTEGER                                            :: added_blocks, debug_img, img, ipair, lb1, lb2, &
+                                                            lb3, skipped_blocks, ub1, ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      LOGICAL                                            :: found
-      REAL(dp)                                           :: after_norm, before_norm, k_norm, &
-                                                            multi_add_norm2, multi_after_norm2, &
-                                                            multi_before_norm2, scale
+      LOGICAL                                            :: debug_found, found
+      REAL(dp)                                           :: after_norm, before_norm, debug_add_norm, &
+                                                            debug_after_norm, debug_before_norm, &
+                                                            debug_k_norm, k_norm, multi_add_norm2, &
+                                                            multi_after_norm2, multi_before_norm2, scale
       REAL(dp), DIMENSION(:, :), POINTER                 :: ks_block
       TYPE(kpoint_type), POINTER                         :: kpoints
 
@@ -1800,6 +1806,13 @@ CONTAINS
          after_norm = SQRT(SUM(ks_block*ks_block))
       END IF
 
+      debug_img = img
+      debug_found = found
+      debug_k_norm = k_norm
+      debug_add_norm = ABS(scale)*debug_k_norm
+      debug_before_norm = before_norm
+      debug_after_norm = after_norm
+
       added_blocks = 0
       multi_before_norm2 = 0.0_dp
       multi_add_norm2 = 0.0_dp
@@ -1837,32 +1850,46 @@ CONTAINS
          END DO
       END IF
 
+      skipped_blocks = 0
+      IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
+         skipped_blocks = ri_data%lri_kp%ndebug_k_blocks - added_blocks
+      END IF
+
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback prototype"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "pair/image", ri_data%lri_kp%debug_k_block%pair_index, img
+            "pair/image", ri_data%lri_kp%debug_k_block%pair_index, debug_img
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "atoms", ri_data%lri_kp%debug_k_block%iatom, &
             ri_data%lri_kp%debug_k_block%jatom
          WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
             "cell", ri_data%lri_kp%debug_k_block%cell
-         IF (found) THEN
+         IF (debug_found) THEN
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "KS dims", SIZE(ks_block, 1), SIZE(ks_block, 2)
+               "KS dims", SIZE(ri_data%lri_kp%debug_k_block%k_block, 1), &
+               SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
          ELSE
             WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
          END IF
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "before/K norm", before_norm, k_norm
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "scale/add norm", scale, ABS(scale)*k_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "after norm", after_norm
+            "before norm", debug_before_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "debug K norm", debug_k_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "scale", scale
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "add norm", debug_add_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "after norm", debug_after_norm
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug multi-K writeback prototype"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "added/stored", added_blocks, ri_data%lri_kp%ndebug_k_blocks
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "before/add norm", SQRT(multi_before_norm2), SQRT(multi_add_norm2)
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+            "skipped", skipped_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "before norm", SQRT(multi_before_norm2)
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+            "add norm", SQRT(multi_add_norm2)
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "after norm", SQRT(multi_after_norm2)
       END IF
