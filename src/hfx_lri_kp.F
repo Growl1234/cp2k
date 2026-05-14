@@ -16,7 +16,8 @@ MODULE hfx_lri_kp
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
    USE gamma,                           ONLY: init_md_ftable
-   USE hfx_lri_types,                   ONLY: hfx_lri_kp_release
+   USE hfx_lri_types,                   ONLY: hfx_lri_kp_release,&
+                                              hfx_lri_pair_block_type
    USE hfx_types,                       ONLY: hfx_ri_type
    USE input_constants,                 ONLY: do_potential_short
    USE kinds,                           ONLY: dp,&
@@ -126,6 +127,7 @@ CONTAINS
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
+      TYPE(hfx_lri_pair_block_type)                      :: dbg_pair_block
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
@@ -137,6 +139,7 @@ CONTAINS
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
       NULLIFY (basis_set_AO, basis_set_RI)
 
+      IF (ALLOCATED(dbg_pair_block%c_fit)) DEALLOCATE (dbg_pair_block%c_fit)
       dbg_pair_found = .FALSE.
       dbg_iatom = 0
       dbg_jatom = 0
@@ -265,15 +268,17 @@ CONTAINS
       CALL release_neighbor_list_sets(soo_list)
 
       IF (dbg_pair_found) THEN
+         CALL hfx_lri_init_pair_block(dbg_pair_block, dbg_iatom, dbg_jatom, dbg_ikind, dbg_jkind, &
+                                      dbg_cell, dbg_nao_i, dbg_nao_j, dbg_naux_pair)
          CALL hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, dbg_ikind, dbg_jkind, &
-                                           dbg_rab, ri_data, dbg_m_ncart, dbg_ji_ncart, &
-                                           dbg_jj_ncart, dbg_m_norm, dbg_ji_norm, dbg_jj_norm, &
-                                           dbg_m_dim, dbg_j_rows, dbg_j_cols, dbg_m_dense_norm, &
-                                           dbg_j_norm, dbg_m_cond_diag, dbg_m_eig_min, &
-                                           dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
-                                           dbg_c_norm, dbg_sph_m_dim, dbg_sph_j_rows, &
-                                           dbg_sph_j_cols, dbg_sph_m_norm, dbg_sph_j_norm, &
-                                           dbg_sph_c_norm)
+                                           dbg_rab, ri_data, dbg_pair_block, dbg_m_ncart, &
+                                           dbg_ji_ncart, dbg_jj_ncart, dbg_m_norm, dbg_ji_norm, &
+                                           dbg_jj_norm, dbg_m_dim, dbg_j_rows, dbg_j_cols, &
+                                           dbg_m_dense_norm, dbg_j_norm, dbg_m_cond_diag, &
+                                           dbg_m_eig_min, dbg_m_eig_max, dbg_m_eig_cond, &
+                                           dbg_m_eig_small, dbg_c_norm, dbg_sph_m_dim, &
+                                           dbg_sph_j_rows, dbg_sph_j_cols, dbg_sph_m_norm, &
+                                           dbg_sph_j_norm, dbg_sph_c_norm)
          dbg_integrals_done = .TRUE.
       END IF
 
@@ -396,6 +401,15 @@ CONTAINS
                   "J norm", dbg_sph_j_norm
                WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                   "C=J Minv norm", dbg_sph_c_norm
+               IF (ALLOCATED(dbg_pair_block%c_fit)) THEN
+                  WRITE (ri_data%unit_nr, "(/,T4,A)") "debug pair coefficient block"
+                  WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
+                     "C dims", SIZE(dbg_pair_block%c_fit, 1), SIZE(dbg_pair_block%c_fit, 2), &
+                     SIZE(dbg_pair_block%c_fit, 3)
+                  WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,F10.4)") &
+                     "C norm/MiB", SQRT(SUM(dbg_pair_block%c_fit*dbg_pair_block%c_fit)), &
+                     REAL(SIZE(dbg_pair_block%c_fit), KIND=dp)*8.0_dp/1024.0_dp**2
+               END IF
             END IF
          END IF
       END IF
@@ -412,6 +426,7 @@ CONTAINS
 !> \param jkind ...
 !> \param rab ...
 !> \param ri_data ...
+!> \param pair_block ...
 !> \param metric_ncart ...
 !> \param threec_i_ncart ...
 !> \param threec_j_ncart ...
@@ -437,7 +452,7 @@ CONTAINS
 !> \param sph_c_norm ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
-                                           metric_ncart, threec_i_ncart, threec_j_ncart, &
+                                           pair_block, metric_ncart, threec_i_ncart, threec_j_ncart, &
                                            metric_norm, threec_i_norm, threec_j_norm, metric_dim, &
                                            threec_rows, threec_cols, metric_dense_norm, threec_norm, &
                                            metric_diag_cond, metric_eig_min, metric_eig_max, &
@@ -449,6 +464,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: ikind, jkind
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: rab
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      TYPE(hfx_lri_pair_block_type), INTENT(INOUT)       :: pair_block
       INTEGER, INTENT(OUT)                               :: metric_ncart, threec_i_ncart, &
                                                             threec_j_ncart
       REAL(dp), INTENT(OUT)                              :: metric_norm, threec_i_norm, threec_j_norm
@@ -468,7 +484,7 @@ CONTAINS
       LOGICAL                                            :: onsite_aux
       REAL(dp) :: diag_abs, diag_max, diag_min, metric_norm2, sph_eig_cond, sph_eig_max, &
          sph_eig_min, threec_i_norm2, threec_j_norm2
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: j_block, j_sph, metric_block, &
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, j_block, j_sph, metric_block, &
                                                             metric_sph, sphi_aux, sphi_i, sphi_j, &
                                                             sphi_pair, sphi_ri_i, sphi_ri_j, &
                                                             tmp_sph
@@ -628,7 +644,10 @@ CONTAINS
             sph_metric_norm = SQRT(SUM(metric_sph*metric_sph))
             sph_j_norm = SQRT(SUM(j_sph*j_sph))
             CALL hfx_lri_probe_metric_inverse(metric_sph, j_sph, sph_eig_min, sph_eig_max, &
-                                              sph_eig_cond, sph_eig_small, sph_c_norm)
+                                              sph_eig_cond, sph_eig_small, sph_c_norm, c_out=c_sph)
+            CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, SIZE(sphi_i, 2), &
+                                                SIZE(sphi_j, 2), sph_metric_dim)
+            DEALLOCATE (c_sph)
 
             DEALLOCATE (j_sph, metric_sph, sphi_aux, sphi_pair)
          END IF
@@ -1003,14 +1022,17 @@ CONTAINS
 !> \param eig_cond ...
 !> \param eig_small ...
 !> \param c_norm ...
+!> \param c_out ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_probe_metric_inverse(metric_block, j_block, eig_min, eig_max, eig_cond, &
-                                           eig_small, c_norm)
+                                           eig_small, c_norm, c_out)
 
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: metric_block, j_block
       REAL(dp), INTENT(OUT)                              :: eig_min, eig_max, eig_cond
       INTEGER, INTENT(OUT)                               :: eig_small
       REAL(dp), INTENT(OUT)                              :: c_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT), OPTIONAL                           :: c_out
 
       INTEGER                                            :: i, info, lwork, ncol, nrow
       REAL(dp)                                           :: eig_abs, eig_cutoff
@@ -1071,9 +1093,88 @@ CONTAINS
       END DO
       c_block(:, :) = MATMUL(tmp, TRANSPOSE(eigvec))
       c_norm = SQRT(SUM(c_block*c_block))
+      IF (PRESENT(c_out)) THEN
+         IF (ALLOCATED(c_out)) DEALLOCATE (c_out)
+         ALLOCATE (c_out(SIZE(c_block, 1), SIZE(c_block, 2)))
+         c_out(:, :) = c_block(:, :)
+      END IF
 
       DEALLOCATE (c_block, tmp, eigenvalues, eigvec)
 
    END SUBROUTINE hfx_lri_probe_metric_inverse
+
+! **************************************************************************************************
+!> \brief Initializes a debug pair-local LRI coefficient block.
+!> \param pair_block ...
+!> \param iatom ...
+!> \param jatom ...
+!> \param ikind ...
+!> \param jkind ...
+!> \param cell ...
+!> \param nao_i ...
+!> \param nao_j ...
+!> \param naux_pair ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_init_pair_block(pair_block, iatom, jatom, ikind, jkind, cell, nao_i, nao_j, &
+                                      naux_pair)
+
+      TYPE(hfx_lri_pair_block_type), INTENT(INOUT)       :: pair_block
+      INTEGER, INTENT(IN)                                :: iatom, jatom, ikind, jkind
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
+      INTEGER, INTENT(IN)                                :: nao_i, nao_j, naux_pair
+
+      IF (ALLOCATED(pair_block%c_fit)) DEALLOCATE (pair_block%c_fit)
+
+      pair_block%iatom = iatom
+      pair_block%jatom = jatom
+      pair_block%ikind = ikind
+      pair_block%jkind = jkind
+      pair_block%cell(:) = cell(:)
+      pair_block%nao_i = nao_i
+      pair_block%nao_j = nao_j
+      pair_block%naux_pair = naux_pair
+
+   END SUBROUTINE hfx_lri_init_pair_block
+
+! **************************************************************************************************
+!> \brief Packs a 2D spherical coefficient matrix into C(mu,nu,P).
+!> \param pair_block ...
+!> \param c_mat ...
+!> \param nao_i ...
+!> \param nao_j ...
+!> \param naux_pair ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_pack_pair_coefficients(pair_block, c_mat, nao_i, nao_j, naux_pair)
+
+      TYPE(hfx_lri_pair_block_type), INTENT(INOUT)       :: pair_block
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: c_mat
+      INTEGER, INTENT(IN)                                :: nao_i, nao_j, naux_pair
+
+      INTEGER                                            :: imu, inu, irow
+
+      IF (SIZE(c_mat, 1) /= nao_i*nao_j) THEN
+         CPABORT("Inconsistent row dimension while packing LRI-HFXk pair coefficients")
+      END IF
+      IF (SIZE(c_mat, 2) /= naux_pair) THEN
+         CPABORT("Inconsistent auxiliary dimension while packing LRI-HFXk pair coefficients")
+      END IF
+
+      IF (pair_block%nao_i /= nao_i .OR. pair_block%nao_j /= nao_j .OR. &
+          pair_block%naux_pair /= naux_pair) THEN
+         CPABORT("Inconsistent pair metadata while packing LRI-HFXk coefficients")
+      END IF
+
+      IF (ALLOCATED(pair_block%c_fit)) DEALLOCATE (pair_block%c_fit)
+      ALLOCATE (pair_block%c_fit(nao_i, nao_j, naux_pair))
+
+      irow = 0
+      DO inu = 1, nao_j
+         DO imu = 1, nao_i
+            irow = irow + 1
+            pair_block%c_fit(imu, inu, :) = c_mat(irow, :)
+         END DO
+      END DO
+
+   END SUBROUTINE hfx_lri_pack_pair_coefficients
 
 END MODULE hfx_lri_kp
