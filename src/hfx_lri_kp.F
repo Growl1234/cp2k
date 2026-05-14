@@ -127,7 +127,8 @@ CONTAINS
       REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_stored_local, c_mem_mib_stored_max, &
          c_mem_mib_stored_sum, c_mem_mib_sum, dbg_c_norm, dbg_j_norm, dbg_ji_norm, dbg_jj_norm, &
          dbg_m_cond_diag, dbg_m_dense_norm, dbg_m_eig_cond, dbg_m_eig_max, dbg_m_eig_min, &
-         dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_j_norm, dbg_sph_m_norm, dbg_stored_c_norm
+         dbg_m_norm, dbg_r2, dbg_sph_c_norm, dbg_sph_cvc_norm, dbg_sph_j_norm, dbg_sph_m_norm, &
+         dbg_stored_c_norm
       REAL(dp), DIMENSION(3)                             :: dbg_rab, rab
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -182,6 +183,7 @@ CONTAINS
       dbg_sph_m_norm = 0.0_dp
       dbg_sph_j_norm = 0.0_dp
       dbg_sph_c_norm = 0.0_dp
+      dbg_sph_cvc_norm = 0.0_dp
       dbg_stored_index = 0
       dbg_stored_c_norm = 0.0_dp
 
@@ -278,7 +280,7 @@ CONTAINS
                                               dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
                                               dbg_c_norm, dbg_sph_m_dim, dbg_sph_j_rows, &
                                               dbg_sph_j_cols, dbg_sph_m_norm, dbg_sph_j_norm, &
-                                              dbg_sph_c_norm, debug_probe=.FALSE.)
+                                              dbg_sph_c_norm, dbg_sph_cvc_norm, debug_probe=.FALSE.)
             IF (ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit)) THEN
                ri_data%lri_kp%npair_blocks = ipair_block
                ri_data%lri_kp%c_nreal_stored = ri_data%lri_kp%c_nreal_stored + &
@@ -307,7 +309,7 @@ CONTAINS
                                            dbg_m_eig_min, dbg_m_eig_max, dbg_m_eig_cond, &
                                            dbg_m_eig_small, dbg_c_norm, dbg_sph_m_dim, &
                                            dbg_sph_j_rows, dbg_sph_j_cols, dbg_sph_m_norm, &
-                                           dbg_sph_j_norm, dbg_sph_c_norm)
+                                           dbg_sph_j_norm, dbg_sph_c_norm, dbg_sph_cvc_norm)
          dbg_integrals_done = .TRUE.
       END IF
 
@@ -460,6 +462,8 @@ CONTAINS
                   "J norm", dbg_sph_j_norm
                WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                   "C=J Minv norm", dbg_sph_c_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "CVC self norm", dbg_sph_cvc_norm
                IF (ALLOCATED(dbg_pair_block%c_fit)) THEN
                   WRITE (ri_data%unit_nr, "(/,T4,A)") "debug pair coefficient block"
                   WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
@@ -512,6 +516,7 @@ CONTAINS
 !> \param sph_metric_norm ...
 !> \param sph_j_norm ...
 !> \param sph_c_norm ...
+!> \param sph_cvc_norm ...
 !> \param debug_probe ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
@@ -521,7 +526,7 @@ CONTAINS
                                            metric_diag_cond, metric_eig_min, metric_eig_max, &
                                            metric_eig_cond, metric_eig_small, c_norm, sph_metric_dim, &
                                            sph_j_rows, sph_j_cols, sph_metric_norm, sph_j_norm, &
-                                           sph_c_norm, debug_probe)
+                                           sph_c_norm, sph_cvc_norm, debug_probe)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -539,7 +544,8 @@ CONTAINS
       INTEGER, INTENT(OUT)                               :: metric_eig_small
       REAL(dp), INTENT(OUT)                              :: c_norm
       INTEGER, INTENT(OUT)                               :: sph_metric_dim, sph_j_rows, sph_j_cols
-      REAL(dp), INTENT(OUT)                              :: sph_metric_norm, sph_j_norm, sph_c_norm
+      REAL(dp), INTENT(OUT)                              :: sph_metric_norm, sph_j_norm, sph_c_norm, &
+                                                            sph_cvc_norm
       LOGICAL, INTENT(IN), OPTIONAL                      :: debug_probe
 
       INTEGER                                            :: idim, maxl_ai, maxl_aj, maxl_ri, &
@@ -549,10 +555,8 @@ CONTAINS
       LOGICAL                                            :: do_debug_probe, onsite_aux
       REAL(dp) :: diag_abs, diag_max, diag_min, metric_norm2, sph_eig_cond, sph_eig_max, &
          sph_eig_min, threec_i_norm2, threec_j_norm2
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, j_block, j_sph, metric_block, &
-                                                            metric_sph, sphi_aux, sphi_i, sphi_j, &
-                                                            sphi_pair, sphi_ri_i, sphi_ri_j, &
-                                                            tmp_sph
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: c_sph, cvc_block, j_block, j_sph, metric_block, &
+         metric_sph, sphi_aux, sphi_i, sphi_j, sphi_pair, sphi_ri_i, sphi_ri_j, tmp_cvc, tmp_sph
       REAL(dp), DIMENSION(3)                             :: r0
       TYPE(cp_libint_t)                                  :: lib2, lib3
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
@@ -719,6 +723,14 @@ CONTAINS
             END IF
             CALL hfx_lri_probe_metric_inverse(metric_sph, j_sph, sph_eig_min, sph_eig_max, &
                                               sph_eig_cond, sph_eig_small, sph_c_norm, c_out=c_sph)
+            IF (do_debug_probe) THEN
+               ALLOCATE (tmp_cvc(SIZE(c_sph, 1), sph_metric_dim), SOURCE=0.0_dp)
+               tmp_cvc = MATMUL(c_sph, metric_sph)
+               ALLOCATE (cvc_block(SIZE(c_sph, 1), SIZE(c_sph, 1)), SOURCE=0.0_dp)
+               cvc_block = MATMUL(tmp_cvc, TRANSPOSE(c_sph))
+               sph_cvc_norm = SQRT(SUM(cvc_block*cvc_block))
+               DEALLOCATE (cvc_block, tmp_cvc)
+            END IF
             CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, SIZE(sphi_i, 2), &
                                                 SIZE(sphi_j, 2), sph_metric_dim)
             DEALLOCATE (c_sph)
