@@ -1336,14 +1336,12 @@ CONTAINS
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
 
-      INTEGER                                            :: img, ipair, ipair_sel, lb1, lb2, lb3, &
-                                                            naccum, ub1, ub2, ub3
+      INTEGER                                            :: img, ipair, ipair_cross, ipair_sel, lb1, &
+                                                            lb2, lb3, naccum, ub1, ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
-      REAL(dp)                                           :: c_norm, k_accum_norm, k_norm, &
-                                                            k_norm2_accum, rho_accum_norm, &
-                                                            rho_norm, rho_norm2_accum, &
-                                                            rho_pair_norm
+      REAL(dp) :: c_norm, cvc_cross_norm, k_accum_norm, k_norm, k_norm2_accum, rho_accum_norm, &
+         rho_norm, rho_norm2_accum, rho_pair_norm, v_cross_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -1403,6 +1401,9 @@ CONTAINS
       c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit* &
                         ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit))
 
+      ipair_cross = 0
+      cvc_cross_norm = 0.0_dp
+      v_cross_norm = 0.0_dp
       naccum = 0
       rho_norm2_accum = 0.0_dp
       k_norm2_accum = 0.0_dp
@@ -1444,6 +1445,28 @@ CONTAINS
       rho_accum_norm = SQRT(rho_norm2_accum)
       k_accum_norm = SQRT(k_norm2_accum)
 
+      ! Select a second onsite pair with the same auxiliary dimension for the
+      ! temporary two-pair CVC probe. This keeps the diagnostic well-defined
+      ! while the real pair-pair V block is still not available.
+      DO ipair = 1, ri_data%lri_kp%npair_blocks
+         IF (ipair == ipair_sel) CYCLE
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%v_fit)) CYCLE
+         IF (ri_data%lri_kp%pair_blocks(ipair)%iatom /= &
+             ri_data%lri_kp%pair_blocks(ipair)%jatom) CYCLE
+         IF (ANY(ri_data%lri_kp%pair_blocks(ipair)%cell /= 0)) CYCLE
+         IF (ri_data%lri_kp%pair_blocks(ipair)%naux_pair /= &
+             ri_data%lri_kp%pair_blocks(ipair_sel)%naux_pair) CYCLE
+         ipair_cross = ipair
+         EXIT
+      END DO
+
+      IF (ipair_cross > 0) THEN
+         CALL hfx_lri_contract_pair_pair_cvc(ri_data%lri_kp%pair_blocks(ipair_sel), &
+                                             ri_data%lri_kp%pair_blocks(ipair_cross), &
+                                             v_cross_norm, cvc_cross_norm)
+      END IF
+
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1470,9 +1493,78 @@ CONTAINS
             "rho threshold", lri_debug_rho_threshold
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_accum_norm, k_accum_norm
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug two-pair CVC probe"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "pair indices", ipair_sel, ipair_cross
+         IF (ipair_cross > 0) THEN
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "C rows", ri_data%lri_kp%pair_blocks(ipair_sel)%nao_i* &
+               ri_data%lri_kp%pair_blocks(ipair_sel)%nao_j, &
+               ri_data%lri_kp%pair_blocks(ipair_cross)%nao_i* &
+               ri_data%lri_kp%pair_blocks(ipair_cross)%nao_j
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+               "aux dimension", ri_data%lri_kp%pair_blocks(ipair_sel)%naux_pair
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+               "V/CVC norm", v_cross_norm, cvc_cross_norm
+         END IF
       END IF
 
    END SUBROUTINE hfx_lri_debug_density_block
+
+! **************************************************************************************************
+!> \brief Probes a two-pair C V C^T contraction using a stored auxiliary metric.
+!> \param pair_left ...
+!> \param pair_right ...
+!> \param v_norm ...
+!> \param cvc_norm ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_contract_pair_pair_cvc(pair_left, pair_right, v_norm, cvc_norm)
+
+      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_left, pair_right
+      REAL(dp), INTENT(OUT)                              :: v_norm, cvc_norm
+
+      INTEGER                                            :: iao, irow, jao, jrow, nao_left, &
+                                                            nao_right, naux
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_left, c_right, cvc_block, tmp
+
+      v_norm = 0.0_dp
+      cvc_norm = 0.0_dp
+
+      IF (.NOT. ALLOCATED(pair_left%c_fit)) RETURN
+      IF (.NOT. ALLOCATED(pair_right%c_fit)) RETURN
+      IF (.NOT. ALLOCATED(pair_left%v_fit)) RETURN
+      IF (pair_left%naux_pair /= pair_right%naux_pair) RETURN
+
+      naux = pair_left%naux_pair
+      nao_left = pair_left%nao_i*pair_left%nao_j
+      nao_right = pair_right%nao_i*pair_right%nao_j
+      ALLOCATE (c_left(nao_left, naux), c_right(nao_right, naux), SOURCE=0.0_dp)
+
+      irow = 0
+      DO jao = 1, pair_left%nao_j
+         DO iao = 1, pair_left%nao_i
+            irow = irow + 1
+            c_left(irow, :) = pair_left%c_fit(iao, jao, :)
+         END DO
+      END DO
+
+      jrow = 0
+      DO jao = 1, pair_right%nao_j
+         DO iao = 1, pair_right%nao_i
+            jrow = jrow + 1
+            c_right(jrow, :) = pair_right%c_fit(iao, jao, :)
+         END DO
+      END DO
+
+      v_norm = SQRT(SUM(pair_left%v_fit*pair_left%v_fit))
+      ALLOCATE (tmp(nao_left, naux), cvc_block(nao_left, nao_right), SOURCE=0.0_dp)
+      tmp = MATMUL(c_left, pair_left%v_fit)
+      cvc_block = MATMUL(tmp, TRANSPOSE(c_right))
+      cvc_norm = SQRT(SUM(cvc_block*cvc_block))
+
+      DEALLOCATE (cvc_block, tmp, c_right, c_left)
+
+   END SUBROUTINE hfx_lri_contract_pair_pair_cvc
 
 ! **************************************************************************************************
 !> \brief Contracts a stored self-pair C/V block with a real density block.
