@@ -56,8 +56,6 @@ MODULE hfx_lri_kp
    PUBLIC :: hfx_lri_update_ks_kp
 
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
-   INTEGER, PARAMETER :: lri_debug_max_accum_pairs = 10
-   REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
 
 CONTAINS
 
@@ -330,12 +328,6 @@ CONTAINS
          dbg_stored_index = hfx_lri_find_pair_block(ri_data%lri_kp%pair_blocks, &
                                                     ri_data%lri_kp%npair_blocks, &
                                                     dbg_iatom, dbg_jatom, dbg_cell)
-         IF (dbg_stored_index > 0) THEN
-            IF (ALLOCATED(ri_data%lri_kp%pair_blocks(dbg_stored_index)%c_fit)) THEN
-               dbg_stored_c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(dbg_stored_index)%c_fit* &
-                                            ri_data%lri_kp%pair_blocks(dbg_stored_index)%c_fit))
-            END IF
-         END IF
       END IF
 
       IF (dbg_stored_index > 0) THEN
@@ -471,26 +463,6 @@ CONTAINS
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
                "RI functions", dbg_naux_i, dbg_naux_j, dbg_naux_pair
             IF (dbg_integrals_done) THEN
-               WRITE (ri_data%unit_nr, "(/,T4,A)") "debug pair short-range integrals"
-               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-                  "metric ncart/norm", dbg_m_ncart, dbg_m_norm
-               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-                  "3c aux-i ncart/norm", dbg_ji_ncart, dbg_ji_norm
-               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-                  "3c aux-j ncart/norm", dbg_jj_ncart, dbg_jj_norm
-               WRITE (ri_data%unit_nr, "(/,T4,A)") "debug dense Cartesian blocks"
-               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-                  "metric dim/norm", dbg_m_dim, dbg_m_dense_norm
-               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-                  "J rows/cols", dbg_j_rows, dbg_j_cols
-               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-                  "J norm/diag cond", dbg_j_norm, dbg_m_cond_diag
-               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-                  "eig min/max", dbg_m_eig_min, dbg_m_eig_max
-               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,I10)") &
-                  "eig cond/small", dbg_m_eig_cond, dbg_m_eig_small
-               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-                  "C=J Minv norm", dbg_c_norm
                WRITE (ri_data%unit_nr, "(/,T4,A)") "debug spherical contracted blocks"
                WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
                   "metric dim/norm", dbg_sph_m_dim, dbg_sph_m_norm
@@ -500,10 +472,6 @@ CONTAINS
                   "J norm", dbg_sph_j_norm
                WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                   "C=J Minv norm", dbg_sph_c_norm
-               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-                  "CVC self norm", dbg_sph_cvc_norm
-               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-                  "toy K(I) norm", dbg_sph_toy_k_norm
                IF (ALLOCATED(dbg_pair_block%c_fit)) THEN
                   WRITE (ri_data%unit_nr, "(/,T4,A)") "debug pair coefficient block"
                   WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
@@ -513,9 +481,6 @@ CONTAINS
                      "C norm/MiB", SQRT(SUM(dbg_pair_block%c_fit*dbg_pair_block%c_fit)), &
                      REAL(SIZE(dbg_pair_block%c_fit), KIND=dp)*8.0_dp/1024.0_dp**2
                END IF
-               WRITE (ri_data%unit_nr, "(/,T4,A)") "debug stored pair lookup"
-               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-                  "index/C norm", dbg_stored_index, dbg_stored_c_norm
                WRITE (ri_data%unit_nr, "(/,T4,A)") "debug real pair-pair CVC probe"
                WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
                   "pair indices", dbg_stored_index, dbg_pair_pair_index
@@ -603,7 +568,6 @@ CONTAINS
       LOGICAL                                            :: do_debug_probe, onsite_aux
       REAL(dp) :: diag_abs, diag_max, diag_min, metric_norm2, sph_eig_cond, sph_eig_max, &
          sph_eig_min, threec_i_norm2, threec_j_norm2
-      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: toy_density, toy_k
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: c_sph, cvc_block, j_block, j_sph, metric_block, &
          metric_sph, sphi_aux, sphi_i, sphi_j, sphi_pair, sphi_ri_i, sphi_ri_j, tmp_cvc, tmp_sph
       REAL(dp), DIMENSION(3)                             :: r0
@@ -1155,27 +1119,6 @@ CONTAINS
    END SUBROUTINE hfx_lri_build_pair_sphi
 
 ! **************************************************************************************************
-!> \brief Builds a toy identity density vector in pair-row ordering.
-!> \param nao_i ...
-!> \param nao_j ...
-!> \param density_vec ...
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_build_toy_identity_density(nao_i, nao_j, density_vec)
-
-      INTEGER, INTENT(IN)                                :: nao_i, nao_j
-      REAL(dp), ALLOCATABLE, DIMENSION(:), INTENT(OUT)   :: density_vec
-
-      INTEGER                                            :: iao, ndiag
-
-      ALLOCATE (density_vec(nao_i*nao_j), SOURCE=0.0_dp)
-      ndiag = MIN(nao_i, nao_j)
-      DO iao = 1, ndiag
-         density_vec((iao - 1)*nao_j + iao) = 1.0_dp
-      END DO
-
-   END SUBROUTINE hfx_lri_build_toy_identity_density
-
-! **************************************************************************************************
 !> \brief Diagonalizes a debug metric block and probes C = J M^-1.
 !> \param metric_block ...
 !> \param j_block ...
@@ -1376,12 +1319,11 @@ CONTAINS
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
 
-      INTEGER                                            :: img, ipair, ipair_cross, ipair_sel, lb1, &
-                                                            lb2, lb3, naccum, ub1, ub2, ub3
+      INTEGER                                            :: img, ipair_sel, lb1, lb2, lb3, ub1, ub2, &
+                                                            ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
-      REAL(dp) :: c_norm, cvc_cross_norm, k_accum_norm, k_norm, k_norm2_accum, rho_accum_norm, &
-         rho_norm, rho_norm2_accum, rho_pair_norm, v_cross_norm
+      REAL(dp)                                           :: c_norm, k_norm, rho_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -1441,72 +1383,6 @@ CONTAINS
       c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit* &
                         ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit))
 
-      ipair_cross = 0
-      cvc_cross_norm = 0.0_dp
-      v_cross_norm = 0.0_dp
-      naccum = 0
-      rho_norm2_accum = 0.0_dp
-      k_norm2_accum = 0.0_dp
-      DO ipair = 1, ri_data%lri_kp%npair_blocks
-         IF (naccum >= lri_debug_max_accum_pairs) EXIT
-         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
-         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%v_fit)) CYCLE
-
-         img = 1
-         IF (ASSOCIATED(cell_to_index)) THEN
-            lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
-            lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
-            lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
-            IF (ALL(ri_data%lri_kp%pair_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
-                ALL(ri_data%lri_kp%pair_blocks(ipair)%cell <= [ub1, ub2, ub3])) THEN
-               img = cell_to_index(ri_data%lri_kp%pair_blocks(ipair)%cell(1), &
-                                   ri_data%lri_kp%pair_blocks(ipair)%cell(2), &
-                                   ri_data%lri_kp%pair_blocks(ipair)%cell(3))
-            END IF
-         END IF
-         IF (img < 1 .OR. img > SIZE(rho_ao, 2)) CYCLE
-
-         CALL dbcsr_get_block_p(matrix=rho_ao(1, img)%matrix, &
-                                row=ri_data%lri_kp%pair_blocks(ipair)%iatom, &
-                                col=ri_data%lri_kp%pair_blocks(ipair)%jatom, &
-                                block=rho_block, found=found)
-         IF (.NOT. found) CYCLE
-
-         rho_pair_norm = SQRT(SUM(rho_block*rho_block))
-         IF (rho_pair_norm < lri_debug_rho_threshold) CYCLE
-
-         CALL hfx_lri_contract_real_density_self(ri_data%lri_kp%pair_blocks(ipair), rho_block, &
-                                                 k_block)
-         rho_norm2_accum = rho_norm2_accum + rho_pair_norm*rho_pair_norm
-         k_norm2_accum = k_norm2_accum + SUM(k_block*k_block)
-         DEALLOCATE (k_block)
-         naccum = naccum + 1
-      END DO
-      rho_accum_norm = SQRT(rho_norm2_accum)
-      k_accum_norm = SQRT(k_norm2_accum)
-
-      ! Select a second onsite pair with the same auxiliary dimension for the
-      ! temporary two-pair CVC probe. This keeps the diagnostic well-defined
-      ! while the real pair-pair V block is still not available.
-      DO ipair = 1, ri_data%lri_kp%npair_blocks
-         IF (ipair == ipair_sel) CYCLE
-         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
-         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%v_fit)) CYCLE
-         IF (ri_data%lri_kp%pair_blocks(ipair)%iatom /= &
-             ri_data%lri_kp%pair_blocks(ipair)%jatom) CYCLE
-         IF (ANY(ri_data%lri_kp%pair_blocks(ipair)%cell /= 0)) CYCLE
-         IF (ri_data%lri_kp%pair_blocks(ipair)%naux_pair /= &
-             ri_data%lri_kp%pair_blocks(ipair_sel)%naux_pair) CYCLE
-         ipair_cross = ipair
-         EXIT
-      END DO
-
-      IF (ipair_cross > 0) THEN
-         CALL hfx_lri_contract_pair_pair_cvc(ri_data%lri_kp%pair_blocks(ipair_sel), &
-                                             ri_data%lri_kp%pair_blocks(ipair_cross), &
-                                             v_cross_norm, cvc_cross_norm)
-      END IF
-
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1526,27 +1402,6 @@ CONTAINS
             "rho/C norm", rho_norm, c_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "real K norm", k_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug rho-selected K accumulation"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "used/max pairs", naccum, lri_debug_max_accum_pairs
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "rho threshold", lri_debug_rho_threshold
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "rho/K norm", rho_accum_norm, k_accum_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug two-pair CVC probe"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "pair indices", ipair_sel, ipair_cross
-         IF (ipair_cross > 0) THEN
-            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "C rows", ri_data%lri_kp%pair_blocks(ipair_sel)%nao_i* &
-               ri_data%lri_kp%pair_blocks(ipair_sel)%nao_j, &
-               ri_data%lri_kp%pair_blocks(ipair_cross)%nao_i* &
-               ri_data%lri_kp%pair_blocks(ipair_cross)%nao_j
-            WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
-               "aux dimension", ri_data%lri_kp%pair_blocks(ipair_sel)%naux_pair
-            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-               "V/CVC norm", v_cross_norm, cvc_cross_norm
-         END IF
       END IF
 
    END SUBROUTINE hfx_lri_debug_density_block
@@ -1688,61 +1543,6 @@ CONTAINS
       CALL cp_libint_cleanup_2eri(lib2)
 
    END SUBROUTINE hfx_lri_contract_pair_pair_cvc_realv
-
-! **************************************************************************************************
-!> \brief Probes a two-pair C V C^T contraction using a stored auxiliary metric.
-!> \param pair_left ...
-!> \param pair_right ...
-!> \param v_norm ...
-!> \param cvc_norm ...
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_contract_pair_pair_cvc(pair_left, pair_right, v_norm, cvc_norm)
-
-      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_left, pair_right
-      REAL(dp), INTENT(OUT)                              :: v_norm, cvc_norm
-
-      INTEGER                                            :: iao, irow, jao, jrow, nao_left, &
-                                                            nao_right, naux
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_left, c_right, cvc_block, tmp
-
-      v_norm = 0.0_dp
-      cvc_norm = 0.0_dp
-
-      IF (.NOT. ALLOCATED(pair_left%c_fit)) RETURN
-      IF (.NOT. ALLOCATED(pair_right%c_fit)) RETURN
-      IF (.NOT. ALLOCATED(pair_left%v_fit)) RETURN
-      IF (pair_left%naux_pair /= pair_right%naux_pair) RETURN
-
-      naux = pair_left%naux_pair
-      nao_left = pair_left%nao_i*pair_left%nao_j
-      nao_right = pair_right%nao_i*pair_right%nao_j
-      ALLOCATE (c_left(nao_left, naux), c_right(nao_right, naux), SOURCE=0.0_dp)
-
-      irow = 0
-      DO jao = 1, pair_left%nao_j
-         DO iao = 1, pair_left%nao_i
-            irow = irow + 1
-            c_left(irow, :) = pair_left%c_fit(iao, jao, :)
-         END DO
-      END DO
-
-      jrow = 0
-      DO jao = 1, pair_right%nao_j
-         DO iao = 1, pair_right%nao_i
-            jrow = jrow + 1
-            c_right(jrow, :) = pair_right%c_fit(iao, jao, :)
-         END DO
-      END DO
-
-      v_norm = SQRT(SUM(pair_left%v_fit*pair_left%v_fit))
-      ALLOCATE (tmp(nao_left, naux), cvc_block(nao_left, nao_right), SOURCE=0.0_dp)
-      tmp = MATMUL(c_left, pair_left%v_fit)
-      cvc_block = MATMUL(tmp, TRANSPOSE(c_right))
-      cvc_norm = SQRT(SUM(cvc_block*cvc_block))
-
-      DEALLOCATE (cvc_block, tmp, c_right, c_left)
-
-   END SUBROUTINE hfx_lri_contract_pair_pair_cvc
 
 ! **************************************************************************************************
 !> \brief Flattens C(mu,nu,P) into C(mu nu,P).
