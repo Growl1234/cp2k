@@ -1519,7 +1519,6 @@ CONTAINS
 
    END SUBROUTINE hfx_lri_debug_density_block
 
-
 ! **************************************************************************************************
 !> \brief Probes whether the stored debug K block can be located in the k-point KS matrix.
 !> \param qs_env ...
@@ -1537,7 +1536,7 @@ CONTAINS
       INTEGER                                            :: img, lb1, lb2, lb3, ub1, ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
-      REAL(dp)                                           :: add_norm, k_norm, ks_norm
+      REAL(dp)                                           :: after_norm, before_norm, k_norm, scale
       REAL(dp), DIMENSION(:, :), POINTER                 :: ks_block
       TYPE(kpoint_type), POINTER                         :: kpoints
 
@@ -1571,14 +1570,23 @@ CONTAINS
                              col=ri_data%lri_kp%debug_k_block%jatom, &
                              block=ks_block, found=found)
 
-      k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block*&
+      k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block* &
                         ri_data%lri_kp%debug_k_block%k_block))
-      add_norm = ABS(hf_fraction)*k_norm
-      ks_norm = 0.0_dp
-      IF (found) ks_norm = SQRT(SUM(ks_block*ks_block))
+      scale = hf_fraction
+      before_norm = 0.0_dp
+      after_norm = 0.0_dp
+      IF (found) THEN
+         IF (SIZE(ks_block, 1) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 1) .OR. &
+             SIZE(ks_block, 2) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)) THEN
+            CPABORT("Inconsistent KS block size in LRI-HFXk debug writeback")
+         END IF
+         before_norm = SQRT(SUM(ks_block*ks_block))
+         ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_block%k_block(:, :)
+         after_norm = SQRT(SUM(ks_block*ks_block))
+      END IF
 
       IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback probe"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback prototype"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "pair/image", ri_data%lri_kp%debug_k_block%pair_index, img
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1593,9 +1601,11 @@ CONTAINS
             WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
          END IF
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "KS/K norm", ks_norm, k_norm
+            "before/K norm", before_norm, k_norm
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "scale/add norm", scale, ABS(scale)*k_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "scaled add norm", add_norm
+            "after norm", after_norm
       END IF
 
    END SUBROUTINE hfx_lri_debug_ks_writeback_probe
