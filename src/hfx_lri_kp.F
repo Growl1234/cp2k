@@ -275,7 +275,7 @@ CONTAINS
                                               dbg_m_eig_max, dbg_m_eig_cond, dbg_m_eig_small, &
                                               dbg_c_norm, dbg_sph_m_dim, dbg_sph_j_rows, &
                                               dbg_sph_j_cols, dbg_sph_m_norm, dbg_sph_j_norm, &
-                                              dbg_sph_c_norm)
+                                              dbg_sph_c_norm, debug_probe=.FALSE.)
             IF (ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit)) THEN
                ri_data%lri_kp%npair_blocks = ipair_block
                ri_data%lri_kp%c_nreal_stored = ri_data%lri_kp%c_nreal_stored + &
@@ -494,14 +494,16 @@ CONTAINS
 !> \param sph_metric_norm ...
 !> \param sph_j_norm ...
 !> \param sph_c_norm ...
+!> \param debug_probe ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, ri_data, &
                                            pair_block, metric_ncart, threec_i_ncart, threec_j_ncart, &
                                            metric_norm, threec_i_norm, threec_j_norm, metric_dim, &
                                            threec_rows, threec_cols, metric_dense_norm, threec_norm, &
                                            metric_diag_cond, metric_eig_min, metric_eig_max, &
-                                           metric_eig_cond, metric_eig_small, c_norm, sph_metric_dim, sph_j_rows, sph_j_cols, &
-                                           sph_metric_norm, sph_j_norm, sph_c_norm)
+                                           metric_eig_cond, metric_eig_small, c_norm, sph_metric_dim, &
+                                           sph_j_rows, sph_j_cols, sph_metric_norm, sph_j_norm, &
+                                           sph_c_norm, debug_probe)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -520,12 +522,13 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: c_norm
       INTEGER, INTENT(OUT)                               :: sph_metric_dim, sph_j_rows, sph_j_cols
       REAL(dp), INTENT(OUT)                              :: sph_metric_norm, sph_j_norm, sph_c_norm
+      LOGICAL, INTENT(IN), OPTIONAL                      :: debug_probe
 
       INTEGER                                            :: idim, maxl_ai, maxl_aj, maxl_ri, &
                                                             maxl_rj, mmax, ncart_ai, ncart_aj, &
                                                             ncart_ri, ncart_rj, offset_j, &
                                                             sph_eig_small
-      LOGICAL                                            :: onsite_aux
+      LOGICAL                                            :: do_debug_probe, onsite_aux
       REAL(dp) :: diag_abs, diag_max, diag_min, metric_norm2, sph_eig_cond, sph_eig_max, &
          sph_eig_min, threec_i_norm2, threec_j_norm2
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, j_block, j_sph, metric_block, &
@@ -567,6 +570,9 @@ CONTAINS
       sph_j_norm = 0.0_dp
       sph_c_norm = 0.0_dp
 
+      do_debug_probe = .TRUE.
+      IF (PRESENT(debug_probe)) do_debug_probe = debug_probe
+
       IF (.NOT. ASSOCIATED(obas_i)) RETURN
       IF (.NOT. ASSOCIATED(obas_j)) RETURN
       IF (.NOT. ASSOCIATED(rbas_i)) RETURN
@@ -595,20 +601,22 @@ CONTAINS
       sph_eig_small = 0
       onsite_aux = (NORM2(rab) <= 1.0E-12_dp .AND. ikind == jkind)
 
-      CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_i, r0, r0, lib2, ri_data, metric_ncart, &
-                                      metric_norm2)
-      IF (.NOT. onsite_aux) THEN
-         CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_j, r0, rab, lib2, ri_data, metric_ncart, &
-                                         metric_norm2, prefactor=2.0_dp)
-         CALL hfx_lri_accumulate_2c_norm(rbas_j, rbas_j, rab, rab, lib2, ri_data, metric_ncart, &
+      IF (do_debug_probe) THEN
+         CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_i, r0, r0, lib2, ri_data, metric_ncart, &
                                          metric_norm2)
-      END IF
+         IF (.NOT. onsite_aux) THEN
+            CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_j, r0, rab, lib2, ri_data, metric_ncart, &
+                                            metric_norm2, prefactor=2.0_dp)
+            CALL hfx_lri_accumulate_2c_norm(rbas_j, rbas_j, rab, rab, lib2, ri_data, metric_ncart, &
+                                            metric_norm2)
+         END IF
 
-      CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_i, r0, rab, r0, lib3, ri_data, &
-                                      threec_i_ncart, threec_i_norm2)
-      IF (.NOT. onsite_aux) THEN
-         CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_j, r0, rab, rab, lib3, ri_data, &
-                                         threec_j_ncart, threec_j_norm2)
+         CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_i, r0, rab, r0, lib3, ri_data, &
+                                         threec_i_ncart, threec_i_norm2)
+         IF (.NOT. onsite_aux) THEN
+            CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_j, r0, rab, rab, lib3, ri_data, &
+                                            threec_j_ncart, threec_j_norm2)
+         END IF
       END IF
 
       ncart_ai = hfx_lri_count_cart_functions(obas_i)
@@ -637,19 +645,21 @@ CONTAINS
                                        j_block, offset_j, ncart_aj)
          END IF
 
-         metric_dense_norm = SQRT(SUM(metric_block*metric_block))
-         threec_norm = SQRT(SUM(j_block*j_block))
-         diag_min = HUGE(1.0_dp)
-         diag_max = 0.0_dp
-         DO idim = 1, metric_dim
-            diag_abs = ABS(metric_block(idim, idim))
-            diag_max = MAX(diag_max, diag_abs)
-            IF (diag_abs > 1.0E-300_dp) diag_min = MIN(diag_min, diag_abs)
-         END DO
-         IF (diag_min < HUGE(1.0_dp)) metric_diag_cond = diag_max/diag_min
+         IF (do_debug_probe) THEN
+            metric_dense_norm = SQRT(SUM(metric_block*metric_block))
+            threec_norm = SQRT(SUM(j_block*j_block))
+            diag_min = HUGE(1.0_dp)
+            diag_max = 0.0_dp
+            DO idim = 1, metric_dim
+               diag_abs = ABS(metric_block(idim, idim))
+               diag_max = MAX(diag_max, diag_abs)
+               IF (diag_abs > 1.0E-300_dp) diag_min = MIN(diag_min, diag_abs)
+            END DO
+            IF (diag_min < HUGE(1.0_dp)) metric_diag_cond = diag_max/diag_min
 
-         CALL hfx_lri_probe_metric_inverse(metric_block, j_block, metric_eig_min, metric_eig_max, &
-                                           metric_eig_cond, metric_eig_small, c_norm)
+            CALL hfx_lri_probe_metric_inverse(metric_block, j_block, metric_eig_min, metric_eig_max, &
+                                              metric_eig_cond, metric_eig_small, c_norm)
+         END IF
 
          CALL hfx_lri_build_sphi_matrix(obas_i, sphi_i)
          CALL hfx_lri_build_sphi_matrix(obas_j, sphi_j)
@@ -685,8 +695,10 @@ CONTAINS
             j_sph = MATMUL(TRANSPOSE(sphi_pair), tmp_sph)
             DEALLOCATE (tmp_sph)
 
-            sph_metric_norm = SQRT(SUM(metric_sph*metric_sph))
-            sph_j_norm = SQRT(SUM(j_sph*j_sph))
+            IF (do_debug_probe) THEN
+               sph_metric_norm = SQRT(SUM(metric_sph*metric_sph))
+               sph_j_norm = SQRT(SUM(j_sph*j_sph))
+            END IF
             CALL hfx_lri_probe_metric_inverse(metric_sph, j_sph, sph_eig_min, sph_eig_max, &
                                               sph_eig_cond, sph_eig_small, sph_c_norm, c_out=c_sph)
             CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, SIZE(sphi_i, 2), &
