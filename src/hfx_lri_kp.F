@@ -56,6 +56,7 @@ MODULE hfx_lri_kp
    PUBLIC :: hfx_lri_update_ks_kp
 
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
+   INTEGER, PARAMETER :: lri_debug_max_accum_pairs = 10
 
 CONTAINS
 
@@ -1335,10 +1336,12 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
 
       INTEGER                                            :: img, ipair, ipair_sel, lb1, lb2, lb3, &
-                                                            ub1, ub2, ub3
+                                                            naccum, ub1, ub2, ub3
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
-      REAL(dp)                                           :: c_norm, k_norm, rho_norm
+      REAL(dp)                                           :: c_norm, k_accum_norm, k_norm, &
+                                                            k_norm2_accum, rho_accum_norm, &
+                                                            rho_norm, rho_norm2_accum
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -1398,6 +1401,47 @@ CONTAINS
       c_norm = SQRT(SUM(ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit* &
                         ri_data%lri_kp%pair_blocks(ipair_sel)%c_fit))
 
+      naccum = 0
+      rho_norm2_accum = 0.0_dp
+      k_norm2_accum = 0.0_dp
+      DO ipair = 1, ri_data%lri_kp%npair_blocks
+         IF (naccum >= lri_debug_max_accum_pairs) EXIT
+         IF (ri_data%lri_kp%pair_blocks(ipair)%iatom /= &
+             ri_data%lri_kp%pair_blocks(ipair)%jatom) CYCLE
+         IF (ANY(ri_data%lri_kp%pair_blocks(ipair)%cell /= 0)) CYCLE
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%v_fit)) CYCLE
+
+         img = 1
+         IF (ASSOCIATED(cell_to_index)) THEN
+            lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+            lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+            lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+            IF (ALL(ri_data%lri_kp%pair_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
+                ALL(ri_data%lri_kp%pair_blocks(ipair)%cell <= [ub1, ub2, ub3])) THEN
+               img = cell_to_index(ri_data%lri_kp%pair_blocks(ipair)%cell(1), &
+                                   ri_data%lri_kp%pair_blocks(ipair)%cell(2), &
+                                   ri_data%lri_kp%pair_blocks(ipair)%cell(3))
+            END IF
+         END IF
+         IF (img < 1 .OR. img > SIZE(rho_ao, 2)) CYCLE
+
+         CALL dbcsr_get_block_p(matrix=rho_ao(1, img)%matrix, &
+                                row=ri_data%lri_kp%pair_blocks(ipair)%iatom, &
+                                col=ri_data%lri_kp%pair_blocks(ipair)%jatom, &
+                                block=rho_block, found=found)
+         IF (.NOT. found) CYCLE
+
+         CALL hfx_lri_contract_real_density_self(ri_data%lri_kp%pair_blocks(ipair), rho_block, &
+                                                 k_block)
+         rho_norm2_accum = rho_norm2_accum + SUM(rho_block*rho_block)
+         k_norm2_accum = k_norm2_accum + SUM(k_block*k_block)
+         DEALLOCATE (k_block)
+         naccum = naccum + 1
+      END DO
+      rho_accum_norm = SQRT(rho_norm2_accum)
+      k_accum_norm = SQRT(k_norm2_accum)
+
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1417,6 +1461,11 @@ CONTAINS
             "rho/C norm", rho_norm, c_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "real K norm", k_norm
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug onsite K accumulation"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "used/max pairs", naccum, lri_debug_max_accum_pairs
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "rho/K norm", rho_accum_norm, k_accum_norm
       END IF
 
    END SUBROUTINE hfx_lri_debug_density_block
