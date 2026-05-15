@@ -1378,16 +1378,18 @@ CONTAINS
       INTEGER, INTENT(OUT) :: skipped_image, skipped_cell_bounds, skipped_img_index, &
          skipped_missing_rho, skipped_rho_dim, skipped_small_rho, skipped_no_kblock
 
-      INTEGER                                            :: img_pair, ipair, ipair_best, lb1, lb2, &
-                                                            lb3, search_iter, ub1, ub2, ub3
-      LOGICAL                                            :: found
+      INTEGER                                            :: img_pair, img_rev, ipair, ipair_best, &
+                                                            lb1, lb2, lb3, search_iter, ub1, ub2, &
+                                                            ub3
+      INTEGER, DIMENSION(3)                              :: cell_rev
+      LOGICAL                                            :: found, found_rev
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
       REAL(dp)                                           :: best_r2, pair_r2, rho_norm2_accum, &
                                                             rho_pair_norm
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_pair_block
-      REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_pair_block, rho_work
+      REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block, rho_block_rev
 
-      NULLIFY (rho_block)
+      NULLIFY (rho_block, rho_block_rev)
 
       used_pairs = 0
       candidate_pairs = 0
@@ -1454,16 +1456,51 @@ CONTAINS
                                 row=ri_data%lri_kp%pair_blocks(ipair_best)%iatom, &
                                 col=ri_data%lri_kp%pair_blocks(ipair_best)%jatom, &
                                 block=rho_block, found=found)
-         IF (.NOT. found) THEN
-            skipped_missing_rho = skipped_missing_rho + 1
-            CYCLE
+         IF (ALLOCATED(rho_work)) DEALLOCATE (rho_work)
+         IF (found) THEN
+            IF (SIZE(rho_block, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i .OR. &
+                SIZE(rho_block, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j) THEN
+               skipped_rho_dim = skipped_rho_dim + 1
+               CYCLE
+            END IF
+            ALLOCATE (rho_work(ri_data%lri_kp%pair_blocks(ipair_best)%nao_i, &
+                               ri_data%lri_kp%pair_blocks(ipair_best)%nao_j))
+            rho_work(:, :) = rho_block(1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_i, &
+                                       1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_j)
+         ELSE
+            ! In the image representation the transposed block may be stored as D_ji(-R)^T.
+            ! Try this fallback before treating the density block as missing.
+            found_rev = .FALSE.
+            cell_rev(:) = -ri_data%lri_kp%pair_blocks(ipair_best)%cell(:)
+            img_rev = 0
+            IF (ASSOCIATED(cell_to_index)) THEN
+               IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
+                  img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
+               END IF
+            ELSE
+               img_rev = 1
+            END IF
+            IF (img_rev >= 1 .AND. img_rev <= SIZE(rho_ao, 2)) THEN
+               CALL dbcsr_get_block_p(matrix=rho_ao(1, img_rev)%matrix, &
+                                      row=ri_data%lri_kp%pair_blocks(ipair_best)%jatom, &
+                                      col=ri_data%lri_kp%pair_blocks(ipair_best)%iatom, &
+                                      block=rho_block_rev, found=found_rev)
+            END IF
+            IF (.NOT. found_rev) THEN
+               skipped_missing_rho = skipped_missing_rho + 1
+               CYCLE
+            END IF
+            IF (SIZE(rho_block_rev, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j .OR. &
+                SIZE(rho_block_rev, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i) THEN
+               skipped_rho_dim = skipped_rho_dim + 1
+               CYCLE
+            END IF
+            ALLOCATE (rho_work(ri_data%lri_kp%pair_blocks(ipair_best)%nao_i, &
+                               ri_data%lri_kp%pair_blocks(ipair_best)%nao_j))
+            rho_work(:, :) = TRANSPOSE(rho_block_rev(1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_j, &
+                                                     1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_i))
          END IF
-         IF (SIZE(rho_block, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i .OR. &
-             SIZE(rho_block, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j) THEN
-            skipped_rho_dim = skipped_rho_dim + 1
-            CYCLE
-         END IF
-         rho_pair_norm = SQRT(SUM(rho_block*rho_block))
+         rho_pair_norm = SQRT(SUM(rho_work*rho_work))
          IF (rho_pair_norm < lri_debug_rho_threshold) THEN
             skipped_small_rho = skipped_small_rho + 1
             CYCLE
@@ -1472,7 +1509,7 @@ CONTAINS
          CALL hfx_lri_contract_pair_pair_density_realv(basis_set_RI, &
                                                        ri_data%lri_kp%pair_blocks(ipair_target), &
                                                        ri_data%lri_kp%pair_blocks(ipair_best), &
-                                                       ri_data, rho_block, k_pair_block)
+                                                       ri_data, rho_work, k_pair_block)
          IF (.NOT. ALLOCATED(k_pair_block)) THEN
             skipped_no_kblock = skipped_no_kblock + 1
             CYCLE
@@ -1483,6 +1520,7 @@ CONTAINS
          DEALLOCATE (k_pair_block)
       END DO
 
+      IF (ALLOCATED(rho_work)) DEALLOCATE (rho_work)
       IF (ALLOCATED(tried_density_pair)) DEALLOCATE (tried_density_pair)
       rho_accum_norm = SQRT(rho_norm2_accum)
       IF (used_pairs <= 0) THEN
@@ -1519,7 +1557,7 @@ CONTAINS
       REAL(dp) :: best_r2, c_norm, k_accum_norm, k_blocks_norm, k_norm, pair_r2, rho_accum_norm, &
          rho_blocks_norm, rho_norm, rho_norm2_accum, rho_pair_norm, rho_tmp_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_accum_block, k_block, k_pair_block, &
-                                                            k_tmp_block
+                                                            k_tmp_block, rho_work
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_RI
       TYPE(kpoint_type), POINTER                         :: kpoints
@@ -1699,6 +1737,7 @@ CONTAINS
          used_pairs = used_pairs + 1
          DEALLOCATE (k_pair_block)
       END DO
+      IF (ALLOCATED(rho_work)) DEALLOCATE (rho_work)
       IF (ALLOCATED(tried_density_pair)) DEALLOCATE (tried_density_pair)
       rho_accum_norm = SQRT(rho_norm2_accum)
       k_accum_norm = SQRT(SUM(k_accum_block*k_accum_block))
