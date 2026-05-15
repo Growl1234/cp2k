@@ -1583,19 +1583,21 @@ CONTAINS
          img_rev, ipair, ipair_best, ipair_sel, ipair_target, lb1, lb2, lb3, max_k_blocks, &
          multi_candidate_pairs, multi_skipped_cell_bounds, multi_skipped_image, &
          multi_skipped_img_index, multi_skipped_missing_rho, multi_skipped_no_kblock, &
-         multi_skipped_rho_dim, multi_skipped_small_rho, multi_used_pairs, nkind, search_iter, &
-         skipped_cell_bounds
-      INTEGER :: skipped_cell_bounds_tmp, skipped_image, skipped_image_tmp, skipped_img_index, &
-         skipped_img_index_tmp, skipped_missing_rho, skipped_missing_rho_tmp, skipped_no_kblock, &
-         skipped_no_kblock_tmp, skipped_rho_dim, skipped_rho_dim_tmp, skipped_small_rho, &
-         skipped_small_rho_tmp, ub1, ub2, ub3, used_pairs, used_pairs_tmp
+         multi_skipped_rho_dim, multi_skipped_small_rho, multi_used_pairs, nearest_candidates, &
+         nearest_k_active_high
+      INTEGER :: nearest_k_active_large, nearest_k_active_low, nearest_k_active_mid, &
+         nearest_rho_active, nearest_targets, nearest_tests, nkind, search_iter, &
+         skipped_cell_bounds, skipped_cell_bounds_tmp, skipped_image, skipped_image_tmp, &
+         skipped_img_index, skipped_img_index_tmp, skipped_missing_rho, skipped_missing_rho_tmp, &
+         skipped_no_kblock, skipped_no_kblock_tmp, skipped_rho_dim, skipped_rho_dim_tmp, &
+         skipped_small_rho, skipped_small_rho_tmp, ub1, ub2, ub3, used_pairs, used_pairs_tmp
       INTEGER, DIMENSION(3)                              :: cell_rev
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found, found_rev
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
       REAL(dp) :: best_r2, c_norm, general_k_max, general_k_rms, k_accum_norm, k_blocks_norm, &
-         k_norm, pair_r2, rho_accum_norm, rho_blocks_norm, rho_norm, rho_norm2_accum, &
-         rho_pair_norm, rho_tmp_norm
+         k_norm, nearest_k_max, nearest_k_rms, pair_r2, rho_accum_norm, rho_blocks_norm, rho_norm, &
+         rho_norm2_accum, rho_pair_norm, rho_tmp_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_accum_block, k_block, k_pair_block, &
                                                             k_tmp_block, rho_work
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block, rho_block_rev
@@ -1879,6 +1881,13 @@ CONTAINS
       rho_blocks_norm = SQRT(rho_blocks_norm)
       k_blocks_norm = SQRT(k_blocks_norm)
 
+      CALL hfx_lri_debug_nearest_origin_contributions(basis_set_RI, rho_ao, cell_to_index, &
+                                                      ri_data, nearest_targets, nearest_candidates, &
+                                                      nearest_tests, nearest_rho_active, &
+                                                      nearest_k_active_low, nearest_k_active_mid, &
+                                                      nearest_k_active_high, nearest_k_active_large, &
+                                                      nearest_k_rms, nearest_k_max)
+
       CALL hfx_lri_debug_general_pair_contributions(basis_set_RI, rho_ao, cell_to_index, ri_data, &
                                                     general_targets, general_density_pairs, &
                                                     general_candidates, general_tests, &
@@ -1937,6 +1946,21 @@ CONTAINS
             "skip small/noK", multi_skipped_small_rho, multi_skipped_no_kblock
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_blocks_norm, k_blocks_norm
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug nearest-origin contribution probe"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "targets/tests", nearest_targets, nearest_tests
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "candidates/rho", nearest_candidates, nearest_rho_active
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+            "K > threshold", nearest_k_active_low, lri_debug_k_threshold_low
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+            "K > threshold", nearest_k_active_mid, lri_debug_k_threshold_mid
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+            "K > threshold", nearest_k_active_high, lri_debug_k_threshold_high
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+            "K > threshold", nearest_k_active_large, lri_debug_k_threshold_large
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "K rms/max", nearest_k_rms, nearest_k_max
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug general pair-pair contribution probe"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "target/density", general_targets, general_density_pairs
@@ -1960,6 +1984,91 @@ CONTAINS
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
    END SUBROUTINE hfx_lri_debug_density_block
+
+! **************************************************************************************************
+!> \brief Probes nearest-origin target K norms without changing the current K path.
+!> \param basis_set_RI ...
+!> \param rho_ao ...
+!> \param cell_to_index ...
+!> \param ri_data ...
+!> \param n_target_pairs ...
+!> \param n_candidates ...
+!> \param n_tests ...
+!> \param n_rho_active ...
+!> \param n_k_active_low ...
+!> \param n_k_active_mid ...
+!> \param n_k_active_high ...
+!> \param n_k_active_large ...
+!> \param k_norm_rms ...
+!> \param k_norm_max ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_debug_nearest_origin_contributions(basis_set_RI, rho_ao, cell_to_index, &
+                                                         ri_data, n_target_pairs, n_candidates, &
+                                                         n_tests, n_rho_active, n_k_active_low, &
+                                                         n_k_active_mid, n_k_active_high, &
+                                                         n_k_active_large, k_norm_rms, k_norm_max)
+
+      TYPE(gto_basis_set_p_type), DIMENSION(:), &
+         INTENT(IN)                                      :: basis_set_RI
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      INTEGER, INTENT(OUT) :: n_target_pairs, n_candidates, n_tests, n_rho_active, n_k_active_low, &
+         n_k_active_mid, n_k_active_high, n_k_active_large
+      REAL(dp), INTENT(OUT)                              :: k_norm_rms, k_norm_max
+
+      INTEGER :: candidate_pairs, ipair_target, skipped_cell_bounds, skipped_image, &
+         skipped_img_index, skipped_missing_rho, skipped_no_kblock, skipped_rho_dim, &
+         skipped_small_rho, used_pairs
+      REAL(dp)                                           :: k_norm, k_norm2, rho_accum_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
+
+      n_target_pairs = 0
+      n_candidates = 0
+      n_tests = 0
+      n_rho_active = 0
+      n_k_active_low = 0
+      n_k_active_mid = 0
+      n_k_active_high = 0
+      n_k_active_large = 0
+      k_norm_rms = 0.0_dp
+      k_norm_max = 0.0_dp
+      k_norm2 = 0.0_dp
+
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) RETURN
+      IF (ri_data%lri_kp%npair_blocks <= 0) RETURN
+      IF (.NOT. ASSOCIATED(rho_ao)) RETURN
+
+      DO ipair_target = 1, ri_data%lri_kp%npair_blocks
+         IF (n_target_pairs >= lri_debug_max_general_targets) EXIT
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) CYCLE
+         n_target_pairs = n_target_pairs + 1
+
+         CALL hfx_lri_accumulate_target_k_block(basis_set_RI, rho_ao, cell_to_index, ipair_target, &
+                                                ri_data, k_block, used_pairs, candidate_pairs, &
+                                                rho_accum_norm, skipped_image, skipped_cell_bounds, &
+                                                skipped_img_index, skipped_missing_rho, &
+                                                skipped_rho_dim, skipped_small_rho, skipped_no_kblock)
+         n_candidates = n_candidates + candidate_pairs
+         n_rho_active = n_rho_active + used_pairs
+         IF (.NOT. ALLOCATED(k_block)) CYCLE
+         n_tests = n_tests + 1
+         k_norm = SQRT(SUM(k_block*k_block))
+         k_norm2 = k_norm2 + k_norm*k_norm
+         k_norm_max = MAX(k_norm_max, k_norm)
+         IF (k_norm > lri_debug_k_threshold_low) n_k_active_low = n_k_active_low + 1
+         IF (k_norm > lri_debug_k_threshold_mid) n_k_active_mid = n_k_active_mid + 1
+         IF (k_norm > lri_debug_k_threshold_high) n_k_active_high = n_k_active_high + 1
+         IF (k_norm > lri_debug_k_threshold_large) n_k_active_large = n_k_active_large + 1
+         DEALLOCATE (k_block)
+      END DO
+
+      IF (n_tests > 0) THEN
+         k_norm_rms = SQRT(k_norm2/REAL(n_tests, KIND=dp))
+      END IF
+
+   END SUBROUTINE hfx_lri_debug_nearest_origin_contributions
 
 ! **************************************************************************************************
 !> \brief Probes general pair-pair contribution norms without changing the current K path.
