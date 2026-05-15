@@ -1875,11 +1875,13 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      INTEGER                                            :: added_blocks, debug_img, img, ipair, &
-                                                            lb1, lb2, lb3, skipped_blocks, ub1, &
-                                                            ub2, ub3
+      INTEGER                                            :: added_blocks, debug_img, img, img_rev, &
+                                                            ipair, lb1, lb2, lb3, skipped_blocks, &
+                                                            transposed_blocks, ub1, ub2, ub3
+      INTEGER, DIMENSION(3)                              :: cell_rev
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      LOGICAL                                            :: debug_found, found
+      LOGICAL                                            :: debug_found, found, found_rev, &
+                                                            use_transpose
       REAL(dp) :: debug_add_norm, debug_before_norm, debug_k_norm, k_norm, multi_add_norm2, &
          multi_after_norm2, multi_before_norm2, scale
       REAL(dp), DIMENSION(:, :), POINTER                 :: ks_block
@@ -1901,6 +1903,11 @@ CONTAINS
       CALL get_qs_env(qs_env=qs_env, kpoints=kpoints)
       IF (ASSOCIATED(kpoints)) THEN
          CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index)
+      END IF
+      IF (ASSOCIATED(cell_to_index)) THEN
+         lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+         lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+         lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
       END IF
 
       scale = hf_fraction
@@ -1931,13 +1938,30 @@ CONTAINS
                                    row=ri_data%lri_kp%debug_k_block%iatom, &
                                    col=ri_data%lri_kp%debug_k_block%jatom, &
                                    block=ks_block, found=found)
-            debug_found = found
             IF (found) THEN
-               IF (SIZE(ks_block, 1) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 1) .OR. &
-                   SIZE(ks_block, 2) /= SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)) THEN
-                  CPABORT("Inconsistent KS block size in LRI-HFXk debug writeback")
+               debug_found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 1) .AND. &
+                              SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 2))
+               IF (debug_found) debug_before_norm = SQRT(SUM(ks_block*ks_block))
+            END IF
+         END IF
+         IF (.NOT. debug_found .AND. ASSOCIATED(cell_to_index)) THEN
+            cell_rev(:) = -ri_data%lri_kp%debug_k_block%cell(:)
+            IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
+               img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
+               IF (img_rev >= 1 .AND. img_rev <= SIZE(ks_matrix, 2)) THEN
+                  CALL dbcsr_get_block_p(matrix=ks_matrix(1, img_rev)%matrix, &
+                                         row=ri_data%lri_kp%debug_k_block%jatom, &
+                                         col=ri_data%lri_kp%debug_k_block%iatom, &
+                                         block=ks_block, found=found_rev)
+                  IF (found_rev) THEN
+                     debug_found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 2) .AND. &
+                                    SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 1))
+                     IF (debug_found) THEN
+                        debug_img = img_rev
+                        debug_before_norm = SQRT(SUM(ks_block*ks_block))
+                     END IF
+                  END IF
                END IF
-               debug_before_norm = SQRT(SUM(ks_block*ks_block))
             END IF
          END IF
          debug_k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block* &
@@ -1946,35 +1970,64 @@ CONTAINS
       END IF
 
       added_blocks = 0
+      transposed_blocks = 0
       multi_before_norm2 = 0.0_dp
       multi_add_norm2 = 0.0_dp
       multi_after_norm2 = 0.0_dp
       IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
          DO ipair = 1, ri_data%lri_kp%ndebug_k_blocks
             IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_blocks(ipair)%k_block)) CYCLE
+            use_transpose = .FALSE.
+            found = .FALSE.
             img = 1
             IF (ASSOCIATED(cell_to_index)) THEN
                IF (.NOT. (ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
-                          ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell <= [ub1, ub2, ub3]))) CYCLE
-               img = cell_to_index(ri_data%lri_kp%debug_k_blocks(ipair)%cell(1), &
-                                   ri_data%lri_kp%debug_k_blocks(ipair)%cell(2), &
-                                   ri_data%lri_kp%debug_k_blocks(ipair)%cell(3))
+                          ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell <= [ub1, ub2, ub3]))) THEN
+                  img = 0
+               ELSE
+                  img = cell_to_index(ri_data%lri_kp%debug_k_blocks(ipair)%cell(1), &
+                                      ri_data%lri_kp%debug_k_blocks(ipair)%cell(2), &
+                                      ri_data%lri_kp%debug_k_blocks(ipair)%cell(3))
+               END IF
             END IF
-            IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) CYCLE
-            CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
-                                   row=ri_data%lri_kp%debug_k_blocks(ipair)%iatom, &
-                                   col=ri_data%lri_kp%debug_k_blocks(ipair)%jatom, &
-                                   block=ks_block, found=found)
+            IF (img >= 1 .AND. img <= SIZE(ks_matrix, 2)) THEN
+               CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
+                                      row=ri_data%lri_kp%debug_k_blocks(ipair)%iatom, &
+                                      col=ri_data%lri_kp%debug_k_blocks(ipair)%jatom, &
+                                      block=ks_block, found=found)
+               IF (found) THEN
+                  found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 1) .AND. &
+                           SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 2))
+               END IF
+            END IF
+            IF (.NOT. found .AND. ASSOCIATED(cell_to_index)) THEN
+               cell_rev(:) = -ri_data%lri_kp%debug_k_blocks(ipair)%cell(:)
+               IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
+                  img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
+                  IF (img_rev >= 1 .AND. img_rev <= SIZE(ks_matrix, 2)) THEN
+                     CALL dbcsr_get_block_p(matrix=ks_matrix(1, img_rev)%matrix, &
+                                            row=ri_data%lri_kp%debug_k_blocks(ipair)%jatom, &
+                                            col=ri_data%lri_kp%debug_k_blocks(ipair)%iatom, &
+                                            block=ks_block, found=found_rev)
+                     IF (found_rev) THEN
+                        found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 2) .AND. &
+                                 SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 1))
+                        use_transpose = found
+                     END IF
+                  END IF
+               END IF
+            END IF
             IF (.NOT. found) CYCLE
-            IF (SIZE(ks_block, 1) /= SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 1) .OR. &
-                SIZE(ks_block, 2) /= SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 2)) THEN
-               CPABORT("Inconsistent KS block size in LRI-HFXk multi-block debug writeback")
-            END IF
             k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_blocks(ipair)%k_block* &
                               ri_data%lri_kp%debug_k_blocks(ipair)%k_block))
             multi_before_norm2 = multi_before_norm2 + SUM(ks_block*ks_block)
             multi_add_norm2 = multi_add_norm2 + (ABS(scale)*k_norm)**2
-            ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_blocks(ipair)%k_block(:, :)
+            IF (use_transpose) THEN
+               ks_block(:, :) = ks_block(:, :) + scale*TRANSPOSE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block(:, :))
+               transposed_blocks = transposed_blocks + 1
+            ELSE
+               ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_blocks(ipair)%k_block(:, :)
+            END IF
             multi_after_norm2 = multi_after_norm2 + SUM(ks_block*ks_block)
             added_blocks = added_blocks + 1
          END DO
@@ -2018,6 +2071,8 @@ CONTAINS
             "added/stored", added_blocks, ri_data%lri_kp%ndebug_k_blocks
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
             "skipped", skipped_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+            "transposed", transposed_blocks
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "before norm", SQRT(multi_before_norm2)
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
