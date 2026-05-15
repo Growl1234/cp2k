@@ -1958,9 +1958,9 @@ CONTAINS
          n_rho_active, n_k_active_low, n_k_active_mid, n_k_active_high, n_k_active_large
       REAL(dp), INTENT(OUT)                              :: k_norm_rms, k_norm_max
 
-      INTEGER                                            :: img_pair, img_rev, ipair_density, &
-                                                            ipair_target, lb1, lb2, lb3, ub1, ub2, &
-                                                            ub3
+      INTEGER                                            :: candidate_index, img_pair, img_rev, &
+                                                            ipair_density, ipair_target, lb1, lb2, &
+                                                            lb3, sample_stride, ub1, ub2, ub3
       INTEGER, DIMENSION(3)                              :: cell_rev
       LOGICAL                                            :: found, found_rev
       REAL(dp)                                           :: k_norm, k_norm2, rho_norm
@@ -1997,9 +1997,21 @@ CONTAINS
          IF (n_target_pairs >= lri_debug_max_general_targets) EXIT
          IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) CYCLE
          n_target_pairs = n_target_pairs + 1
+      END DO
+
+      n_candidates = n_target_pairs*n_density_pairs
+      sample_stride = MAX(1, n_candidates/MAX(1, lri_debug_max_general_tests))
+      candidate_index = 0
+      n_target_pairs = 0
+
+      DO ipair_target = 1, ri_data%lri_kp%npair_blocks
+         IF (n_target_pairs >= lri_debug_max_general_targets) EXIT
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) CYCLE
+         n_target_pairs = n_target_pairs + 1
          DO ipair_density = 1, ri_data%lri_kp%npair_blocks
             IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_density)%c_fit)) CYCLE
-            n_candidates = n_candidates + 1
+            candidate_index = candidate_index + 1
+            IF (MOD(candidate_index - 1, sample_stride) /= 0) CYCLE
             IF (n_tests >= lri_debug_max_general_tests) CYCLE
             n_tests = n_tests + 1
 
