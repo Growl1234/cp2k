@@ -107,8 +107,8 @@ CONTAINS
          CALL hfx_lri_pre_scf_kp(qs_env, ri_data)
       END IF
 
-      CALL hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
-      CALL hfx_lri_debug_ks_writeback_probe(qs_env, ri_data, ks_matrix, hf_fraction)
+      CALL hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao)
+      CALL hfx_lri_write_rank_local_k_blocks(qs_env, ri_data, ks_matrix, hf_fraction)
 
       IF (lri_debug_abort_after_writeback) THEN
          ! CPABORT may terminate MPI ranks before buffered debug output is written.
@@ -1351,7 +1351,7 @@ CONTAINS
 !> \param pair_index ...
 !> \param k_block ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_store_debug_k_block(k_pair, pair_block, pair_index, k_block)
+   SUBROUTINE hfx_lri_store_k_block(k_pair, pair_block, pair_index, k_block)
 
       USE hfx_lri_types, ONLY: hfx_lri_k_block_type
       TYPE(hfx_lri_k_block_type), INTENT(INOUT)          :: k_pair
@@ -1373,7 +1373,7 @@ CONTAINS
       ALLOCATE (k_pair%k_block(SIZE(k_block, 1), SIZE(k_block, 2)))
       k_pair%k_block(:, :) = k_block(:, :)
 
-   END SUBROUTINE hfx_lri_store_debug_k_block
+   END SUBROUTINE hfx_lri_store_k_block
 
 ! **************************************************************************************************
 !> \brief Accumulates a debug K block for one target pair using nearest-origin density pairs.
@@ -1571,7 +1571,7 @@ CONTAINS
 !> \param ri_data ...
 !> \param rho_ao ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_debug_density_block(qs_env, ri_data, rho_ao)
+   SUBROUTINE hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
@@ -1819,22 +1819,22 @@ CONTAINS
       rho_accum_norm = SQRT(rho_norm2_accum)
       k_accum_norm = SQRT(SUM(k_accum_block*k_accum_block))
 
-      CALL hfx_lri_store_debug_k_block(ri_data%lri_kp%debug_k_block, &
-                                       ri_data%lri_kp%pair_blocks(ipair_sel), &
-                                       ipair_sel, k_accum_block)
+      CALL hfx_lri_store_k_block(ri_data%lri_kp%diagnostic_k_block, &
+                                 ri_data%lri_kp%pair_blocks(ipair_sel), &
+                                 ipair_sel, k_accum_block)
 
-      IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
-         DO ipair = 1, SIZE(ri_data%lri_kp%debug_k_blocks)
-            IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks(ipair)%k_block)) THEN
-               DEALLOCATE (ri_data%lri_kp%debug_k_blocks(ipair)%k_block)
+      IF (ALLOCATED(ri_data%lri_kp%k_blocks)) THEN
+         DO ipair = 1, SIZE(ri_data%lri_kp%k_blocks)
+            IF (ALLOCATED(ri_data%lri_kp%k_blocks(ipair)%k_block)) THEN
+               DEALLOCATE (ri_data%lri_kp%k_blocks(ipair)%k_block)
             END IF
          END DO
-         DEALLOCATE (ri_data%lri_kp%debug_k_blocks)
+         DEALLOCATE (ri_data%lri_kp%k_blocks)
       END IF
-      ri_data%lri_kp%ndebug_k_blocks = 0
+      ri_data%lri_kp%nk_blocks = 0
       max_k_blocks = MIN(lri_debug_max_k_blocks, ri_data%lri_kp%npair_blocks)
       IF (max_k_blocks > 0) THEN
-         ALLOCATE (ri_data%lri_kp%debug_k_blocks(max_k_blocks))
+         ALLOCATE (ri_data%lri_kp%k_blocks(max_k_blocks))
       END IF
       multi_used_pairs = 0
       multi_candidate_pairs = 0
@@ -1848,7 +1848,7 @@ CONTAINS
       rho_blocks_norm = 0.0_dp
       k_blocks_norm = 0.0_dp
       DO ipair_target = 1, ri_data%lri_kp%npair_blocks
-         IF (ri_data%lri_kp%ndebug_k_blocks >= max_k_blocks) EXIT
+         IF (ri_data%lri_kp%nk_blocks >= max_k_blocks) EXIT
          IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) CYCLE
          CALL hfx_lri_accumulate_target_k_block(basis_set_RI, rho_ao, cell_to_index, ipair_target, &
                                                 ri_data, k_tmp_block, used_pairs_tmp, &
@@ -1870,9 +1870,9 @@ CONTAINS
             DEALLOCATE (k_tmp_block)
             CYCLE
          END IF
-         ri_data%lri_kp%ndebug_k_blocks = ri_data%lri_kp%ndebug_k_blocks + 1
-         CALL hfx_lri_store_debug_k_block( &
-            ri_data%lri_kp%debug_k_blocks(ri_data%lri_kp%ndebug_k_blocks), &
+         ri_data%lri_kp%nk_blocks = ri_data%lri_kp%nk_blocks + 1
+         CALL hfx_lri_store_k_block( &
+            ri_data%lri_kp%k_blocks(ri_data%lri_kp%nk_blocks), &
             ri_data%lri_kp%pair_blocks(ipair_target), ipair_target, k_tmp_block)
          rho_blocks_norm = rho_blocks_norm + rho_tmp_norm*rho_tmp_norm
          k_blocks_norm = k_blocks_norm + SUM(k_tmp_block*k_tmp_block)
@@ -1915,7 +1915,7 @@ CONTAINS
             "rho/C norm", rho_norm, c_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
             "real K norm", k_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug nearest-origin K accumulation"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk diagnostic K accumulation"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "used/candidates", used_pairs, candidate_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1929,13 +1929,13 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_accum_norm, k_accum_norm
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "stored K dims", SIZE(ri_data%lri_kp%debug_k_block%k_block, 1), &
-            SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
+            "stored K dims", SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1), &
+            SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2)
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
-            "stored K pair", ri_data%lri_kp%debug_k_block%pair_index
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug multi-K block accumulation"
+            "stored K pair", ri_data%lri_kp%diagnostic_k_block%pair_index
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk rank-local K construction"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "stored/max blocks", ri_data%lri_kp%ndebug_k_blocks, max_k_blocks
+            "stored/max blocks", ri_data%lri_kp%nk_blocks, max_k_blocks
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "used/candidates", multi_used_pairs, multi_candidate_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1946,7 +1946,7 @@ CONTAINS
             "skip small/noK", multi_skipped_small_rho, multi_skipped_no_kblock
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_blocks_norm, k_blocks_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug nearest-origin contribution probe"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk nearest-origin contribution probe"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "targets/tests", nearest_targets, nearest_tests
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1961,7 +1961,7 @@ CONTAINS
             "K > threshold", nearest_k_active_large, lri_debug_k_threshold_large
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "K rms/max", nearest_k_rms, nearest_k_max
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug general pair-pair contribution probe"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk general pair-pair contribution probe"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "target/density", general_targets, general_density_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1983,7 +1983,7 @@ CONTAINS
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
-   END SUBROUTINE hfx_lri_debug_density_block
+   END SUBROUTINE hfx_lri_build_rank_local_k_blocks
 
 ! **************************************************************************************************
 !> \brief Probes nearest-origin target K norms without changing the current K path.
@@ -2245,7 +2245,7 @@ CONTAINS
 !> \param ks_matrix ...
 !> \param hf_fraction ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_debug_ks_writeback_probe(qs_env, ri_data, ks_matrix, hf_fraction)
+   SUBROUTINE hfx_lri_write_rank_local_k_blocks(qs_env, ri_data, ks_matrix, hf_fraction)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
@@ -2294,45 +2294,45 @@ CONTAINS
       debug_k_norm = 0.0_dp
       debug_add_norm = 0.0_dp
 
-      ! Keep the single debug K block as a diagnostic only. The actual prototype
+      ! Keep one diagnostic K block for detailed reporting only. The actual prototype
       ! writeback below uses the rank-local multi-K block list exclusively.
-      IF (ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) THEN
+      IF (ALLOCATED(ri_data%lri_kp%diagnostic_k_block%k_block)) THEN
          img = 1
          IF (ASSOCIATED(cell_to_index)) THEN
             lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
             lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
             lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
-            IF (ALL(ri_data%lri_kp%debug_k_block%cell >= [lb1, lb2, lb3]) .AND. &
-                ALL(ri_data%lri_kp%debug_k_block%cell <= [ub1, ub2, ub3])) THEN
-               img = cell_to_index(ri_data%lri_kp%debug_k_block%cell(1), &
-                                   ri_data%lri_kp%debug_k_block%cell(2), &
-                                   ri_data%lri_kp%debug_k_block%cell(3))
+            IF (ALL(ri_data%lri_kp%diagnostic_k_block%cell >= [lb1, lb2, lb3]) .AND. &
+                ALL(ri_data%lri_kp%diagnostic_k_block%cell <= [ub1, ub2, ub3])) THEN
+               img = cell_to_index(ri_data%lri_kp%diagnostic_k_block%cell(1), &
+                                   ri_data%lri_kp%diagnostic_k_block%cell(2), &
+                                   ri_data%lri_kp%diagnostic_k_block%cell(3))
             END IF
          END IF
          debug_img = img
          IF (img >= 1 .AND. img <= SIZE(ks_matrix, 2)) THEN
             CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
-                                   row=ri_data%lri_kp%debug_k_block%iatom, &
-                                   col=ri_data%lri_kp%debug_k_block%jatom, &
+                                   row=ri_data%lri_kp%diagnostic_k_block%iatom, &
+                                   col=ri_data%lri_kp%diagnostic_k_block%jatom, &
                                    block=ks_block, found=found)
             IF (found) THEN
-               debug_found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 1) .AND. &
-                              SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 2))
+               debug_found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1) .AND. &
+                              SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2))
                IF (debug_found) debug_before_norm = SQRT(SUM(ks_block*ks_block))
             END IF
          END IF
          IF (.NOT. debug_found .AND. ASSOCIATED(cell_to_index)) THEN
-            cell_rev(:) = -ri_data%lri_kp%debug_k_block%cell(:)
+            cell_rev(:) = -ri_data%lri_kp%diagnostic_k_block%cell(:)
             IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
                img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
                IF (img_rev >= 1 .AND. img_rev <= SIZE(ks_matrix, 2)) THEN
                   CALL dbcsr_get_block_p(matrix=ks_matrix(1, img_rev)%matrix, &
-                                         row=ri_data%lri_kp%debug_k_block%jatom, &
-                                         col=ri_data%lri_kp%debug_k_block%iatom, &
+                                         row=ri_data%lri_kp%diagnostic_k_block%jatom, &
+                                         col=ri_data%lri_kp%diagnostic_k_block%iatom, &
                                          block=ks_block, found=found_rev)
                   IF (found_rev) THEN
-                     debug_found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 2) .AND. &
-                                    SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_block%k_block, 1))
+                     debug_found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2) .AND. &
+                                    SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1))
                      IF (debug_found) THEN
                         debug_img = img_rev
                         debug_before_norm = SQRT(SUM(ks_block*ks_block))
@@ -2341,8 +2341,8 @@ CONTAINS
                END IF
             END IF
          END IF
-         debug_k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_block%k_block* &
-                                 ri_data%lri_kp%debug_k_block%k_block))
+         debug_k_norm = SQRT(SUM(ri_data%lri_kp%diagnostic_k_block%k_block* &
+                                 ri_data%lri_kp%diagnostic_k_block%k_block))
          debug_add_norm = ABS(scale)*debug_k_norm
       END IF
 
@@ -2351,59 +2351,59 @@ CONTAINS
       multi_before_norm2 = 0.0_dp
       multi_add_norm2 = 0.0_dp
       multi_after_norm2 = 0.0_dp
-      IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
-         DO ipair = 1, ri_data%lri_kp%ndebug_k_blocks
-            IF (.NOT. ALLOCATED(ri_data%lri_kp%debug_k_blocks(ipair)%k_block)) CYCLE
+      IF (ALLOCATED(ri_data%lri_kp%k_blocks)) THEN
+         DO ipair = 1, ri_data%lri_kp%nk_blocks
+            IF (.NOT. ALLOCATED(ri_data%lri_kp%k_blocks(ipair)%k_block)) CYCLE
             use_transpose = .FALSE.
             found = .FALSE.
             img = 1
             IF (ASSOCIATED(cell_to_index)) THEN
-               IF (.NOT. (ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
-                          ALL(ri_data%lri_kp%debug_k_blocks(ipair)%cell <= [ub1, ub2, ub3]))) THEN
+               IF (.NOT. (ALL(ri_data%lri_kp%k_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
+                          ALL(ri_data%lri_kp%k_blocks(ipair)%cell <= [ub1, ub2, ub3]))) THEN
                   img = 0
                ELSE
-                  img = cell_to_index(ri_data%lri_kp%debug_k_blocks(ipair)%cell(1), &
-                                      ri_data%lri_kp%debug_k_blocks(ipair)%cell(2), &
-                                      ri_data%lri_kp%debug_k_blocks(ipair)%cell(3))
+                  img = cell_to_index(ri_data%lri_kp%k_blocks(ipair)%cell(1), &
+                                      ri_data%lri_kp%k_blocks(ipair)%cell(2), &
+                                      ri_data%lri_kp%k_blocks(ipair)%cell(3))
                END IF
             END IF
             IF (img >= 1 .AND. img <= SIZE(ks_matrix, 2)) THEN
                CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, &
-                                      row=ri_data%lri_kp%debug_k_blocks(ipair)%iatom, &
-                                      col=ri_data%lri_kp%debug_k_blocks(ipair)%jatom, &
+                                      row=ri_data%lri_kp%k_blocks(ipair)%iatom, &
+                                      col=ri_data%lri_kp%k_blocks(ipair)%jatom, &
                                       block=ks_block, found=found)
                IF (found) THEN
-                  found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 1) .AND. &
-                           SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 2))
+                  found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 1) .AND. &
+                           SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 2))
                END IF
             END IF
             IF (.NOT. found .AND. ASSOCIATED(cell_to_index)) THEN
-               cell_rev(:) = -ri_data%lri_kp%debug_k_blocks(ipair)%cell(:)
+               cell_rev(:) = -ri_data%lri_kp%k_blocks(ipair)%cell(:)
                IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
                   img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
                   IF (img_rev >= 1 .AND. img_rev <= SIZE(ks_matrix, 2)) THEN
                      CALL dbcsr_get_block_p(matrix=ks_matrix(1, img_rev)%matrix, &
-                                            row=ri_data%lri_kp%debug_k_blocks(ipair)%jatom, &
-                                            col=ri_data%lri_kp%debug_k_blocks(ipair)%iatom, &
+                                            row=ri_data%lri_kp%k_blocks(ipair)%jatom, &
+                                            col=ri_data%lri_kp%k_blocks(ipair)%iatom, &
                                             block=ks_block, found=found_rev)
                      IF (found_rev) THEN
-                        found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 2) .AND. &
-                                 SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block, 1))
+                        found = (SIZE(ks_block, 1) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 2) .AND. &
+                                 SIZE(ks_block, 2) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 1))
                         use_transpose = found
                      END IF
                   END IF
                END IF
             END IF
             IF (.NOT. found) CYCLE
-            k_norm = SQRT(SUM(ri_data%lri_kp%debug_k_blocks(ipair)%k_block* &
-                              ri_data%lri_kp%debug_k_blocks(ipair)%k_block))
+            k_norm = SQRT(SUM(ri_data%lri_kp%k_blocks(ipair)%k_block* &
+                              ri_data%lri_kp%k_blocks(ipair)%k_block))
             multi_before_norm2 = multi_before_norm2 + SUM(ks_block*ks_block)
             multi_add_norm2 = multi_add_norm2 + (ABS(scale)*k_norm)**2
             IF (use_transpose) THEN
-               ks_block(:, :) = ks_block(:, :) + scale*TRANSPOSE(ri_data%lri_kp%debug_k_blocks(ipair)%k_block(:, :))
+               ks_block(:, :) = ks_block(:, :) + scale*TRANSPOSE(ri_data%lri_kp%k_blocks(ipair)%k_block(:, :))
                transposed_blocks = transposed_blocks + 1
             ELSE
-               ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%debug_k_blocks(ipair)%k_block(:, :)
+               ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%k_blocks(ipair)%k_block(:, :)
             END IF
             multi_after_norm2 = multi_after_norm2 + SUM(ks_block*ks_block)
             added_blocks = added_blocks + 1
@@ -2411,41 +2411,41 @@ CONTAINS
       END IF
 
       skipped_blocks = 0
-      IF (ALLOCATED(ri_data%lri_kp%debug_k_blocks)) THEN
-         skipped_blocks = ri_data%lri_kp%ndebug_k_blocks - added_blocks
+      IF (ALLOCATED(ri_data%lri_kp%k_blocks)) THEN
+         skipped_blocks = ri_data%lri_kp%nk_blocks - added_blocks
       END IF
 
       IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug KS writeback diagnostic"
-         IF (ALLOCATED(ri_data%lri_kp%debug_k_block%k_block)) THEN
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk KS writeback diagnostic"
+         IF (ALLOCATED(ri_data%lri_kp%diagnostic_k_block%k_block)) THEN
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "pair/image", ri_data%lri_kp%debug_k_block%pair_index, debug_img
+               "pair/image", ri_data%lri_kp%diagnostic_k_block%pair_index, debug_img
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "atoms", ri_data%lri_kp%debug_k_block%iatom, &
-               ri_data%lri_kp%debug_k_block%jatom
+               "atoms", ri_data%lri_kp%diagnostic_k_block%iatom, &
+               ri_data%lri_kp%diagnostic_k_block%jatom
             WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
-               "cell", ri_data%lri_kp%debug_k_block%cell
+               "cell", ri_data%lri_kp%diagnostic_k_block%cell
             IF (debug_found) THEN
                WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-                  "KS dims", SIZE(ri_data%lri_kp%debug_k_block%k_block, 1), &
-                  SIZE(ri_data%lri_kp%debug_k_block%k_block, 2)
+                  "KS dims", SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1), &
+                  SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2)
             ELSE
                WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
             END IF
             WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                "before norm", debug_before_norm
             WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-               "debug K norm", debug_k_norm
+               "diagnostic K norm", debug_k_norm
             WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                "scale", scale
             WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
                "would-add norm", debug_add_norm
          ELSE
-            WRITE (ri_data%unit_nr, "(T6,A)") "debug K block is not allocated"
+            WRITE (ri_data%unit_nr, "(T6,A)") "diagnostic K block is not allocated"
          END IF
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug multi-K writeback prototype"
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk rank-local KS writeback"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "added/stored", added_blocks, ri_data%lri_kp%ndebug_k_blocks
+            "added/stored", added_blocks, ri_data%lri_kp%nk_blocks
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
             "skipped", skipped_blocks
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
@@ -2458,7 +2458,7 @@ CONTAINS
             "after norm", SQRT(multi_after_norm2)
       END IF
 
-   END SUBROUTINE hfx_lri_debug_ks_writeback_probe
+   END SUBROUTINE hfx_lri_write_rank_local_k_blocks
 
 ! **************************************************************************************************
 !> \brief Contracts a target pair with a density pair and a real pair-pair auxiliary metric.
