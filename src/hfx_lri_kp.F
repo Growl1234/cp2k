@@ -58,6 +58,9 @@ MODULE hfx_lri_kp
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
    INTEGER, PARAMETER :: lri_debug_max_k_blocks = 500
    REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
+   INTEGER, PARAMETER :: lri_debug_max_general_targets = 20
+   INTEGER, PARAMETER :: lri_debug_max_general_v_tests = 200
+   REAL(dp), PARAMETER :: lri_debug_v_threshold = 1.0E-10_dp
    LOGICAL, PARAMETER :: lri_debug_abort_after_writeback = .FALSE.
 
 CONTAINS
@@ -1571,21 +1574,23 @@ CONTAINS
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
 
-      INTEGER :: candidate_pairs, candidate_pairs_tmp, img, img_pair, ipair, ipair_best, &
+      INTEGER :: candidate_pairs, candidate_pairs_tmp, general_candidates, general_density_pairs, &
+         general_targets, general_v_active, general_v_tests, img, img_pair, ipair, ipair_best, &
          ipair_sel, ipair_target, lb1, lb2, lb3, max_k_blocks, multi_candidate_pairs, &
          multi_skipped_cell_bounds, multi_skipped_image, multi_skipped_img_index, &
          multi_skipped_missing_rho, multi_skipped_no_kblock, multi_skipped_rho_dim, &
          multi_skipped_small_rho, multi_used_pairs, nkind, search_iter, skipped_cell_bounds, &
          skipped_cell_bounds_tmp, skipped_image, skipped_image_tmp, skipped_img_index, &
-         skipped_img_index_tmp, skipped_missing_rho, skipped_missing_rho_tmp, skipped_no_kblock, &
-         skipped_no_kblock_tmp, skipped_rho_dim
-      INTEGER :: skipped_rho_dim_tmp, skipped_small_rho, skipped_small_rho_tmp, ub1, ub2, ub3, &
-         used_pairs, used_pairs_tmp
+         skipped_img_index_tmp
+      INTEGER :: skipped_missing_rho, skipped_missing_rho_tmp, skipped_no_kblock, &
+         skipped_no_kblock_tmp, skipped_rho_dim, skipped_rho_dim_tmp, skipped_small_rho, &
+         skipped_small_rho_tmp, ub1, ub2, ub3, used_pairs, used_pairs_tmp
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
-      REAL(dp) :: best_r2, c_norm, k_accum_norm, k_blocks_norm, k_norm, pair_r2, rho_accum_norm, &
-         rho_blocks_norm, rho_norm, rho_norm2_accum, rho_pair_norm, rho_tmp_norm
+      REAL(dp) :: best_r2, c_norm, general_v_max, general_v_rms, k_accum_norm, k_blocks_norm, &
+         k_norm, pair_r2, rho_accum_norm, rho_blocks_norm, rho_norm, rho_norm2_accum, &
+         rho_pair_norm, rho_tmp_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_accum_block, k_block, k_pair_block, &
                                                             k_tmp_block, rho_work
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
@@ -1834,6 +1839,11 @@ CONTAINS
       rho_blocks_norm = SQRT(rho_blocks_norm)
       k_blocks_norm = SQRT(k_blocks_norm)
 
+      CALL hfx_lri_debug_general_pair_candidates(basis_set_RI, ri_data, general_targets, &
+                                                 general_density_pairs, general_candidates, &
+                                                 general_v_tests, general_v_active, &
+                                                 general_v_rms, general_v_max)
+
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
@@ -1884,12 +1894,93 @@ CONTAINS
             "skip small/noK", multi_skipped_small_rho, multi_skipped_no_kblock
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_blocks_norm, k_blocks_norm
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug general pair-pair candidate probe"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "target/density", general_targets, general_density_pairs
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "candidates/tests", general_candidates, general_v_tests
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+            "active V/thresh", general_v_active, lri_debug_v_threshold
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+            "V rms/max", general_v_rms, general_v_max
       END IF
 
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
    END SUBROUTINE hfx_lri_debug_density_block
+
+! **************************************************************************************************
+!> \brief Probes the size of a general pair-pair V graph without changing the current K path.
+!> \param basis_set_RI ...
+!> \param ri_data ...
+!> \param n_target_pairs ...
+!> \param n_density_pairs ...
+!> \param n_candidates ...
+!> \param n_v_tests ...
+!> \param n_v_active ...
+!> \param v_norm_rms ...
+!> \param v_norm_max ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_debug_general_pair_candidates(basis_set_RI, ri_data, n_target_pairs, &
+                                                    n_density_pairs, n_candidates, n_v_tests, &
+                                                    n_v_active, v_norm_rms, v_norm_max)
+
+      TYPE(gto_basis_set_p_type), DIMENSION(:), &
+         INTENT(IN)                                      :: basis_set_RI
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      INTEGER, INTENT(OUT)                               :: n_target_pairs, n_density_pairs, &
+                                                            n_candidates, n_v_tests, n_v_active
+      REAL(dp), INTENT(OUT)                              :: v_norm_rms, v_norm_max
+
+      INTEGER                                            :: ipair_density, ipair_target
+      REAL(dp)                                           :: v_norm, v_norm2
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_sph
+
+      n_target_pairs = 0
+      n_density_pairs = 0
+      n_candidates = 0
+      n_v_tests = 0
+      n_v_active = 0
+      v_norm_rms = 0.0_dp
+      v_norm_max = 0.0_dp
+      v_norm2 = 0.0_dp
+
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) RETURN
+      IF (ri_data%lri_kp%npair_blocks <= 0) RETURN
+
+      DO ipair_density = 1, ri_data%lri_kp%npair_blocks
+         IF (ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_density)%c_fit)) THEN
+            n_density_pairs = n_density_pairs + 1
+         END IF
+      END DO
+
+      DO ipair_target = 1, ri_data%lri_kp%npair_blocks
+         IF (n_target_pairs >= lri_debug_max_general_targets) EXIT
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_target)%c_fit)) CYCLE
+         n_target_pairs = n_target_pairs + 1
+         DO ipair_density = 1, ri_data%lri_kp%npair_blocks
+            IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_density)%c_fit)) CYCLE
+            n_candidates = n_candidates + 1
+            IF (n_v_tests >= lri_debug_max_general_v_tests) CYCLE
+            CALL hfx_lri_build_pair_pair_v_sph(basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_target), &
+                                               ri_data%lri_kp%pair_blocks(ipair_density), ri_data, v_sph)
+            IF (.NOT. ALLOCATED(v_sph)) CYCLE
+            n_v_tests = n_v_tests + 1
+            v_norm = SQRT(SUM(v_sph*v_sph))
+            v_norm2 = v_norm2 + v_norm*v_norm
+            v_norm_max = MAX(v_norm_max, v_norm)
+            IF (v_norm > lri_debug_v_threshold) n_v_active = n_v_active + 1
+            DEALLOCATE (v_sph)
+         END DO
+      END DO
+
+      IF (n_v_tests > 0) THEN
+         v_norm_rms = SQRT(v_norm2/REAL(n_v_tests, KIND=dp))
+      END IF
+
+   END SUBROUTINE hfx_lri_debug_general_pair_candidates
 
 ! **************************************************************************************************
 !> \brief Probes whether the stored debug K block can be located in the k-point KS matrix.
