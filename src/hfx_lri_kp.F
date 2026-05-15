@@ -55,6 +55,7 @@ MODULE hfx_lri_kp
 
    PUBLIC :: hfx_lri_update_ks_kp
 
+   INTEGER, PARAMETER :: lri_debug_level = 0
    INTEGER, PARAMETER :: lri_debug_max_pair_blocks = 1000
    INTEGER, PARAMETER :: lri_debug_max_k_blocks = 500
    REAL(dp), PARAMETER :: lri_debug_rho_threshold = 1.0E-8_dp
@@ -322,7 +323,7 @@ CONTAINS
       CALL neighbor_list_iterator_release(nl_iterator)
       CALL release_neighbor_list_sets(soo_list)
 
-      IF (dbg_pair_found) THEN
+      IF (dbg_pair_found .AND. lri_debug_level >= 1) THEN
          CALL hfx_lri_init_pair_block(dbg_pair_block, dbg_iatom, dbg_jatom, dbg_ikind, dbg_jkind, &
                                       dbg_cell, dbg_rab, dbg_nao_i, dbg_nao_j, dbg_naux_i, dbg_naux_j, &
                                       dbg_naux_pair)
@@ -458,7 +459,7 @@ CONTAINS
                REAL(sum_naux_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
                REAL(sum_naux_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
          END IF
-         IF (dbg_pair_found) THEN
+         IF (dbg_pair_found .AND. lri_debug_level >= 1) THEN
             WRITE (ri_data%unit_nr, "(/,T4,A)") "debug local AO pair"
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
                "atoms", dbg_iatom, dbg_jatom
@@ -1881,58 +1882,84 @@ CONTAINS
       rho_blocks_norm = SQRT(rho_blocks_norm)
       k_blocks_norm = SQRT(k_blocks_norm)
 
-      CALL hfx_lri_debug_nearest_origin_contributions(basis_set_RI, rho_ao, cell_to_index, &
-                                                      ri_data, nearest_targets, nearest_candidates, &
-                                                      nearest_tests, nearest_rho_active, &
-                                                      nearest_k_active_low, nearest_k_active_mid, &
-                                                      nearest_k_active_high, nearest_k_active_large, &
-                                                      nearest_k_rms, nearest_k_max)
+      nearest_targets = 0
+      nearest_candidates = 0
+      nearest_tests = 0
+      nearest_rho_active = 0
+      nearest_k_active_low = 0
+      nearest_k_active_mid = 0
+      nearest_k_active_high = 0
+      nearest_k_active_large = 0
+      nearest_k_rms = 0.0_dp
+      nearest_k_max = 0.0_dp
+      general_targets = 0
+      general_density_pairs = 0
+      general_candidates = 0
+      general_tests = 0
+      general_rho_active = 0
+      general_k_active_low = 0
+      general_k_active_mid = 0
+      general_k_active_high = 0
+      general_k_active_large = 0
+      general_k_rms = 0.0_dp
+      general_k_max = 0.0_dp
 
-      CALL hfx_lri_debug_general_pair_contributions(basis_set_RI, rho_ao, cell_to_index, ri_data, &
-                                                    general_targets, general_density_pairs, &
-                                                    general_candidates, general_tests, &
-                                                    general_rho_active, general_k_active_low, &
-                                                    general_k_active_mid, general_k_active_high, &
-                                                    general_k_active_large, general_k_rms, &
-                                                    general_k_max)
+      IF (lri_debug_level >= 1) THEN
+         CALL hfx_lri_debug_nearest_origin_contributions(basis_set_RI, rho_ao, cell_to_index, &
+                                                         ri_data, nearest_targets, nearest_candidates, &
+                                                         nearest_tests, nearest_rho_active, &
+                                                         nearest_k_active_low, nearest_k_active_mid, &
+                                                         nearest_k_active_high, nearest_k_active_large, &
+                                                         nearest_k_rms, nearest_k_max)
+
+         CALL hfx_lri_debug_general_pair_contributions(basis_set_RI, rho_ao, cell_to_index, ri_data, &
+                                                       general_targets, general_density_pairs, &
+                                                       general_candidates, general_tests, &
+                                                       general_rho_active, general_k_active_low, &
+                                                       general_k_active_mid, general_k_active_high, &
+                                                       general_k_active_large, general_k_rms, &
+                                                       general_k_max)
+      END IF
 
       IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "pair/image", ipair_sel, img
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "atoms", ri_data%lri_kp%pair_blocks(ipair_sel)%iatom, &
-            ri_data%lri_kp%pair_blocks(ipair_sel)%jatom
-         WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
-            "cell", ri_data%lri_kp%pair_blocks(ipair_sel)%cell
-         IF (found) THEN
+         IF (lri_debug_level >= 1) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") "debug density block"
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "rho dims", SIZE(rho_block, 1), SIZE(rho_block, 2)
-         ELSE
-            WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "rho dims", "not found"
+               "pair/image", ipair_sel, img
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "atoms", ri_data%lri_kp%pair_blocks(ipair_sel)%iatom, &
+               ri_data%lri_kp%pair_blocks(ipair_sel)%jatom
+            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
+               "cell", ri_data%lri_kp%pair_blocks(ipair_sel)%cell
+            IF (found) THEN
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+                  "rho dims", SIZE(rho_block, 1), SIZE(rho_block, 2)
+            ELSE
+               WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "rho dims", "not found"
+            END IF
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+               "rho/C norm", rho_norm, c_norm
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+               "real K norm", k_norm
+            WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk diagnostic K accumulation"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "used/candidates", used_pairs, candidate_pairs
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "skip cell/img", skipped_cell_bounds, skipped_img_index
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "skip rho/dim", skipped_missing_rho, skipped_rho_dim
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "skip small/noK", skipped_small_rho, skipped_no_kblock
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+               "rho threshold", lri_debug_rho_threshold
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+               "rho/K norm", rho_accum_norm, k_accum_norm
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "stored K dims", SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1), &
+               SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2)
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+               "stored K pair", ri_data%lri_kp%diagnostic_k_block%pair_index
          END IF
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "rho/C norm", rho_norm, c_norm
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "real K norm", k_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk diagnostic K accumulation"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "used/candidates", used_pairs, candidate_pairs
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "skip cell/img", skipped_cell_bounds, skipped_img_index
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "skip rho/dim", skipped_missing_rho, skipped_rho_dim
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "skip small/noK", skipped_small_rho, skipped_no_kblock
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-            "rho threshold", lri_debug_rho_threshold
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "rho/K norm", rho_accum_norm, k_accum_norm
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "stored K dims", SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1), &
-            SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2)
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
-            "stored K pair", ri_data%lri_kp%diagnostic_k_block%pair_index
          WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk rank-local K construction"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "stored/max blocks", ri_data%lri_kp%nk_blocks, max_k_blocks
@@ -1946,38 +1973,40 @@ CONTAINS
             "skip small/noK", multi_skipped_small_rho, multi_skipped_no_kblock
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
             "rho/K norm", rho_blocks_norm, k_blocks_norm
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk nearest-origin contribution probe"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "targets/tests", nearest_targets, nearest_tests
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "candidates/rho", nearest_candidates, nearest_rho_active
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", nearest_k_active_low, lri_debug_k_threshold_low
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", nearest_k_active_mid, lri_debug_k_threshold_mid
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", nearest_k_active_high, lri_debug_k_threshold_high
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", nearest_k_active_large, lri_debug_k_threshold_large
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "K rms/max", nearest_k_rms, nearest_k_max
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk general pair-pair contribution probe"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "target/density", general_targets, general_density_pairs
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "candidates/tests", general_candidates, general_tests
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
-            "rho active", general_rho_active
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", general_k_active_low, lri_debug_k_threshold_low
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", general_k_active_mid, lri_debug_k_threshold_mid
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", general_k_active_high, lri_debug_k_threshold_high
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
-            "K > threshold", general_k_active_large, lri_debug_k_threshold_large
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
-            "K rms/max", general_k_rms, general_k_max
+         IF (lri_debug_level >= 1) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk nearest-origin contribution probe"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "targets/tests", nearest_targets, nearest_tests
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "candidates/rho", nearest_candidates, nearest_rho_active
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", nearest_k_active_low, lri_debug_k_threshold_low
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", nearest_k_active_mid, lri_debug_k_threshold_mid
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", nearest_k_active_high, lri_debug_k_threshold_high
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", nearest_k_active_large, lri_debug_k_threshold_large
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+               "K rms/max", nearest_k_rms, nearest_k_max
+            WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk general pair-pair contribution probe"
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "target/density", general_targets, general_density_pairs
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+               "candidates/tests", general_candidates, general_tests
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+               "rho active", general_rho_active
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", general_k_active_low, lri_debug_k_threshold_low
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", general_k_active_mid, lri_debug_k_threshold_mid
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", general_k_active_high, lri_debug_k_threshold_high
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
+               "K > threshold", general_k_active_large, lri_debug_k_threshold_large
+            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
+               "K rms/max", general_k_rms, general_k_max
+         END IF
       END IF
 
       IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
@@ -2416,32 +2445,34 @@ CONTAINS
       END IF
 
       IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk KS writeback diagnostic"
-         IF (ALLOCATED(ri_data%lri_kp%diagnostic_k_block%k_block)) THEN
-            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "pair/image", ri_data%lri_kp%diagnostic_k_block%pair_index, debug_img
-            WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-               "atoms", ri_data%lri_kp%diagnostic_k_block%iatom, &
-               ri_data%lri_kp%diagnostic_k_block%jatom
-            WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
-               "cell", ri_data%lri_kp%diagnostic_k_block%cell
-            IF (debug_found) THEN
+         IF (lri_debug_level >= 1) THEN
+            WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk KS writeback diagnostic"
+            IF (ALLOCATED(ri_data%lri_kp%diagnostic_k_block%k_block)) THEN
                WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-                  "KS dims", SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1), &
-                  SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2)
+                  "pair/image", ri_data%lri_kp%diagnostic_k_block%pair_index, debug_img
+               WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+                  "atoms", ri_data%lri_kp%diagnostic_k_block%iatom, &
+                  ri_data%lri_kp%diagnostic_k_block%jatom
+               WRITE (ri_data%unit_nr, "(T6,A,T28,3I6)") &
+                  "cell", ri_data%lri_kp%diagnostic_k_block%cell
+               IF (debug_found) THEN
+                  WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+                     "KS dims", SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 1), &
+                     SIZE(ri_data%lri_kp%diagnostic_k_block%k_block, 2)
+               ELSE
+                  WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
+               END IF
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "before norm", debug_before_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "diagnostic K norm", debug_k_norm
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "scale", scale
+               WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
+                  "would-add norm", debug_add_norm
             ELSE
-               WRITE (ri_data%unit_nr, "(T6,A,T28,A)") "KS dims", "not found"
+               WRITE (ri_data%unit_nr, "(T6,A)") "diagnostic K block is not allocated"
             END IF
-            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-               "before norm", debug_before_norm
-            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-               "diagnostic K norm", debug_k_norm
-            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-               "scale", scale
-            WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
-               "would-add norm", debug_add_norm
-         ELSE
-            WRITE (ri_data%unit_nr, "(T6,A)") "diagnostic K block is not allocated"
          END IF
          WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk rank-local KS writeback"
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
