@@ -342,12 +342,8 @@ CONTAINS
          DO ipair_block = 1, ri_data%lri_kp%npair_blocks
             IF (ipair_block == dbg_stored_index) CYCLE
             IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit)) CYCLE
-            ! The temporary real V12 probe is currently limited to pair blocks
-            ! sharing the same first center, so their auxiliary-center positions
-            ! can be expressed with the stored rab vectors alone. Pick the nearest
-            ! such pair rather than the first one in the neighbor-list order.
-            IF (ri_data%lri_kp%pair_blocks(ipair_block)%iatom /= &
-                ri_data%lri_kp%pair_blocks(dbg_stored_index)%iatom) CYCLE
+            ! Pick the nearest stored pair for the real V12 probe. The actual
+            ! auxiliary-center positions are now taken from pair-block metadata.
             IF (SUM((ri_data%lri_kp%pair_blocks(ipair_block)%rab - &
                      ri_data%lri_kp%pair_blocks(dbg_stored_index)%rab)**2) >= dbg_pair_pair_r2) CYCLE
             dbg_pair_pair_index = ipair_block
@@ -2137,112 +2133,21 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
          INTENT(OUT)                                     :: k_block
 
-      INTEGER :: iao, irow, jao, maxl_li, maxl_lj, maxl_ri, maxl_rj, naux_left, naux_right, &
-         ncart_li, ncart_lj, ncart_ri, ncart_rj, nraw_left, nraw_right, offset_left_j, &
-         offset_right_j
-      LOGICAL                                            :: onsite_left, onsite_right
+      INTEGER                                            :: iao, irow, jao
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: aux_density, aux_target, d_vec, k_vec
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_density, c_target, sphi_left, sphi_li, &
-                                                            sphi_lj, sphi_ri, sphi_right, sphi_rj, &
-                                                            tmp, v_raw, v_sph
-      REAL(dp), DIMENSION(3)                             :: r0
-      TYPE(cp_libint_t)                                  :: lib2
-      TYPE(gto_basis_set_type), POINTER                  :: rbas_li, rbas_lj, rbas_ri, rbas_rj
-
-      NULLIFY (rbas_li, rbas_lj, rbas_ri, rbas_rj)
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_density, c_target, v_sph
 
       IF (.NOT. ALLOCATED(pair_target%c_fit)) RETURN
       IF (.NOT. ALLOCATED(pair_density%c_fit)) RETURN
-      IF (pair_target%iatom /= pair_density%iatom) RETURN
       IF (SIZE(rho_block, 1) < pair_density%nao_i .OR. &
           SIZE(rho_block, 2) < pair_density%nao_j) RETURN
 
-      rbas_li => basis_set_RI(pair_target%ikind)%gto_basis_set
-      rbas_lj => basis_set_RI(pair_target%jkind)%gto_basis_set
-      rbas_ri => basis_set_RI(pair_density%ikind)%gto_basis_set
-      rbas_rj => basis_set_RI(pair_density%jkind)%gto_basis_set
-      IF (.NOT. ASSOCIATED(rbas_li)) RETURN
-      IF (.NOT. ASSOCIATED(rbas_lj)) RETURN
-      IF (.NOT. ASSOCIATED(rbas_ri)) RETURN
-      IF (.NOT. ASSOCIATED(rbas_rj)) RETURN
-
-      onsite_left = (pair_target%iatom == pair_target%jatom .AND. NORM2(pair_target%rab) <= 1.0E-12_dp)
-      onsite_right = (pair_density%iatom == pair_density%jatom .AND. NORM2(pair_density%rab) <= 1.0E-12_dp)
-
-      CALL get_gto_basis_set(rbas_li, maxl=maxl_li)
-      CALL get_gto_basis_set(rbas_lj, maxl=maxl_lj)
-      CALL get_gto_basis_set(rbas_ri, maxl=maxl_ri)
-      CALL get_gto_basis_set(rbas_rj, maxl=maxl_rj)
-      CALL init_md_ftable(nmax=MAX(maxl_li + maxl_ri, maxl_li + maxl_rj, &
-                                   maxl_lj + maxl_ri, maxl_lj + maxl_rj))
-      CALL cp_libint_init_2eri(lib2, MAX(maxl_li, maxl_lj, maxl_ri, maxl_rj))
-      CALL cp_libint_set_contrdepth(lib2, 1)
-
-      ncart_li = hfx_lri_count_cart_functions(rbas_li)
-      ncart_lj = hfx_lri_count_cart_functions(rbas_lj)
-      ncart_ri = hfx_lri_count_cart_functions(rbas_ri)
-      ncart_rj = hfx_lri_count_cart_functions(rbas_rj)
-      nraw_left = ncart_li
-      IF (.NOT. onsite_left) nraw_left = nraw_left + ncart_lj
-      nraw_right = ncart_ri
-      IF (.NOT. onsite_right) nraw_right = nraw_right + ncart_rj
-
-      r0(:) = 0.0_dp
-      ALLOCATE (v_raw(nraw_left, nraw_right), SOURCE=0.0_dp)
-      CALL hfx_lri_fill_2c_block(rbas_li, rbas_ri, r0, r0, lib2, ri_data, v_raw, 0, 0)
-      IF (.NOT. onsite_right) THEN
-         offset_right_j = ncart_ri
-         CALL hfx_lri_fill_2c_block(rbas_li, rbas_rj, r0, pair_density%rab, lib2, ri_data, v_raw, 0, &
-                                    offset_right_j)
-      END IF
-      IF (.NOT. onsite_left) THEN
-         offset_left_j = ncart_li
-         CALL hfx_lri_fill_2c_block(rbas_lj, rbas_ri, pair_target%rab, r0, lib2, ri_data, v_raw, &
-                                    offset_left_j, 0)
-         IF (.NOT. onsite_right) THEN
-            offset_right_j = ncart_ri
-            CALL hfx_lri_fill_2c_block(rbas_lj, rbas_rj, pair_target%rab, pair_density%rab, lib2, &
-                                       ri_data, v_raw, offset_left_j, offset_right_j)
-         END IF
-      END IF
-
-      CALL hfx_lri_build_sphi_matrix(rbas_li, sphi_li)
-      CALL hfx_lri_build_sphi_matrix(rbas_ri, sphi_ri)
-      naux_left = SIZE(sphi_li, 2)
-      naux_right = SIZE(sphi_ri, 2)
-      IF (.NOT. onsite_left) THEN
-         CALL hfx_lri_build_sphi_matrix(rbas_lj, sphi_lj)
-         naux_left = naux_left + SIZE(sphi_lj, 2)
-      ELSE
-         ALLOCATE (sphi_lj(0, 0))
-      END IF
-      IF (.NOT. onsite_right) THEN
-         CALL hfx_lri_build_sphi_matrix(rbas_rj, sphi_rj)
-         naux_right = naux_right + SIZE(sphi_rj, 2)
-      ELSE
-         ALLOCATE (sphi_rj(0, 0))
-      END IF
-
-      IF (naux_left /= pair_target%naux_pair .OR. naux_right /= pair_density%naux_pair) THEN
+      CALL hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_target, pair_density, ri_data, v_sph)
+      IF (.NOT. ALLOCATED(v_sph)) RETURN
+      IF (SIZE(v_sph, 1) /= pair_target%naux_pair .OR. &
+          SIZE(v_sph, 2) /= pair_density%naux_pair) THEN
          CPABORT("Inconsistent auxiliary dimension in LRI-HFXk pair-pair density contraction")
       END IF
-
-      ALLOCATE (sphi_left(nraw_left, naux_left), SOURCE=0.0_dp)
-      sphi_left(1:ncart_li, 1:SIZE(sphi_li, 2)) = sphi_li
-      IF (.NOT. onsite_left) THEN
-         sphi_left(ncart_li + 1:nraw_left, SIZE(sphi_li, 2) + 1:naux_left) = sphi_lj
-      END IF
-      ALLOCATE (sphi_right(nraw_right, naux_right), SOURCE=0.0_dp)
-      sphi_right(1:ncart_ri, 1:SIZE(sphi_ri, 2)) = sphi_ri
-      IF (.NOT. onsite_right) THEN
-         sphi_right(ncart_ri + 1:nraw_right, SIZE(sphi_ri, 2) + 1:naux_right) = sphi_rj
-      END IF
-
-      ALLOCATE (tmp(nraw_left, naux_right), SOURCE=0.0_dp)
-      tmp = MATMUL(v_raw, sphi_right)
-      ALLOCATE (v_sph(naux_left, naux_right), SOURCE=0.0_dp)
-      v_sph = MATMUL(TRANSPOSE(sphi_left), tmp)
-      DEALLOCATE (tmp, v_raw)
 
       CALL hfx_lri_flatten_pair_coefficients(pair_target, c_target)
       CALL hfx_lri_flatten_pair_coefficients(pair_density, c_density)
@@ -2256,8 +2161,8 @@ CONTAINS
          END DO
       END DO
 
-      ALLOCATE (aux_density(naux_right), aux_target(naux_left), k_vec(SIZE(c_target, 1)), &
-                SOURCE=0.0_dp)
+      ALLOCATE (aux_density(pair_density%naux_pair), aux_target(pair_target%naux_pair), &
+                k_vec(SIZE(c_target, 1)), SOURCE=0.0_dp)
       aux_density = MATMUL(TRANSPOSE(c_density), d_vec)
       aux_target = MATMUL(v_sph, aux_density)
       k_vec = MATMUL(c_target, aux_target)
@@ -2271,10 +2176,7 @@ CONTAINS
          END DO
       END DO
 
-      DEALLOCATE (k_vec, aux_target, aux_density, d_vec, c_density, c_target, v_sph, sphi_right, &
-                  sphi_left)
-      DEALLOCATE (sphi_rj, sphi_ri, sphi_lj, sphi_li)
-      CALL cp_libint_cleanup_2eri(lib2)
+      DEALLOCATE (k_vec, aux_target, aux_density, d_vec, c_density, c_target, v_sph)
 
    END SUBROUTINE hfx_lri_contract_pair_pair_density_realv
 
@@ -2296,125 +2198,141 @@ CONTAINS
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       REAL(dp), INTENT(OUT)                              :: v_norm, cvc_norm
 
-      INTEGER :: maxl_li, maxl_lj, maxl_ri, maxl_rj, naux_left, naux_right, ncart_li, ncart_lj, &
-         ncart_ri, ncart_rj, nraw_left, nraw_right, offset_left_j, offset_right_j
-      LOGICAL                                            :: onsite_left, onsite_right
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_left, c_right, cvc_block, sphi_left, &
-                                                            sphi_li, sphi_lj, sphi_ri, sphi_right, &
-                                                            sphi_rj, tmp, v_raw, v_sph
-      REAL(dp), DIMENSION(3)                             :: r0
-      TYPE(cp_libint_t)                                  :: lib2
-      TYPE(gto_basis_set_type), POINTER                  :: rbas_li, rbas_lj, rbas_ri, rbas_rj
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_left, c_right, cvc_block, tmp, v_sph
 
-      NULLIFY (rbas_li, rbas_lj, rbas_ri, rbas_rj)
       v_norm = 0.0_dp
       cvc_norm = 0.0_dp
 
       IF (.NOT. ALLOCATED(pair_left%c_fit)) RETURN
       IF (.NOT. ALLOCATED(pair_right%c_fit)) RETURN
-      IF (pair_left%iatom /= pair_right%iatom) RETURN
 
-      rbas_li => basis_set_RI(pair_left%ikind)%gto_basis_set
-      rbas_lj => basis_set_RI(pair_left%jkind)%gto_basis_set
-      rbas_ri => basis_set_RI(pair_right%ikind)%gto_basis_set
-      rbas_rj => basis_set_RI(pair_right%jkind)%gto_basis_set
-      IF (.NOT. ASSOCIATED(rbas_li)) RETURN
-      IF (.NOT. ASSOCIATED(rbas_lj)) RETURN
-      IF (.NOT. ASSOCIATED(rbas_ri)) RETURN
-      IF (.NOT. ASSOCIATED(rbas_rj)) RETURN
-
-      onsite_left = (pair_left%iatom == pair_left%jatom .AND. NORM2(pair_left%rab) <= 1.0E-12_dp)
-      onsite_right = (pair_right%iatom == pair_right%jatom .AND. NORM2(pair_right%rab) <= 1.0E-12_dp)
-
-      CALL get_gto_basis_set(rbas_li, maxl=maxl_li)
-      CALL get_gto_basis_set(rbas_lj, maxl=maxl_lj)
-      CALL get_gto_basis_set(rbas_ri, maxl=maxl_ri)
-      CALL get_gto_basis_set(rbas_rj, maxl=maxl_rj)
-      CALL init_md_ftable(nmax=MAX(maxl_li + maxl_ri, maxl_li + maxl_rj, &
-                                   maxl_lj + maxl_ri, maxl_lj + maxl_rj))
-      CALL cp_libint_init_2eri(lib2, MAX(maxl_li, maxl_lj, maxl_ri, maxl_rj))
-      CALL cp_libint_set_contrdepth(lib2, 1)
-
-      ncart_li = hfx_lri_count_cart_functions(rbas_li)
-      ncart_lj = hfx_lri_count_cart_functions(rbas_lj)
-      ncart_ri = hfx_lri_count_cart_functions(rbas_ri)
-      ncart_rj = hfx_lri_count_cart_functions(rbas_rj)
-      nraw_left = ncart_li
-      IF (.NOT. onsite_left) nraw_left = nraw_left + ncart_lj
-      nraw_right = ncart_ri
-      IF (.NOT. onsite_right) nraw_right = nraw_right + ncart_rj
-
-      r0(:) = 0.0_dp
-      ALLOCATE (v_raw(nraw_left, nraw_right), SOURCE=0.0_dp)
-      CALL hfx_lri_fill_2c_block(rbas_li, rbas_ri, r0, r0, lib2, ri_data, v_raw, 0, 0)
-      IF (.NOT. onsite_right) THEN
-         offset_right_j = ncart_ri
-         CALL hfx_lri_fill_2c_block(rbas_li, rbas_rj, r0, pair_right%rab, lib2, ri_data, v_raw, 0, &
-                                    offset_right_j)
-      END IF
-      IF (.NOT. onsite_left) THEN
-         offset_left_j = ncart_li
-         CALL hfx_lri_fill_2c_block(rbas_lj, rbas_ri, pair_left%rab, r0, lib2, ri_data, v_raw, &
-                                    offset_left_j, 0)
-         IF (.NOT. onsite_right) THEN
-            offset_right_j = ncart_ri
-            CALL hfx_lri_fill_2c_block(rbas_lj, rbas_rj, pair_left%rab, pair_right%rab, lib2, &
-                                       ri_data, v_raw, offset_left_j, offset_right_j)
-         END IF
-      END IF
-
-      CALL hfx_lri_build_sphi_matrix(rbas_li, sphi_li)
-      CALL hfx_lri_build_sphi_matrix(rbas_ri, sphi_ri)
-      naux_left = SIZE(sphi_li, 2)
-      naux_right = SIZE(sphi_ri, 2)
-      IF (.NOT. onsite_left) THEN
-         CALL hfx_lri_build_sphi_matrix(rbas_lj, sphi_lj)
-         naux_left = naux_left + SIZE(sphi_lj, 2)
-      ELSE
-         ALLOCATE (sphi_lj(0, 0))
-      END IF
-      IF (.NOT. onsite_right) THEN
-         CALL hfx_lri_build_sphi_matrix(rbas_rj, sphi_rj)
-         naux_right = naux_right + SIZE(sphi_rj, 2)
-      ELSE
-         ALLOCATE (sphi_rj(0, 0))
-      END IF
-
-      IF (naux_left /= pair_left%naux_pair .OR. naux_right /= pair_right%naux_pair) THEN
+      CALL hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_left, pair_right, ri_data, v_sph)
+      IF (.NOT. ALLOCATED(v_sph)) RETURN
+      IF (SIZE(v_sph, 1) /= pair_left%naux_pair .OR. SIZE(v_sph, 2) /= pair_right%naux_pair) THEN
          CPABORT("Inconsistent auxiliary dimension in LRI-HFXk pair-pair V probe")
       END IF
 
-      ALLOCATE (sphi_left(nraw_left, naux_left), SOURCE=0.0_dp)
-      sphi_left(1:ncart_li, 1:SIZE(sphi_li, 2)) = sphi_li
-      IF (.NOT. onsite_left) THEN
-         sphi_left(ncart_li + 1:nraw_left, SIZE(sphi_li, 2) + 1:naux_left) = sphi_lj
-      END IF
-      ALLOCATE (sphi_right(nraw_right, naux_right), SOURCE=0.0_dp)
-      sphi_right(1:ncart_ri, 1:SIZE(sphi_ri, 2)) = sphi_ri
-      IF (.NOT. onsite_right) THEN
-         sphi_right(ncart_ri + 1:nraw_right, SIZE(sphi_ri, 2) + 1:naux_right) = sphi_rj
-      END IF
-
-      ALLOCATE (tmp(nraw_left, naux_right), SOURCE=0.0_dp)
-      tmp = MATMUL(v_raw, sphi_right)
-      ALLOCATE (v_sph(naux_left, naux_right), SOURCE=0.0_dp)
-      v_sph = MATMUL(TRANSPOSE(sphi_left), tmp)
-      DEALLOCATE (tmp, v_raw)
-
       CALL hfx_lri_flatten_pair_coefficients(pair_left, c_left)
       CALL hfx_lri_flatten_pair_coefficients(pair_right, c_right)
-      ALLOCATE (tmp(SIZE(c_left, 1), naux_right), SOURCE=0.0_dp)
+      ALLOCATE (tmp(SIZE(c_left, 1), pair_right%naux_pair), SOURCE=0.0_dp)
       tmp = MATMUL(c_left, v_sph)
       ALLOCATE (cvc_block(SIZE(c_left, 1), SIZE(c_right, 1)), SOURCE=0.0_dp)
       cvc_block = MATMUL(tmp, TRANSPOSE(c_right))
       v_norm = SQRT(SUM(v_sph*v_sph))
       cvc_norm = SQRT(SUM(cvc_block*cvc_block))
 
-      DEALLOCATE (cvc_block, tmp, c_right, c_left, v_sph, sphi_right, sphi_left)
-      DEALLOCATE (sphi_rj, sphi_ri, sphi_lj, sphi_li)
-      CALL cp_libint_cleanup_2eri(lib2)
+      DEALLOCATE (cvc_block, tmp, c_right, c_left, v_sph)
 
    END SUBROUTINE hfx_lri_contract_pair_pair_cvc_realv
+
+! **************************************************************************************************
+!> \brief Builds a spherical pair-pair auxiliary coupling block from pair metadata.
+!> \param basis_set_RI ...
+!> \param pair_left ...
+!> \param pair_right ...
+!> \param ri_data ...
+!> \param v_sph ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_left, pair_right, ri_data, v_sph)
+
+      TYPE(gto_basis_set_p_type), DIMENSION(:), &
+         INTENT(IN)                                      :: basis_set_RI
+      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_left, pair_right
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: v_sph
+
+      INTEGER                                            :: ic_left, ic_right, maxl_all, &
+                                                            maxl_center, naux_left, naux_right, &
+                                                            ncart_center, nraw_left, nraw_right
+      INTEGER, DIMENSION(2)                              :: raw_offset_left, raw_offset_right
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sphi_center, sphi_left, sphi_right, tmp, &
+                                                            v_raw
+      TYPE(cp_libint_t)                                  :: lib2
+      TYPE(gto_basis_set_type), POINTER                  :: rbas_left, rbas_right
+
+      NULLIFY (rbas_left, rbas_right)
+
+      IF (ALLOCATED(v_sph)) DEALLOCATE (v_sph)
+      IF (pair_left%naux_centers <= 0 .OR. pair_right%naux_centers <= 0) RETURN
+      IF (pair_left%naux_centers > 2 .OR. pair_right%naux_centers > 2) RETURN
+
+      nraw_left = 0
+      nraw_right = 0
+      naux_left = 0
+      naux_right = 0
+      maxl_all = 0
+      raw_offset_left(:) = 0
+      raw_offset_right(:) = 0
+
+      DO ic_left = 1, pair_left%naux_centers
+         rbas_left => basis_set_RI(pair_left%aux_kind(ic_left))%gto_basis_set
+         IF (.NOT. ASSOCIATED(rbas_left)) RETURN
+         CALL get_gto_basis_set(rbas_left, maxl=maxl_center)
+         maxl_all = MAX(maxl_all, maxl_center)
+         raw_offset_left(ic_left) = nraw_left
+         ncart_center = hfx_lri_count_cart_functions(rbas_left)
+         nraw_left = nraw_left + ncart_center
+         naux_left = naux_left + pair_left%aux_size(ic_left)
+      END DO
+      DO ic_right = 1, pair_right%naux_centers
+         rbas_right => basis_set_RI(pair_right%aux_kind(ic_right))%gto_basis_set
+         IF (.NOT. ASSOCIATED(rbas_right)) RETURN
+         CALL get_gto_basis_set(rbas_right, maxl=maxl_center)
+         maxl_all = MAX(maxl_all, maxl_center)
+         raw_offset_right(ic_right) = nraw_right
+         ncart_center = hfx_lri_count_cart_functions(rbas_right)
+         nraw_right = nraw_right + ncart_center
+         naux_right = naux_right + pair_right%aux_size(ic_right)
+      END DO
+
+      IF (naux_left /= pair_left%naux_pair .OR. naux_right /= pair_right%naux_pair) THEN
+         CPABORT("Inconsistent auxiliary metadata in LRI-HFXk pair-pair V build")
+      END IF
+
+      CALL init_md_ftable(nmax=2*maxl_all)
+      CALL cp_libint_init_2eri(lib2, maxl_all)
+      CALL cp_libint_set_contrdepth(lib2, 1)
+
+      ALLOCATE (v_raw(nraw_left, nraw_right), SOURCE=0.0_dp)
+      DO ic_left = 1, pair_left%naux_centers
+         rbas_left => basis_set_RI(pair_left%aux_kind(ic_left))%gto_basis_set
+         DO ic_right = 1, pair_right%naux_centers
+            rbas_right => basis_set_RI(pair_right%aux_kind(ic_right))%gto_basis_set
+            CALL hfx_lri_fill_2c_block(rbas_left, rbas_right, pair_left%aux_r(:, ic_left), &
+                                       pair_right%aux_r(:, ic_right), lib2, ri_data, v_raw, &
+                                       raw_offset_left(ic_left), raw_offset_right(ic_right))
+         END DO
+      END DO
+
+      ALLOCATE (sphi_left(nraw_left, naux_left), SOURCE=0.0_dp)
+      DO ic_left = 1, pair_left%naux_centers
+         rbas_left => basis_set_RI(pair_left%aux_kind(ic_left))%gto_basis_set
+         CALL hfx_lri_build_sphi_matrix(rbas_left, sphi_center)
+         sphi_left(raw_offset_left(ic_left) + 1:raw_offset_left(ic_left) + SIZE(sphi_center, 1), &
+                   pair_left%aux_offset(ic_left) + 1:pair_left%aux_offset(ic_left) + &
+                   pair_left%aux_size(ic_left)) = sphi_center
+         DEALLOCATE (sphi_center)
+      END DO
+      ALLOCATE (sphi_right(nraw_right, naux_right), SOURCE=0.0_dp)
+      DO ic_right = 1, pair_right%naux_centers
+         rbas_right => basis_set_RI(pair_right%aux_kind(ic_right))%gto_basis_set
+         CALL hfx_lri_build_sphi_matrix(rbas_right, sphi_center)
+         sphi_right(raw_offset_right(ic_right) + 1:raw_offset_right(ic_right) + SIZE(sphi_center, 1), &
+                    pair_right%aux_offset(ic_right) + 1:pair_right%aux_offset(ic_right) + &
+                    pair_right%aux_size(ic_right)) = sphi_center
+         DEALLOCATE (sphi_center)
+      END DO
+
+      ALLOCATE (tmp(nraw_left, naux_right), SOURCE=0.0_dp)
+      tmp = MATMUL(v_raw, sphi_right)
+      ALLOCATE (v_sph(naux_left, naux_right), SOURCE=0.0_dp)
+      v_sph = MATMUL(TRANSPOSE(sphi_left), tmp)
+
+      DEALLOCATE (tmp, sphi_right, sphi_left, v_raw)
+      CALL cp_libint_cleanup_2eri(lib2)
+
+   END SUBROUTINE hfx_lri_build_pair_pair_v_sph
 
 ! **************************************************************************************************
 !> \brief Flattens C(mu,nu,P) into C(mu nu,P).
