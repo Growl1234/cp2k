@@ -1351,14 +1351,18 @@ CONTAINS
 !> \param candidate_pairs ...
 !> \param rho_accum_norm ...
 !> \param skipped_image ...
+!> \param skipped_cell_bounds ...
+!> \param skipped_img_index ...
 !> \param skipped_missing_rho ...
+!> \param skipped_rho_dim ...
 !> \param skipped_small_rho ...
 !> \param skipped_no_kblock ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_accumulate_target_k_block(basis_set_RI, rho_ao, cell_to_index, ipair_target, &
                                                 ri_data, k_accum_block, used_pairs, &
                                                 candidate_pairs, rho_accum_norm, skipped_image, &
-                                                skipped_missing_rho, skipped_small_rho, &
+                                                skipped_cell_bounds, skipped_img_index, &
+                                                skipped_missing_rho, skipped_rho_dim, skipped_small_rho, &
                                                 skipped_no_kblock)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
@@ -1371,8 +1375,8 @@ CONTAINS
          INTENT(OUT)                                     :: k_accum_block
       INTEGER, INTENT(OUT)                               :: used_pairs, candidate_pairs
       REAL(dp), INTENT(OUT)                              :: rho_accum_norm
-      INTEGER, INTENT(OUT)                               :: skipped_image, skipped_missing_rho, &
-                                                            skipped_small_rho, skipped_no_kblock
+      INTEGER, INTENT(OUT) :: skipped_image, skipped_cell_bounds, skipped_img_index, &
+         skipped_missing_rho, skipped_rho_dim, skipped_small_rho, skipped_no_kblock
 
       INTEGER                                            :: img_pair, ipair, ipair_best, lb1, lb2, &
                                                             lb3, search_iter, ub1, ub2, ub3
@@ -1388,7 +1392,10 @@ CONTAINS
       used_pairs = 0
       candidate_pairs = 0
       skipped_image = 0
+      skipped_cell_bounds = 0
+      skipped_img_index = 0
       skipped_missing_rho = 0
+      skipped_rho_dim = 0
       skipped_small_rho = 0
       skipped_no_kblock = 0
       rho_accum_norm = 0.0_dp
@@ -1429,6 +1436,7 @@ CONTAINS
             lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
             IF (.NOT. (ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell >= [lb1, lb2, lb3]) .AND. &
                        ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell <= [ub1, ub2, ub3]))) THEN
+               skipped_cell_bounds = skipped_cell_bounds + 1
                skipped_image = skipped_image + 1
                CYCLE
             END IF
@@ -1437,6 +1445,7 @@ CONTAINS
                                      ri_data%lri_kp%pair_blocks(ipair_best)%cell(3))
          END IF
          IF (img_pair < 1 .OR. img_pair > SIZE(rho_ao, 2)) THEN
+            skipped_img_index = skipped_img_index + 1
             skipped_image = skipped_image + 1
             CYCLE
          END IF
@@ -1447,6 +1456,11 @@ CONTAINS
                                 block=rho_block, found=found)
          IF (.NOT. found) THEN
             skipped_missing_rho = skipped_missing_rho + 1
+            CYCLE
+         END IF
+         IF (SIZE(rho_block, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i .OR. &
+             SIZE(rho_block, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j) THEN
+            skipped_rho_dim = skipped_rho_dim + 1
             CYCLE
          END IF
          rho_pair_norm = SQRT(SUM(rho_block*rho_block))
@@ -1491,10 +1505,13 @@ CONTAINS
 
       INTEGER :: candidate_pairs, candidate_pairs_tmp, img, img_pair, ipair, ipair_best, &
          ipair_sel, ipair_target, lb1, lb2, lb3, max_k_blocks, multi_candidate_pairs, &
-         multi_skipped_image, multi_skipped_missing_rho, multi_skipped_no_kblock, &
-         multi_skipped_small_rho, multi_used_pairs, nkind, search_iter, skipped_image, &
-         skipped_image_tmp, skipped_missing_rho, skipped_missing_rho_tmp, skipped_no_kblock, &
-         skipped_no_kblock_tmp, skipped_small_rho, skipped_small_rho_tmp, ub1, ub2, ub3, &
+         multi_skipped_cell_bounds, multi_skipped_image, multi_skipped_img_index, &
+         multi_skipped_missing_rho, multi_skipped_no_kblock, multi_skipped_rho_dim, &
+         multi_skipped_small_rho, multi_used_pairs, nkind, search_iter, skipped_cell_bounds, &
+         skipped_cell_bounds_tmp, skipped_image, skipped_image_tmp, skipped_img_index, &
+         skipped_img_index_tmp, skipped_missing_rho, skipped_missing_rho_tmp, skipped_no_kblock, &
+         skipped_no_kblock_tmp, skipped_rho_dim
+      INTEGER :: skipped_rho_dim_tmp, skipped_small_rho, skipped_small_rho_tmp, ub1, ub2, ub3, &
          used_pairs, used_pairs_tmp
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
@@ -1602,7 +1619,10 @@ CONTAINS
       used_pairs = 0
       candidate_pairs = 0
       skipped_image = 0
+      skipped_cell_bounds = 0
+      skipped_img_index = 0
       skipped_missing_rho = 0
+      skipped_rho_dim = 0
       skipped_small_rho = 0
       skipped_no_kblock = 0
       rho_norm2_accum = 0.0_dp
@@ -1633,6 +1653,7 @@ CONTAINS
          IF (ASSOCIATED(cell_to_index)) THEN
             IF (.NOT. (ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell >= [lb1, lb2, lb3]) .AND. &
                        ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell <= [ub1, ub2, ub3]))) THEN
+               skipped_cell_bounds = skipped_cell_bounds + 1
                skipped_image = skipped_image + 1
                CYCLE
             END IF
@@ -1641,6 +1662,7 @@ CONTAINS
                                      ri_data%lri_kp%pair_blocks(ipair_best)%cell(3))
          END IF
          IF (img_pair < 1 .OR. img_pair > SIZE(rho_ao, 2)) THEN
+            skipped_img_index = skipped_img_index + 1
             skipped_image = skipped_image + 1
             CYCLE
          END IF
@@ -1651,6 +1673,11 @@ CONTAINS
                                 block=rho_block, found=found)
          IF (.NOT. found) THEN
             skipped_missing_rho = skipped_missing_rho + 1
+            CYCLE
+         END IF
+         IF (SIZE(rho_block, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i .OR. &
+             SIZE(rho_block, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j) THEN
+            skipped_rho_dim = skipped_rho_dim + 1
             CYCLE
          END IF
          rho_pair_norm = SQRT(SUM(rho_block*rho_block))
@@ -1696,7 +1723,10 @@ CONTAINS
       multi_used_pairs = 0
       multi_candidate_pairs = 0
       multi_skipped_image = 0
+      multi_skipped_cell_bounds = 0
+      multi_skipped_img_index = 0
       multi_skipped_missing_rho = 0
+      multi_skipped_rho_dim = 0
       multi_skipped_small_rho = 0
       multi_skipped_no_kblock = 0
       rho_blocks_norm = 0.0_dp
@@ -1707,12 +1737,16 @@ CONTAINS
          CALL hfx_lri_accumulate_target_k_block(basis_set_RI, rho_ao, cell_to_index, ipair_target, &
                                                 ri_data, k_tmp_block, used_pairs_tmp, &
                                                 candidate_pairs_tmp, rho_tmp_norm, skipped_image_tmp, &
-                                                skipped_missing_rho_tmp, skipped_small_rho_tmp, &
-                                                skipped_no_kblock_tmp)
+                                                skipped_cell_bounds_tmp, skipped_img_index_tmp, &
+                                                skipped_missing_rho_tmp, skipped_rho_dim_tmp, &
+                                                skipped_small_rho_tmp, skipped_no_kblock_tmp)
          multi_used_pairs = multi_used_pairs + used_pairs_tmp
          multi_candidate_pairs = multi_candidate_pairs + candidate_pairs_tmp
          multi_skipped_image = multi_skipped_image + skipped_image_tmp
+         multi_skipped_cell_bounds = multi_skipped_cell_bounds + skipped_cell_bounds_tmp
+         multi_skipped_img_index = multi_skipped_img_index + skipped_img_index_tmp
          multi_skipped_missing_rho = multi_skipped_missing_rho + skipped_missing_rho_tmp
+         multi_skipped_rho_dim = multi_skipped_rho_dim + skipped_rho_dim_tmp
          multi_skipped_small_rho = multi_skipped_small_rho + skipped_small_rho_tmp
          multi_skipped_no_kblock = multi_skipped_no_kblock + skipped_no_kblock_tmp
          IF (.NOT. ALLOCATED(k_tmp_block)) CYCLE
@@ -1754,7 +1788,9 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "used/candidates", used_pairs, candidate_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "skip image/rho", skipped_image, skipped_missing_rho
+            "skip cell/img", skipped_cell_bounds, skipped_img_index
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "skip rho/dim", skipped_missing_rho, skipped_rho_dim
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "skip small/noK", skipped_small_rho, skipped_no_kblock
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3)") &
@@ -1772,7 +1808,9 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "used/candidates", multi_used_pairs, multi_candidate_pairs
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "skip image/rho", multi_skipped_image, multi_skipped_missing_rho
+            "skip cell/img", multi_skipped_cell_bounds, multi_skipped_img_index
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "skip rho/dim", multi_skipped_missing_rho, multi_skipped_rho_dim
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
             "skip small/noK", multi_skipped_small_rho, multi_skipped_no_kblock
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES10.3,T41,ES10.3)") &
