@@ -15,11 +15,17 @@ MODULE hfx_lri_types
    PUBLIC :: hfx_lri_k_block_type, hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release
 
    TYPE hfx_lri_pair_block_type
+      LOGICAL                                            :: onsite_pair = .FALSE.
       INTEGER                                            :: iatom = 0, ikind = 0, jatom = 0, &
                                                             jkind = 0, nao_i = 0, nao_j = 0, &
-                                                            naux_pair = 0
+                                                            naux_i = 0, naux_j = 0, naux_pair = 0
+      INTEGER                                            :: naux_centers = 0
       INTEGER, DIMENSION(3)                              :: cell = 0
+      INTEGER, DIMENSION(2)                              :: aux_atom = 0, aux_kind = 0, &
+                                                            aux_offset = 0, aux_size = 0
+      INTEGER, DIMENSION(3, 2)                           :: aux_cell = 0
       REAL(dp), DIMENSION(3)                             :: rab = 0.0_dp
+      REAL(dp), DIMENSION(3, 2)                          :: aux_r = 0.0_dp
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_fit
    END TYPE hfx_lri_pair_block_type
