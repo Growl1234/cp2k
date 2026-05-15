@@ -109,6 +109,7 @@ CONTAINS
       END IF
 
       CALL hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao)
+      CALL hfx_lri_compute_rank_local_energy(qs_env, ri_data, rho_ao, hf_fraction, ehfx)
       CALL hfx_lri_write_rank_local_k_blocks(qs_env, ri_data, ks_matrix, hf_fraction)
 
       IF (lri_debug_abort_after_writeback) THEN
@@ -2490,6 +2491,141 @@ CONTAINS
       END IF
 
    END SUBROUTINE hfx_lri_write_rank_local_k_blocks
+
+! **************************************************************************************************
+!> \brief Computes a prototype HFX energy contribution from rank-local LRI K blocks.
+!> \param qs_env ...
+!> \param ri_data ...
+!> \param rho_ao ...
+!> \param hf_fraction ...
+!> \param ehfx ...
+!> \note This diagnostic uses the current real-space density blocks and the stored rank-local
+!>       K blocks. It mirrors the direct/reverse-transpose lookup used by the writeback path.
+!> \note The value is intended as a prototype consistency metric until the final LRI-HFXk
+!>       energy expression and k-point normalization are validated against RI-HFXk.
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_compute_rank_local_energy(qs_env, ri_data, rho_ao, hf_fraction, ehfx)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+      REAL(dp), INTENT(IN)                               :: hf_fraction
+      REAL(dp), INTENT(OUT)                              :: ehfx
+
+      INTEGER                                            :: added_blocks, img, img_rev, ipair, lb1, &
+                                                            lb2, lb3, skipped_blocks, &
+                                                            transposed_blocks, ub1, ub2, ub3
+      INTEGER, DIMENSION(3)                              :: cell_rev
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: found, found_rev, use_transpose
+      REAL(dp)                                           :: e_local, e_scaled_global, &
+                                                            e_unscaled_global, rho_k_dot
+      REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block, rho_block_rev
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+
+      NULLIFY (cell_to_index, kpoints, para_env, rho_block, rho_block_rev)
+
+      ehfx = 0.0_dp
+      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
+      IF (.NOT. ASSOCIATED(rho_ao)) RETURN
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%k_blocks)) RETURN
+      IF (ri_data%lri_kp%nk_blocks <= 0) RETURN
+
+      CALL get_qs_env(qs_env=qs_env, kpoints=kpoints, para_env=para_env)
+      IF (ASSOCIATED(kpoints)) THEN
+         CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index)
+      END IF
+      IF (ASSOCIATED(cell_to_index)) THEN
+         lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+         lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+         lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+      END IF
+
+      e_local = 0.0_dp
+      added_blocks = 0
+      transposed_blocks = 0
+
+      DO ipair = 1, ri_data%lri_kp%nk_blocks
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%k_blocks(ipair)%k_block)) CYCLE
+
+         found = .FALSE.
+         use_transpose = .FALSE.
+         img = 1
+         IF (ASSOCIATED(cell_to_index)) THEN
+            IF (.NOT. (ALL(ri_data%lri_kp%k_blocks(ipair)%cell >= [lb1, lb2, lb3]) .AND. &
+                       ALL(ri_data%lri_kp%k_blocks(ipair)%cell <= [ub1, ub2, ub3]))) THEN
+               img = 0
+            ELSE
+               img = cell_to_index(ri_data%lri_kp%k_blocks(ipair)%cell(1), &
+                                   ri_data%lri_kp%k_blocks(ipair)%cell(2), &
+                                   ri_data%lri_kp%k_blocks(ipair)%cell(3))
+            END IF
+         END IF
+         IF (img >= 1 .AND. img <= SIZE(rho_ao, 2)) THEN
+            CALL dbcsr_get_block_p(matrix=rho_ao(1, img)%matrix, &
+                                   row=ri_data%lri_kp%k_blocks(ipair)%iatom, &
+                                   col=ri_data%lri_kp%k_blocks(ipair)%jatom, &
+                                   block=rho_block, found=found)
+            IF (found) THEN
+               found = (SIZE(rho_block, 1) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 1) .AND. &
+                        SIZE(rho_block, 2) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 2))
+            END IF
+         END IF
+         IF (.NOT. found .AND. ASSOCIATED(cell_to_index)) THEN
+            cell_rev(:) = -ri_data%lri_kp%k_blocks(ipair)%cell(:)
+            IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
+               img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
+               IF (img_rev >= 1 .AND. img_rev <= SIZE(rho_ao, 2)) THEN
+                  CALL dbcsr_get_block_p(matrix=rho_ao(1, img_rev)%matrix, &
+                                         row=ri_data%lri_kp%k_blocks(ipair)%jatom, &
+                                         col=ri_data%lri_kp%k_blocks(ipair)%iatom, &
+                                         block=rho_block_rev, found=found_rev)
+                  IF (found_rev) THEN
+                     found = (SIZE(rho_block_rev, 1) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 2) .AND. &
+                              SIZE(rho_block_rev, 2) == SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 1))
+                     use_transpose = found
+                  END IF
+               END IF
+            END IF
+         END IF
+         IF (.NOT. found) CYCLE
+
+         IF (use_transpose) THEN
+            rho_k_dot = SUM(TRANSPOSE(rho_block_rev)*ri_data%lri_kp%k_blocks(ipair)%k_block)
+            transposed_blocks = transposed_blocks + 1
+         ELSE
+            rho_k_dot = SUM(rho_block*ri_data%lri_kp%k_blocks(ipair)%k_block)
+         END IF
+         e_local = e_local + 0.5_dp*rho_k_dot
+         added_blocks = added_blocks + 1
+      END DO
+
+      e_unscaled_global = e_local
+      IF (ASSOCIATED(para_env)) THEN
+         CALL para_env%sum(e_unscaled_global)
+      END IF
+      e_scaled_global = hf_fraction*e_unscaled_global
+      ehfx = e_scaled_global
+
+      skipped_blocks = ri_data%lri_kp%nk_blocks - added_blocks
+      IF (ri_data%unit_nr > 0) THEN
+         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk prototype energy"
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
+            "used/stored", added_blocks, ri_data%lri_kp%nk_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+            "skipped", skipped_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+            "transposed", transposed_blocks
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
+            "E unscaled", e_unscaled_global
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
+            "HF fraction", hf_fraction
+         WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
+            "E scaled", ehfx
+      END IF
+
+   END SUBROUTINE hfx_lri_compute_rank_local_energy
 
 ! **************************************************************************************************
 !> \brief Contracts a target pair with a density pair and a real pair-pair auxiliary metric.
