@@ -54,10 +54,10 @@ MODULE hfx_lri_types
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
 
-      TYPE(hfx_lri_k_block_type) :: debug_k_block
+      TYPE(hfx_lri_k_block_type) :: diagnostic_k_block
 
-      INTEGER :: ndebug_k_blocks = 0
-      TYPE(hfx_lri_k_block_type), ALLOCATABLE, DIMENSION(:) :: debug_k_blocks
+      INTEGER :: nk_blocks = 0
+      TYPE(hfx_lri_k_block_type), ALLOCATABLE, DIMENSION(:) :: k_blocks
    END TYPE hfx_lri_kp_type
 
 CONTAINS
@@ -72,16 +72,16 @@ CONTAINS
       INTEGER                                            :: ipair
 
       IF (ASSOCIATED(lri_kp)) THEN
-         IF (ALLOCATED(lri_kp%debug_k_block%k_block)) THEN
-            DEALLOCATE (lri_kp%debug_k_block%k_block)
+         IF (ALLOCATED(lri_kp%diagnostic_k_block%k_block)) THEN
+            DEALLOCATE (lri_kp%diagnostic_k_block%k_block)
          END IF
-         IF (ALLOCATED(lri_kp%debug_k_blocks)) THEN
-            DO ipair = 1, SIZE(lri_kp%debug_k_blocks)
-               IF (ALLOCATED(lri_kp%debug_k_blocks(ipair)%k_block)) THEN
-                  DEALLOCATE (lri_kp%debug_k_blocks(ipair)%k_block)
+         IF (ALLOCATED(lri_kp%k_blocks)) THEN
+            DO ipair = 1, SIZE(lri_kp%k_blocks)
+               IF (ALLOCATED(lri_kp%k_blocks(ipair)%k_block)) THEN
+                  DEALLOCATE (lri_kp%k_blocks(ipair)%k_block)
                END IF
             END DO
-            DEALLOCATE (lri_kp%debug_k_blocks)
+            DEALLOCATE (lri_kp%k_blocks)
          END IF
          IF (ALLOCATED(lri_kp%pair_blocks)) THEN
             DO ipair = 1, SIZE(lri_kp%pair_blocks)
