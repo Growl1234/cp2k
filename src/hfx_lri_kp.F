@@ -287,7 +287,8 @@ CONTAINS
          IF (ri_data%lri_kp%npair_blocks < lri_debug_max_pair_blocks) THEN
             ipair_block = ri_data%lri_kp%npair_blocks + 1
             CALL hfx_lri_init_pair_block(ri_data%lri_kp%pair_blocks(ipair_block), iatom, jatom, &
-                                         ikind, jkind, cell_j, rab, nao_i, nao_j, naux_pair)
+                                         ikind, jkind, cell_j, rab, nao_i, nao_j, naux_i, naux_j, &
+                                         naux_pair)
             CALL hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, ikind, jkind, rab, &
                                               ri_data, ri_data%lri_kp%pair_blocks(ipair_block), &
                                               dbg_m_ncart, dbg_ji_ncart, dbg_jj_ncart, &
@@ -317,7 +318,8 @@ CONTAINS
 
       IF (dbg_pair_found) THEN
          CALL hfx_lri_init_pair_block(dbg_pair_block, dbg_iatom, dbg_jatom, dbg_ikind, dbg_jkind, &
-                                      dbg_cell, dbg_rab, dbg_nao_i, dbg_nao_j, dbg_naux_pair)
+                                      dbg_cell, dbg_rab, dbg_nao_i, dbg_nao_j, dbg_naux_i, dbg_naux_j, &
+                                      dbg_naux_pair)
          CALL hfx_lri_debug_pair_integrals(basis_set_AO, basis_set_RI, dbg_ikind, dbg_jkind, &
                                            dbg_rab, ri_data, dbg_pair_block, dbg_m_ncart, &
                                            dbg_ji_ncart, dbg_jj_ncart, dbg_m_norm, dbg_ji_norm, &
@@ -468,6 +470,8 @@ CONTAINS
                "AO functions", dbg_nao_i, dbg_nao_j
             WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10,T54,I10)") &
                "RI functions", dbg_naux_i, dbg_naux_j, dbg_naux_pair
+            WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
+               "aux centers", dbg_pair_block%naux_centers
             IF (dbg_integrals_done) THEN
                WRITE (ri_data%unit_nr, "(/,T4,A)") "debug spherical contracted blocks"
                WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,ES10.3)") &
@@ -1219,16 +1223,18 @@ CONTAINS
 !> \param rab ...
 !> \param nao_i ...
 !> \param nao_j ...
+!> \param naux_i ...
+!> \param naux_j ...
 !> \param naux_pair ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_init_pair_block(pair_block, iatom, jatom, ikind, jkind, cell, rab, nao_i, &
-                                      nao_j, naux_pair)
+                                      nao_j, naux_i, naux_j, naux_pair)
 
       TYPE(hfx_lri_pair_block_type), INTENT(INOUT)       :: pair_block
       INTEGER, INTENT(IN)                                :: iatom, jatom, ikind, jkind
       INTEGER, DIMENSION(3), INTENT(IN)                  :: cell
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: rab
-      INTEGER, INTENT(IN)                                :: nao_i, nao_j, naux_pair
+      INTEGER, INTENT(IN)                                :: nao_i, nao_j, naux_i, naux_j, naux_pair
 
       IF (ALLOCATED(pair_block%c_fit)) DEALLOCATE (pair_block%c_fit)
       IF (ALLOCATED(pair_block%v_fit)) DEALLOCATE (pair_block%v_fit)
@@ -1241,7 +1247,35 @@ CONTAINS
       pair_block%rab(:) = rab(:)
       pair_block%nao_i = nao_i
       pair_block%nao_j = nao_j
+      pair_block%naux_i = naux_i
+      pair_block%naux_j = naux_j
       pair_block%naux_pair = naux_pair
+
+      pair_block%onsite_pair = (iatom == jatom .AND. SUM(rab*rab) < 1.0E-20_dp)
+      pair_block%naux_centers = 1
+      pair_block%aux_atom(:) = 0
+      pair_block%aux_kind(:) = 0
+      pair_block%aux_cell(:, :) = 0
+      pair_block%aux_r(:, :) = 0.0_dp
+      pair_block%aux_offset(:) = 0
+      pair_block%aux_size(:) = 0
+
+      pair_block%aux_atom(1) = iatom
+      pair_block%aux_kind(1) = ikind
+      pair_block%aux_cell(:, 1) = 0
+      pair_block%aux_r(:, 1) = 0.0_dp
+      pair_block%aux_offset(1) = 0
+      pair_block%aux_size(1) = naux_i
+
+      IF (.NOT. pair_block%onsite_pair) THEN
+         pair_block%naux_centers = 2
+         pair_block%aux_atom(2) = jatom
+         pair_block%aux_kind(2) = jkind
+         pair_block%aux_cell(:, 2) = cell(:)
+         pair_block%aux_r(:, 2) = rab(:)
+         pair_block%aux_offset(2) = naux_i
+         pair_block%aux_size(2) = naux_j
+      END IF
 
    END SUBROUTINE hfx_lri_init_pair_block
 
