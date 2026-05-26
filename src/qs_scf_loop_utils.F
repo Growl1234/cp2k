@@ -19,6 +19,7 @@ MODULE qs_scf_loop_utils
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE kpoint_methods,                  ONLY: kpoint_set_mo_occupation_fixed
    USE kpoint_types,                    ONLY: kpoint_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE qs_density_matrices,             ONLY: calculate_density_matrix
@@ -382,10 +383,19 @@ CONTAINS
          CALL cp_abort(__LOCATION__, &
                        "KP code: Scf method not available: "// &
                        cp_to_string(scf_env%method))
+      CASE (ot_method_nr)
+         CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks, matrix_s_kp=matrix_s)
+         IF (scf_env%iter_count == 1) THEN
+            CALL do_general_diag_kp(matrix_ks, matrix_s, kpoints, scf_env, scf_control, .FALSE., &
+                                    diis_step, diis_error, qs_env)
+            CALL kpoint_set_mo_occupation_fixed(kpoints)
+            scf_env%iter_method = "Init/OT-k"
+         END IF
+         CALL cp_abort(__LOCATION__, &
+                       "KP code: OT minimizer for k-points not implemented yet")
       CASE (ot_diag_method_nr, &
             block_krylov_diag_method_nr, &
-            block_davidson_diag_method_nr, &
-            ot_method_nr)
+            block_davidson_diag_method_nr)
          CALL cp_abort(__LOCATION__, &
                        "KP code: Scf method not available: "// &
                        cp_to_string(scf_env%method))

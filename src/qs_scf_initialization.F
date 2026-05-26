@@ -56,14 +56,16 @@ MODULE qs_scf_initialization
    USE input_constants,                 ONLY: &
         broy_mix, cholesky_dbcsr, cholesky_inverse, cholesky_off, diag_block_davidson, &
         diag_block_krylov, diag_filter_matrix, diag_ot, diag_standard, direct_p_mix, kerker_mix, &
-        modified_broy_mix, multisec_mix, new_pulay_mix, no_mix, ot2cdft, outer_scf_none, &
-        plus_u_lowdin, pulay_mix, smeagol_runtype_emtransport, wfi_frozen_method_nr, &
-        wfi_ps_method_nr, wfi_use_guess_method_nr
+        modified_broy_mix, multisec_mix, new_pulay_mix, no_mix, ot2cdft, &
+        ot_precond_full_kinetic, ot_precond_none, outer_scf_none, plus_u_lowdin, &
+        pulay_mix, smeagol_runtype_emtransport, wfi_frozen_method_nr, wfi_ps_method_nr, &
+        wfi_use_guess_method_nr
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: dp
-   USE kpoint_types,                    ONLY: kpoint_type
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_types,                  ONLY: particle_type
@@ -772,9 +774,13 @@ CONTAINS
       LOGICAL                                            :: do_kpoints, need_coeff_b, not_se_or_tb
       TYPE(cp_fm_type), POINTER                          :: mo_coeff
       TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
 
-      CALL get_qs_env(qs_env=qs_env, do_kpoints=do_kpoints, dft_control=dft_control, mos=mos)
+      NULLIFY (kpoints)
+
+      CALL get_qs_env(qs_env=qs_env, do_kpoints=do_kpoints, dft_control=dft_control, &
+                      kpoints=kpoints, mos=mos)
       not_se_or_tb = .NOT. (dft_control%qs_control%dftb .OR. dft_control%qs_control%xtb .OR. &
                             dft_control%qs_control%semi_empirical)
       need_coeff_b = .FALSE.
@@ -884,7 +890,7 @@ CONTAINS
          IF (dft_control%restricted .AND. dft_control%nspins /= 2) &
             CPABORT("nspin must be 2 for restricted (ROKS)")
          IF (do_kpoints) &
-            CPABORT("OT not possible with kpoint calculations")
+            CALL qs_scf_check_ot_kpoints_supported(scf_control, kpoints)
       ELSEIF (scf_env%method /= smeagol_method_nr) THEN
          CPABORT("OT or DIAGONALIZATION have to be set")
       END IF
@@ -893,6 +899,48 @@ CONTAINS
       END DO
 
    END SUBROUTINE qs_scf_ensure_diagonalization
+
+! **************************************************************************************************
+!> \brief checks the currently supported OT+k-points front-end subset
+!> \param scf_control ...
+!> \param kpoints ...
+! **************************************************************************************************
+   SUBROUTINE qs_scf_check_ot_kpoints_supported(scf_control, kpoints)
+      TYPE(scf_control_type), POINTER                    :: scf_control
+      TYPE(kpoint_type), POINTER                         :: kpoints
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_scf_check_ot_kpoints_supported'
+
+      INTEGER                                            :: handle
+      LOGICAL                                            :: full_grid
+
+      CALL timeset(routineN, handle)
+
+      CPASSERT(ASSOCIATED(kpoints))
+      CALL get_kpoint_info(kpoints, full_grid=full_grid)
+
+      IF (.NOT. full_grid) &
+         CPABORT("OT with k-points currently requires a full k-point grid")
+      IF (scf_control%diagonalization%ot_settings%ot_algorithm /= "TOD") &
+         CPABORT("OT with k-points currently supports only ALGORITHM STRICT")
+      IF (scf_control%diagonalization%ot_settings%ot_method /= "CG") &
+         CPABORT("OT with k-points currently supports only MINIMIZER CG")
+      SELECT CASE (scf_control%diagonalization%ot_settings%preconditioner_type)
+      CASE (ot_precond_none, ot_precond_full_kinetic)
+         CONTINUE
+      CASE DEFAULT
+         CPABORT("OT with k-points currently supports only NONE or FULL_KINETIC preconditioning")
+      END SELECT
+      IF (scf_control%diagonalization%ot_settings%do_rotation) &
+         CPABORT("OT with k-points currently does not support ROTATION")
+      IF (scf_control%diagonalization%ot_settings%occupation_preconditioner) &
+         CPABORT("OT with k-points currently does not support OCCUPATION_PRECONDITIONER")
+      IF (scf_control%diagonalization%ot_settings%add_nondiag_energy) &
+         CPABORT("OT with k-points currently does not support NONDIAG_ENERGY")
+
+      CALL timestop(handle)
+
+   END SUBROUTINE qs_scf_check_ot_kpoints_supported
 
 ! **************************************************************************************************
 !> \brief performs those initialisations that need to be done only once

@@ -103,7 +103,7 @@ MODULE kpoint_methods
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'kpoint_methods'
 
    PUBLIC :: kpoint_initialize, kpoint_env_initialize, kpoint_initialize_mos, kpoint_initialize_mo_set
-   PUBLIC :: kpoint_init_cell_index, kpoint_set_mo_occupation
+   PUBLIC :: kpoint_init_cell_index, kpoint_set_mo_occupation, kpoint_set_mo_occupation_fixed
    PUBLIC :: kpoint_density_matrices, kpoint_density_transform
    PUBLIC :: rskp_transform, lowdin_kp_trans, lowdin_kp_mo_coeff
 
@@ -1454,6 +1454,63 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE kpoint_set_mo_occupation
+
+! **************************************************************************************************
+!> \brief Set fixed k-point occupations without reordering by eigenvalues
+!> \param kpoint kpoint environment
+! **************************************************************************************************
+   SUBROUTINE kpoint_set_mo_occupation_fixed(kpoint)
+
+      TYPE(kpoint_type), POINTER                         :: kpoint
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'kpoint_set_mo_occupation_fixed'
+
+      INTEGER                                            :: handle, ikpgr, ispin, kplocal, nelectron, &
+                                                            nmo, nocc, nspin
+      INTEGER, DIMENSION(2)                              :: kp_range
+      REAL(KIND=dp)                                      :: maxocc
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: occupation
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(mo_set_type), POINTER                         :: mo_set
+
+      CALL timeset(routineN, handle)
+
+      CALL get_kpoint_info(kpoint, kp_range=kp_range)
+      kplocal = kp_range(2) - kp_range(1) + 1
+      kp => kpoint%kp_env(1)%kpoint_env
+      nspin = SIZE(kp%mos, 2)
+
+      DO ispin = 1, nspin
+         mo_set => kp%mos(1, ispin)
+         CALL get_mo_set(mo_set, maxocc=maxocc, nelectron=nelectron, nmo=nmo)
+         nocc = NINT(REAL(nelectron, KIND=dp)/maxocc)
+         IF (ABS(REAL(nelectron, KIND=dp) - maxocc*REAL(nocc, KIND=dp)) > 10.0_dp*EPSILON(1.0_dp)) &
+            CPABORT("OT with k-points requires integer fixed occupations per k-point")
+         IF (nocc > nmo) &
+            CPABORT("OT with k-points: not enough MOs for fixed occupations")
+
+         DO ikpgr = 1, kplocal
+            kp => kpoint%kp_env(ikpgr)%kpoint_env
+            mo_set => kp%mos(1, ispin)
+            CALL get_mo_set(mo_set, occupation_numbers=occupation)
+            occupation(1:nmo) = 0.0_dp
+            IF (nocc > 0) occupation(1:nocc) = maxocc
+            mo_set%kTS = 0.0_dp
+            mo_set%mu = 0.0_dp
+            IF (.NOT. kpoint%use_real_wfn) THEN
+               mo_set => kp%mos(2, ispin)
+               CALL get_mo_set(mo_set, occupation_numbers=occupation)
+               occupation(1:nmo) = 0.0_dp
+               IF (nocc > 0) occupation(1:nocc) = maxocc
+               mo_set%kTS = 0.0_dp
+               mo_set%mu = 0.0_dp
+            END IF
+         END DO
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE kpoint_set_mo_occupation_fixed
 
 ! **************************************************************************************************
 !> \brief Calculate kpoint density matrices (rho(k), owned by kpoint groups)
