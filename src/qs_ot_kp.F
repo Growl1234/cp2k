@@ -74,18 +74,22 @@ MODULE qs_ot_kp
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Prepare the first k-point OT state. The actual OT update is intentionally not implemented
+!> \brief Check the current k-point OT state. The actual OT update is intentionally not implemented
 !>        in this preparatory step.
-!> \param matrix_ks  Kohn-Sham matrices in real-space image representation
-!> \param matrix_s   overlap matrices in real-space image representation
-!> \param kpoints    k-point environment
-!> \param scf_env    SCF environment
+!> \param matrix_ks     Kohn-Sham matrices in real-space image representation
+!> \param matrix_s      overlap matrices in real-space image representation
+!> \param kpoints       k-point environment
+!> \param scf_env       SCF environment
+!> \param initial_state whether the current MOs come from the initialization diagonalization
+!> \param gradient_norm unpreconditioned tangent-gradient norm for the current k-point MOs
 ! **************************************************************************************************
-   SUBROUTINE ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env)
+   SUBROUTINE ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env, initial_state, gradient_norm)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      LOGICAL, INTENT(IN)                                :: initial_state
+      REAL(KIND=dp), INTENT(OUT)                         :: gradient_norm
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_mini_kp'
 
@@ -115,21 +119,31 @@ CONTAINS
       CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, max_offdiag, &
                                       max_eval_deviation, max_residual, max_tangent_deviation, &
                                       max_gradient_norm, max_descent_deviation)
-      IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check .OR. &
-          max_tangent_deviation > eps_tangent_check .OR. &
-          max_descent_deviation > eps_tangent_check) THEN
+      gradient_norm = max_gradient_norm
+      IF (initial_state) THEN
+         IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check .OR. &
+             max_tangent_deviation > eps_tangent_check .OR. &
+             max_descent_deviation > eps_tangent_check) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "KP code: initial OT-k Hamiltonian/gradient check failed; max offdiag = "// &
+                          cp_to_string(max_offdiag)//", max eval deviation = "// &
+                          cp_to_string(max_eval_deviation)//", max residual = "// &
+                          cp_to_string(max_residual)//", max |C^H G| = "// &
+                          cp_to_string(max_tangent_deviation)//", max gradient norm = "// &
+                          cp_to_string(max_gradient_norm)//", max descent deviation = "// &
+                          cp_to_string(max_descent_deviation))
+         END IF
+      ELSE IF (max_tangent_deviation > eps_tangent_check .OR. &
+               max_descent_deviation > eps_tangent_check) THEN
          CALL cp_abort(__LOCATION__, &
-                       "KP code: initial OT-k Hamiltonian/gradient check failed; max offdiag = "// &
-                       cp_to_string(max_offdiag)//", max eval deviation = "// &
-                       cp_to_string(max_eval_deviation)//", max residual = "// &
-                       cp_to_string(max_residual)//", max |C^H G| = "// &
+                       "KP code: OT-k tangent-gradient check failed; max |C^H G| = "// &
                        cp_to_string(max_tangent_deviation)//", max gradient norm = "// &
                        cp_to_string(max_gradient_norm)//", max descent deviation = "// &
                        cp_to_string(max_descent_deviation))
       END IF
 
       ! No orbital update is performed yet. This scaffold intentionally returns after
-      ! checking the initialized k-point OT objects, so that the SCF driver can rebuild
+      ! checking the current k-point OT objects, so that the SCF driver can rebuild
       ! the density matrix and exercise the full k-point OT control flow.
       CALL timestop(handle)
 

@@ -329,22 +329,18 @@ CONTAINS
 
       INTEGER                                            :: handle, ispin
       LOGICAL                                            :: disable_diis, has_unit_metric
-      REAL(dp)                                           :: diis_error, saved_eps_diis
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s, rho_ao_kp
+      REAL(dp)                                           :: diis_error, ot_kp_gradient_norm, saved_eps_diis
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mo_set_type), DIMENSION(:, :), POINTER        :: mos
       TYPE(qs_energy_type), POINTER                      :: energy
-      TYPE(qs_rho_type), POINTER                         :: rho
-      TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_nl
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (dft_control, kpoints, matrix_ks, matrix_s, rho, rho_ao_kp, sab_nl, fmwork)
+      NULLIFY (dft_control, kpoints, matrix_ks, matrix_s)
 
-      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, kpoints=kpoints, rho=rho)
+      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, kpoints=kpoints)
       scf_env%iter_param = 0.0_dp
       disable_diis = dft_control%qs_control%xtb_control%do_tblite .AND. &
                      tb_native_scc_mixer_active(dft_control)
@@ -398,17 +394,15 @@ CONTAINS
          IF (scf_env%iter_count == 1) THEN
             CALL do_general_diag_kp(matrix_ks, matrix_s, kpoints, scf_env, scf_control, .FALSE., &
                                     diis_step, diis_error, qs_env)
-            CALL kpoint_set_mo_occupation_fixed(kpoints)
-            CALL kpoint_density_matrices(kpoints)
-            CALL qs_rho_get(rho, rho_ao_kp=rho_ao_kp)
-            CALL get_kpoint_info(kpoints, sab_nl=sab_nl)
-            fmwork => scf_env%scf_work1
-            CALL kpoint_density_transform(kpoints, rho_ao_kp, .FALSE., &
-                                          matrix_s(1, 1)%matrix, sab_nl, fmwork)
             scf_env%iter_method = "Init/OT-k"
+         ELSE
+            scf_env%iter_method = "Zero/OT-k"
          END IF
-         CALL ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env)
-         scf_env%iter_method = "Zero/OT-k"
+         CALL ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env, &
+                              initial_state=(scf_env%iter_count == 1), &
+                              gradient_norm=ot_kp_gradient_norm)
+         scf_env%iter_param = ot_kp_gradient_norm
+         CALL qs_scf_update_density_kp_ot(qs_env, scf_env, kpoints, matrix_s)
       CASE (ot_diag_method_nr, &
             block_krylov_diag_method_nr, &
             block_davidson_diag_method_nr)
@@ -444,6 +438,40 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE qs_scf_new_mos_kp
+
+! **************************************************************************************************
+!> \brief Rebuilds the k-point density after an OT update.
+!> \param qs_env ...
+!> \param scf_env ...
+!> \param kpoints ...
+!> \param matrix_s ...
+! **************************************************************************************************
+   SUBROUTINE qs_scf_update_density_kp_ot(qs_env, scf_env, kpoints, matrix_s)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s
+
+      TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao_kp
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_nl
+      TYPE(qs_rho_type), POINTER                         :: rho
+
+      NULLIFY (fmwork, rho, rho_ao_kp, sab_nl)
+
+      CALL kpoint_set_mo_occupation_fixed(kpoints)
+      CALL kpoint_density_matrices(kpoints)
+
+      CALL get_qs_env(qs_env=qs_env, rho=rho)
+      CALL qs_rho_get(rho, rho_ao_kp=rho_ao_kp)
+      CALL get_kpoint_info(kpoints, sab_nl=sab_nl)
+
+      fmwork => scf_env%scf_work1
+      CALL kpoint_density_transform(kpoints, rho_ao_kp, .FALSE., &
+                                    matrix_s(1, 1)%matrix, sab_nl, fmwork)
+
+   END SUBROUTINE qs_scf_update_density_kp_ot
 
 ! **************************************************************************************************
 !> \brief the inner loop of scf, specific to using to the orbital transformation method
