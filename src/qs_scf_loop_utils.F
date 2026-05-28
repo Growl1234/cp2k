@@ -554,12 +554,13 @@ CONTAINS
 !> \param rho       All data for the electron density
 !> \param para_env  Parallel environment
 !> \param diis_step Did we do a DIIS step?
+!> \param do_kpoints Whether this is a k-point calculation
 ! **************************************************************************************************
-   SUBROUTINE qs_scf_density_mixing(scf_env, rho, para_env, diis_step)
+   SUBROUTINE qs_scf_density_mixing(scf_env, rho, para_env, diis_step, do_kpoints)
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       TYPE(qs_rho_type), POINTER                         :: rho
       TYPE(mp_para_env_type), POINTER                    :: para_env
-      LOGICAL                                            :: diis_step
+      LOGICAL                                            :: diis_step, do_kpoints
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao_kp
 
@@ -583,6 +584,13 @@ CONTAINS
                        "unknown scf mixing method: "// &
                        cp_to_string(scf_env%mixing_method))
       END SELECT
+
+      ! The first k-point OT step bootstraps the occupied subspace by diagonalization.
+      ! This makes the orbital residual essentially zero by construction, but it is
+      ! only an initialization step and must not be allowed to terminate the SCF loop.
+      IF (do_kpoints .AND. scf_env%method == ot_method_nr .AND. scf_env%iter_count == 1) THEN
+         scf_env%iter_delta = MAX(scf_env%iter_delta, 1.0_dp)
+      END IF
 
    END SUBROUTINE qs_scf_density_mixing
 
