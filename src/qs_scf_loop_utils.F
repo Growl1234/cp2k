@@ -392,7 +392,7 @@ CONTAINS
             CALL kpoint_set_mo_occupation_fixed(kpoints)
             scf_env%iter_method = "Init/OT-k"
          END IF
-         CALL ot_scf_mini_kp(matrix_s, kpoints, scf_env)
+         CALL ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env)
       CASE (ot_diag_method_nr, &
             block_krylov_diag_method_nr, &
             block_davidson_diag_method_nr)
