@@ -686,6 +686,7 @@ list(
   qs_operators_ao.F
   qs_ot_eigensolver.F
   qs_ot.F
+  qs_ot_kp_types.F
   qs_ot_kp.F
   qs_ot_minimizer.F
   qs_ot_scf.F

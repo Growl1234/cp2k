@@ -48,6 +48,7 @@ MODULE qs_scf_loop_utils
    USE qs_mo_types,                     ONLY: mo_set_type
    USE qs_mom_methods,                  ONLY: do_mom_diag
    USE qs_ot_kp,                        ONLY: ot_scf_mini_kp
+   USE qs_ot_kp_types,                  ONLY: qs_ot_kp_env_release
    USE qs_ot_scf,                       ONLY: ot_scf_destroy,&
                                               ot_scf_mini
    USE qs_outer_scf,                    ONLY: outer_loop_gradient
@@ -811,6 +812,9 @@ CONTAINS
             END DO
             DEALLOCATE (scf_env%qs_ot_env)
             NULLIFY (scf_env%qs_ot_env)
+         END IF
+         IF (ASSOCIATED(scf_env%qs_ot_kp_env)) THEN
+            CALL qs_ot_kp_env_release(scf_env%qs_ot_kp_env)
          END IF
       CASE (ot_diag_method_nr)
          !

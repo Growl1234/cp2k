@@ -55,6 +55,9 @@ MODULE qs_ot_kp
    USE qs_matrix_pools,                 ONLY: mpools_get,&
                                               qs_matrix_pools_type
    USE qs_mo_types,                     ONLY: get_mo_set
+   USE qs_ot_kp_types,                  ONLY: qs_ot_kp_block_type,&
+                                              qs_ot_kp_env_release,&
+                                              qs_ot_kp_env_type
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_scf_diagonalization,          ONLY: diag_kp_smat
    USE qs_scf_types,                    ONLY: qs_scf_env_type
@@ -116,10 +119,17 @@ CONTAINS
 
       ! Rebuild H(k), apply it to the initialized MOs, and verify that C(k)^H H(k) C(k)
       ! is consistent with the eigenvalues produced by the initialization diagonalization.
-      CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, max_offdiag, &
-                                      max_eval_deviation, max_residual, max_tangent_deviation, &
-                                      max_gradient_norm, max_descent_deviation)
+      ! The residual is stored as the first persistent unpreconditioned gradient candidate.
+      CALL ot_kp_ensure_env(scf_env%qs_ot_kp_env, kpoints)
+      IF (scf_env%qs_ot_kp_env%gnorm >= 0.0_dp) THEN
+         scf_env%qs_ot_kp_env%gnorm_old = scf_env%qs_ot_kp_env%gnorm
+         scf_env%qs_ot_kp_env%has_history = .TRUE.
+      END IF
+      CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, scf_env%qs_ot_kp_env, &
+                                      max_offdiag, max_eval_deviation, max_residual, &
+                                      max_tangent_deviation, max_gradient_norm, max_descent_deviation)
       gradient_norm = max_gradient_norm
+      scf_env%qs_ot_kp_env%gnorm = max_gradient_norm
       IF (initial_state) THEN
          IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check .OR. &
              max_tangent_deviation > eps_tangent_check .OR. &
@@ -148,6 +158,76 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE ot_scf_mini_kp
+
+
+! **************************************************************************************************
+!> \brief Ensure that the persistent k-point OT work environment has the right shape.
+!> \param ot_kp_env  k-point OT work environment
+!> \param kpoints    k-point environment
+! **************************************************************************************************
+   SUBROUTINE ot_kp_ensure_env(ot_kp_env, kpoints)
+
+      TYPE(qs_ot_kp_env_type), POINTER                  :: ot_kp_env
+      TYPE(kpoint_type), POINTER                        :: kpoints
+
+      INTEGER                                           :: kplocal, nspin
+      INTEGER, DIMENSION(2)                             :: kp_range
+      TYPE(kpoint_env_type), POINTER                    :: kp
+
+      CALL get_kpoint_info(kpoints, kp_range=kp_range)
+      kplocal = kp_range(2) - kp_range(1) + 1
+      kp => kpoints%kp_env(1)%kpoint_env
+      nspin = SIZE(kp%mos, 2)
+
+      IF (ASSOCIATED(ot_kp_env)) THEN
+         IF (ot_kp_env%kplocal == kplocal .AND. ot_kp_env%nspin == nspin) RETURN
+         CALL qs_ot_kp_env_release(ot_kp_env)
+      END IF
+
+      ALLOCATE (ot_kp_env)
+      ot_kp_env%kplocal = kplocal
+      ot_kp_env%nspin = nspin
+      ot_kp_env%has_history = .FALSE.
+      ot_kp_env%gnorm = -1.0_dp
+      ot_kp_env%gnorm_old = -1.0_dp
+      ALLOCATE (ot_kp_env%block(kplocal, nspin))
+
+   END SUBROUTINE ot_kp_ensure_env
+
+! **************************************************************************************************
+!> \brief Store one k-point/spin block of the current OT work state.
+!> \param block     persistent work block
+!> \param mo_struct matrix structure of the MO coefficient matrices
+!> \param cmos      current reference orbitals C0
+!> \param gx        current unpreconditioned tangent gradient
+! **************************************************************************************************
+   SUBROUTINE ot_kp_store_block(block, mo_struct, cmos, gx)
+
+      TYPE(qs_ot_kp_block_type), INTENT(INOUT)          :: block
+      TYPE(cp_fm_struct_type), POINTER                  :: mo_struct
+      TYPE(cp_cfm_type), INTENT(IN)                     :: cmos, gx
+
+      COMPLEX(KIND=dp), PARAMETER                       :: cone = (1.0_dp, 0.0_dp)
+
+      IF (.NOT. block%allocated) THEN
+         CALL cp_cfm_create(block%c0, mo_struct)
+         CALL cp_cfm_create(block%gx, mo_struct)
+         CALL cp_cfm_create(block%dx, mo_struct)
+         CALL cp_cfm_create(block%gx_old, mo_struct)
+         CALL cp_cfm_create(block%dx_old, mo_struct)
+         block%allocated = .TRUE.
+      ELSE IF (block%has_data) THEN
+         CALL cp_cfm_to_cfm(block%gx, block%gx_old)
+         CALL cp_cfm_to_cfm(block%dx, block%dx_old)
+      END IF
+
+      CALL cp_cfm_to_cfm(cmos, block%c0)
+      CALL cp_cfm_to_cfm(gx, block%gx)
+      CALL cp_cfm_to_cfm(gx, block%dx)
+      CALL cp_cfm_scale_and_add(-cone, block%dx)
+      block%has_data = .TRUE.
+
+   END SUBROUTINE ot_kp_store_block
 
 ! **************************************************************************************************
 !> \brief Pack the real/imaginary k-point MO coefficients into a complex full matrix.
@@ -309,13 +389,14 @@ CONTAINS
 !> \param max_gradient_norm     maximum Frobenius norm of the tentative tangent gradient
 !> \param max_descent_deviation maximum deviation of <G,-G> from -||G||^2
 ! **************************************************************************************************
-   SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, max_offdiag, &
+   SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, ot_kp_env, max_offdiag, &
                                       max_eval_deviation, max_residual, max_tangent_deviation, &
                                       max_gradient_norm, max_descent_deviation)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
+      TYPE(qs_ot_kp_env_type), POINTER                   :: ot_kp_env
       REAL(KIND=dp), INTENT(OUT)                         :: max_offdiag, max_eval_deviation, &
                                                             max_residual, max_tangent_deviation, &
                                                             max_gradient_norm, max_descent_deviation
@@ -531,10 +612,13 @@ CONTAINS
                END DO
             END DO
 
+            ! Store the current reference orbitals, the unpreconditioned tangent gradient,
+            ! and the first steepest-descent direction in the persistent k-point OT state.
+            CALL ot_kp_store_block(ot_kp_env%block(ikp, ispin), mo_struct, cmos, hcmos)
+
             ! The first steepest-descent direction would be D = -G.  Check the complex
             ! inner-product convention that will later be used by CG and line search.
-            CALL cp_cfm_to_cfm(hcmos, dxmos)
-            CALL cp_cfm_scale_and_add(-cone, dxmos)
+            CALL cp_cfm_to_cfm(ot_kp_env%block(ikp, ispin)%dx, dxmos)
             CALL cp_cfm_get_info(dxmos, nrow_local=nrow_local, ncol_local=ncol_local, &
                                  local_data=d_local, para_env=para_env)
             descent_local = 0.0_dp

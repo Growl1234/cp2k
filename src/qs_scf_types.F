@@ -37,6 +37,8 @@ MODULE qs_scf_types
                                               fb_env_nullify,&
                                               fb_env_obj,&
                                               fb_env_release
+   USE qs_ot_kp_types,                  ONLY: qs_ot_kp_env_release,&
+                                              qs_ot_kp_env_type
    USE qs_ot_types,                     ONLY: qs_ot_destroy,&
                                               qs_ot_type
 #include "./base/base_uses.f90"
@@ -112,6 +114,7 @@ MODULE qs_scf_types
       TYPE(dbcsr_type), POINTER :: ortho_dbcsr => NULL(), buf1_dbcsr => NULL(), buf2_dbcsr => NULL()
       TYPE(preconditioner_p_type), DIMENSION(:), POINTER :: ot_preconditioner => NULL()
       TYPE(qs_ot_type), POINTER, DIMENSION(:)  :: qs_ot_env => NULL()
+      TYPE(qs_ot_kp_env_type), POINTER :: qs_ot_kp_env => NULL()
       TYPE(qs_diis_buffer_type), POINTER :: scf_diis_buffer => NULL()
       TYPE(subspace_env_type), POINTER :: subspace_env => NULL()
       TYPE(davidson_type), POINTER, DIMENSION(:) :: block_davidson_env => NULL()
@@ -174,6 +177,7 @@ CONTAINS
       NULLIFY (scf_env%p_mix_new)
       NULLIFY (scf_env%ot_preconditioner)
       NULLIFY (scf_env%qs_ot_env)
+      NULLIFY (scf_env%qs_ot_kp_env)
       NULLIFY (scf_env%scf_diis_buffer)
       NULLIFY (scf_env%buf1_dbcsr)
       NULLIFY (scf_env%buf2_dbcsr)
@@ -316,6 +320,9 @@ CONTAINS
             CALL qs_ot_destroy(scf_env%qs_ot_env(i))
          END DO
          DEALLOCATE (scf_env%qs_ot_env)
+      END IF
+      IF (ASSOCIATED(scf_env%qs_ot_kp_env)) THEN
+         CALL qs_ot_kp_env_release(scf_env%qs_ot_kp_env)
       END IF
       IF (ASSOCIATED(scf_env%scf_diis_buffer)) THEN
          CALL qs_diis_b_release(scf_env%scf_diis_buffer)
