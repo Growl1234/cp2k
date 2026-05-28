@@ -44,6 +44,8 @@ MODULE qs_ot_kp_types
       LOGICAL :: has_history = .FALSE.
       REAL(KIND=dp) :: gnorm = -1.0_dp
       REAL(KIND=dp) :: gnorm_old = -1.0_dp
+      REAL(KIND=dp) :: step_size = 1.0E-4_dp
+      REAL(KIND=dp) :: last_step_size = 0.0_dp
       TYPE(qs_ot_kp_block_type), DIMENSION(:, :), POINTER :: block => NULL()
    END TYPE qs_ot_kp_env_type
 

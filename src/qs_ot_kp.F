@@ -74,7 +74,8 @@ MODULE qs_ot_kp
                                              eps_hamiltonian_check = 1.0E-6_dp, &
                                              eps_strict_check = 1.0E-8_dp, &
                                              eps_tangent_check = 1.0E-8_dp
-   REAL(KIND=dp), PARAMETER, PRIVATE    :: ot_kp_trial_step = 1.0E-4_dp
+   REAL(KIND=dp), PARAMETER, PRIVATE    :: ot_kp_default_step = 1.0E-4_dp, &
+                                             ot_kp_min_step = 1.0E-8_dp
 
    PUBLIC :: ot_scf_mini_kp
 
@@ -106,7 +107,7 @@ CONTAINS
                                                             max_eval_deviation, max_gradient_norm, &
                                                             max_offdiag, max_residual, &
                                                             max_strict_deviation, &
-                                                            max_tangent_deviation
+                                                            max_tangent_deviation, step_size
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
 
       CALL timeset(routineN, handle)
@@ -127,15 +128,22 @@ CONTAINS
       ! is consistent with the eigenvalues produced by the initialization diagonalization.
       ! The residual is stored as the first persistent unpreconditioned gradient candidate.
       CALL ot_kp_ensure_env(scf_env%qs_ot_kp_env, kpoints)
+      step_size = scf_env%qs_ot_kp_env%step_size
       IF (scf_env%qs_ot_kp_env%gnorm >= 0.0_dp) THEN
          scf_env%qs_ot_kp_env%gnorm_old = scf_env%qs_ot_kp_env%gnorm
          scf_env%qs_ot_kp_env%has_history = .TRUE.
       END IF
       CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, scf_env%qs_ot_kp_env, do_update, &
-                                      max_offdiag, max_eval_deviation, max_residual, &
+                                      step_size, max_offdiag, max_eval_deviation, max_residual, &
                                       max_tangent_deviation, max_gradient_norm, max_descent_deviation, max_strict_deviation)
       gradient_norm = max_gradient_norm
       scf_env%qs_ot_kp_env%gnorm = max_gradient_norm
+      scf_env%qs_ot_kp_env%last_step_size = step_size
+      IF (do_update .AND. scf_env%qs_ot_kp_env%has_history .AND. &
+          max_gradient_norm > scf_env%qs_ot_kp_env%gnorm_old) THEN
+         scf_env%qs_ot_kp_env%step_size = MAX(0.5_dp*scf_env%qs_ot_kp_env%step_size, &
+                                              ot_kp_min_step)
+      END IF
       IF (initial_state) THEN
          IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check .OR. &
              max_tangent_deviation > eps_tangent_check .OR. &
@@ -200,6 +208,8 @@ CONTAINS
       ot_kp_env%has_history = .FALSE.
       ot_kp_env%gnorm = -1.0_dp
       ot_kp_env%gnorm_old = -1.0_dp
+      ot_kp_env%step_size = ot_kp_default_step
+      ot_kp_env%last_step_size = 0.0_dp
       ALLOCATE (ot_kp_env%block(kplocal, nspin))
 
    END SUBROUTINE ot_kp_ensure_env
@@ -393,6 +403,7 @@ CONTAINS
 !> \param matrix_s           overlap matrices in real-space image representation
 !> \param kpoints            k-point environment
 !> \param do_update          whether to write one trial STRICT update back to the k-point MOs
+!> \param step_size          trial step size used in the STRICT retraction
 !> \param max_offdiag        maximum absolute off-diagonal element of C^H H C
 !> \param max_eval_deviation maximum absolute deviation between diag(C^H H C) and eigenvalues
 !> \param max_residual          maximum absolute residual of H C - S C (C^H H C)
@@ -401,8 +412,8 @@ CONTAINS
 !> \param max_descent_deviation maximum deviation of <G,-G> from -||G||^2
 !> \param max_strict_deviation  maximum deviation of the trial STRICT retraction from S-orthonormality
 ! **************************************************************************************************
-   SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, ot_kp_env, do_update, max_offdiag, &
-                                      max_eval_deviation, max_residual, max_tangent_deviation, &
+   SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, ot_kp_env, do_update, step_size, &
+                                      max_offdiag, max_eval_deviation, max_residual, max_tangent_deviation, &
                                       max_gradient_norm, max_descent_deviation, max_strict_deviation)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
@@ -410,6 +421,7 @@ CONTAINS
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
       TYPE(qs_ot_kp_env_type), POINTER                   :: ot_kp_env
       LOGICAL, INTENT(IN)                                :: do_update
+      REAL(KIND=dp), INTENT(IN)                          :: step_size
       REAL(KIND=dp), INTENT(OUT)                         :: max_offdiag, max_eval_deviation, &
                                                             max_residual, max_tangent_deviation, &
                                                             max_gradient_norm, max_descent_deviation, max_strict_deviation
@@ -644,7 +656,7 @@ CONTAINS
             END DO
 
             CALL ot_kp_check_strict_retraction(cmos, dxmos, csmat, mo_struct, nao, nmo, para_env, &
-                                               max_strict_deviation, cnewmos)
+                                               step_size, max_strict_deviation, cnewmos)
             IF (do_update) CALL ot_kp_unpack_mos(cnewmos, kp, ispin, use_real_wfn)
 
             CALL para_env%max(offdiag_local)
@@ -726,16 +738,18 @@ CONTAINS
 !> \param nao           number of AO functions
 !> \param nmo           number of MOs in the occupied subspace
 !> \param para_env      BLACS/parallel environment
+!> \param step_size     trial step size for the search direction
 !> \param max_deviation maximum local S-orthonormality deviation after the trial retraction
 !> \param cnew_out      optional output orbitals from the trial STRICT retraction
 ! **************************************************************************************************
    SUBROUTINE ot_kp_check_strict_retraction(cmos, dxmos, csmat, mo_struct, nao, nmo, para_env, &
-                                            max_deviation, cnew_out)
+                                            step_size, max_deviation, cnew_out)
 
       TYPE(cp_cfm_type), INTENT(IN)                      :: cmos, dxmos, csmat
       TYPE(cp_fm_struct_type), POINTER                   :: mo_struct
       INTEGER, INTENT(IN)                                :: nao, nmo
       TYPE(mp_para_env_type), POINTER                    :: para_env
+      REAL(KIND=dp), INTENT(IN)                          :: step_size
       REAL(KIND=dp), INTENT(INOUT)                       :: max_deviation
       TYPE(cp_cfm_type), OPTIONAL, INTENT(INOUT)          :: cnew_out
 
@@ -775,7 +789,7 @@ CONTAINS
       CALL cp_cfm_gemm('C', 'N', nmo, nmo, nao, cone, cmos, sdxmos, czero, overlap)
       CALL cp_cfm_to_cfm(dxmos, xmos)
       CALL cp_cfm_gemm('N', 'N', nao, nmo, nmo, -cone, cmos, overlap, cone, xmos)
-      CALL cp_cfm_scale_and_add(CMPLX(ot_kp_trial_step, 0.0_dp, KIND=dp), xmos)
+      CALL cp_cfm_scale_and_add(CMPLX(step_size, 0.0_dp, KIND=dp), xmos)
 
       ! Build P = X^H S X and the matrix functions cos(P^1/2) and sin(P^1/2)/P^1/2.
       CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, csmat, xmos, czero, sxmos)
