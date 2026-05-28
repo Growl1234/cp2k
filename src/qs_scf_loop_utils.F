@@ -42,6 +42,7 @@ MODULE qs_scf_loop_utils
    USE qs_mo_occupation,                ONLY: set_mo_occupation
    USE qs_mo_types,                     ONLY: mo_set_type
    USE qs_mom_methods,                  ONLY: do_mom_diag
+   USE qs_ot_kp,                        ONLY: ot_scf_mini_kp
    USE qs_ot_scf,                       ONLY: ot_scf_destroy,&
                                               ot_scf_mini
    USE qs_outer_scf,                    ONLY: outer_loop_gradient
@@ -391,8 +392,7 @@ CONTAINS
             CALL kpoint_set_mo_occupation_fixed(kpoints)
             scf_env%iter_method = "Init/OT-k"
          END IF
-         CALL cp_abort(__LOCATION__, &
-                       "KP code: OT minimizer for k-points not implemented yet")
+         CALL ot_scf_mini_kp(matrix_s, kpoints, scf_env)
       CASE (ot_diag_method_nr, &
             block_krylov_diag_method_nr, &
             block_davidson_diag_method_nr)

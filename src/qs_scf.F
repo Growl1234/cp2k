@@ -845,10 +845,15 @@ CONTAINS
       CASE (block_davidson_diag_method_nr)
          ! Preconditioner initialized within the loop, when required
       CASE (ot_method_nr)
-         CALL get_qs_env(qs_env, &
-                         has_unit_metric=has_unit_metric, &
-                         matrix_s=matrix_s, &
-                         matrix_ks=matrix_ks)
+         IF (do_kpoints) THEN
+            ! K-point OT uses a separate initialization path in qs_scf_new_mos_kp.
+            ! The Gamma-point OT setup below requests 1D matrix pointers and sparse
+            ! MO representations, which are intentionally unavailable for k-points.
+         ELSE
+            CALL get_qs_env(qs_env, &
+                            has_unit_metric=has_unit_metric, &
+                            matrix_s=matrix_s, &
+                            matrix_ks=matrix_ks)
 
          ! reortho the wavefunctions if we are having an outer scf and
          ! this is not the first iteration
@@ -971,11 +976,12 @@ CONTAINS
 
          ! if we have non-uniform occupations we should be using rotation
          do_rotation = scf_env%qs_ot_env(1)%settings%do_rotation
-         DO ispin = 1, SIZE(mos)
-            IF (.NOT. mos(ispin)%uniform_occupation) THEN
-               CPASSERT(do_rotation)
-            END IF
-         END DO
+            DO ispin = 1, SIZE(mos)
+               IF (.NOT. mos(ispin)%uniform_occupation) THEN
+                  CPASSERT(do_rotation)
+               END IF
+            END DO
+         END IF
       END SELECT
 
       ! another safety check
