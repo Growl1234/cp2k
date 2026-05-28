@@ -9,9 +9,11 @@
 !> \brief Orbital transformation support routines for k-point calculations
 ! **************************************************************************************************
 MODULE qs_ot_kp
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_gemm,&
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale,&
+                                              cp_cfm_gemm,&
                                               cp_cfm_scale_and_add,&
                                               cp_cfm_scale_and_add_fm
+   USE cp_cfm_diag,                     ONLY: cp_cfm_heevd
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
                                               cp_cfm_release,&
@@ -70,7 +72,9 @@ MODULE qs_ot_kp
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ot_kp'
    REAL(KIND=dp), PARAMETER, PRIVATE    :: eps_ortho_check = 1.0E-8_dp, &
                                              eps_hamiltonian_check = 1.0E-6_dp, &
+                                             eps_strict_check = 1.0E-8_dp, &
                                              eps_tangent_check = 1.0E-8_dp
+   REAL(KIND=dp), PARAMETER, PRIVATE    :: ot_kp_trial_step = 1.0E-4_dp
 
    PUBLIC :: ot_scf_mini_kp
 
@@ -84,14 +88,15 @@ CONTAINS
 !> \param kpoints       k-point environment
 !> \param scf_env       SCF environment
 !> \param initial_state whether the current MOs come from the initialization diagonalization
+!> \param do_update     whether to write one trial STRICT update back to the k-point MOs
 !> \param gradient_norm unpreconditioned tangent-gradient norm for the current k-point MOs
 ! **************************************************************************************************
-   SUBROUTINE ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env, initial_state, gradient_norm)
+   SUBROUTINE ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env, initial_state, do_update, gradient_norm)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
-      LOGICAL, INTENT(IN)                                :: initial_state
+      LOGICAL, INTENT(IN)                                :: initial_state, do_update
       REAL(KIND=dp), INTENT(OUT)                         :: gradient_norm
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_mini_kp'
@@ -100,6 +105,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: max_deviation, max_descent_deviation, &
                                                             max_eval_deviation, max_gradient_norm, &
                                                             max_offdiag, max_residual, &
+                                                            max_strict_deviation, &
                                                             max_tangent_deviation
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
 
@@ -125,15 +131,16 @@ CONTAINS
          scf_env%qs_ot_kp_env%gnorm_old = scf_env%qs_ot_kp_env%gnorm
          scf_env%qs_ot_kp_env%has_history = .TRUE.
       END IF
-      CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, scf_env%qs_ot_kp_env, &
+      CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, scf_env%qs_ot_kp_env, do_update, &
                                       max_offdiag, max_eval_deviation, max_residual, &
-                                      max_tangent_deviation, max_gradient_norm, max_descent_deviation)
+                                      max_tangent_deviation, max_gradient_norm, max_descent_deviation, max_strict_deviation)
       gradient_norm = max_gradient_norm
       scf_env%qs_ot_kp_env%gnorm = max_gradient_norm
       IF (initial_state) THEN
          IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check .OR. &
              max_tangent_deviation > eps_tangent_check .OR. &
-             max_descent_deviation > eps_tangent_check) THEN
+             max_descent_deviation > eps_tangent_check .OR. &
+             max_strict_deviation > eps_strict_check) THEN
             CALL cp_abort(__LOCATION__, &
                           "KP code: initial OT-k Hamiltonian/gradient check failed; max offdiag = "// &
                           cp_to_string(max_offdiag)//", max eval deviation = "// &
@@ -141,15 +148,18 @@ CONTAINS
                           cp_to_string(max_residual)//", max |C^H G| = "// &
                           cp_to_string(max_tangent_deviation)//", max gradient norm = "// &
                           cp_to_string(max_gradient_norm)//", max descent deviation = "// &
-                          cp_to_string(max_descent_deviation))
+                          cp_to_string(max_descent_deviation)//", max strict deviation = "// &
+                          cp_to_string(max_strict_deviation))
          END IF
       ELSE IF (max_tangent_deviation > eps_tangent_check .OR. &
-               max_descent_deviation > eps_tangent_check) THEN
+               max_descent_deviation > eps_tangent_check .OR. &
+               max_strict_deviation > eps_strict_check) THEN
          CALL cp_abort(__LOCATION__, &
                        "KP code: OT-k tangent-gradient check failed; max |C^H G| = "// &
                        cp_to_string(max_tangent_deviation)//", max gradient norm = "// &
                        cp_to_string(max_gradient_norm)//", max descent deviation = "// &
-                       cp_to_string(max_descent_deviation))
+                       cp_to_string(max_descent_deviation)//", max strict deviation = "// &
+                       cp_to_string(max_strict_deviation))
       END IF
 
       ! No orbital update is performed yet. This scaffold intentionally returns after
@@ -382,24 +392,27 @@ CONTAINS
 !> \param matrix_ks          Kohn-Sham matrices in real-space image representation
 !> \param matrix_s           overlap matrices in real-space image representation
 !> \param kpoints            k-point environment
+!> \param do_update          whether to write one trial STRICT update back to the k-point MOs
 !> \param max_offdiag        maximum absolute off-diagonal element of C^H H C
 !> \param max_eval_deviation maximum absolute deviation between diag(C^H H C) and eigenvalues
 !> \param max_residual          maximum absolute residual of H C - S C (C^H H C)
 !> \param max_tangent_deviation maximum absolute deviation of C^H G from zero
 !> \param max_gradient_norm     maximum Frobenius norm of the tentative tangent gradient
 !> \param max_descent_deviation maximum deviation of <G,-G> from -||G||^2
+!> \param max_strict_deviation  maximum deviation of the trial STRICT retraction from S-orthonormality
 ! **************************************************************************************************
-   SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, ot_kp_env, max_offdiag, &
+   SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, ot_kp_env, do_update, max_offdiag, &
                                       max_eval_deviation, max_residual, max_tangent_deviation, &
-                                      max_gradient_norm, max_descent_deviation)
+                                      max_gradient_norm, max_descent_deviation, max_strict_deviation)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
       TYPE(qs_ot_kp_env_type), POINTER                   :: ot_kp_env
+      LOGICAL, INTENT(IN)                                :: do_update
       REAL(KIND=dp), INTENT(OUT)                         :: max_offdiag, max_eval_deviation, &
                                                             max_residual, max_tangent_deviation, &
-                                                            max_gradient_norm, max_descent_deviation
+                                                            max_gradient_norm, max_descent_deviation, max_strict_deviation
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_kp_check_hamiltonian'
       COMPLEX(KIND=dp), PARAMETER                        :: cone = (1.0_dp, 0.0_dp), &
@@ -422,7 +435,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
       TYPE(copy_info_type), ALLOCATABLE, DIMENSION(:, :) :: info
-      TYPE(cp_cfm_type)                                  :: cksmat, cmos, csmat, dxmos, gsmall, hcmos, hsmall, scmos
+      TYPE(cp_cfm_type)                                  :: cksmat, cmos, csmat, cnewmos, dxmos, gsmall, hcmos, hsmall, scmos
       TYPE(cp_fm_pool_p_type), DIMENSION(:), POINTER     :: ao_ao_fm_pools
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct, mo_struct
       TYPE(cp_fm_type)                                   :: fmdummy, fmlocal, rksmat, rsmat
@@ -444,6 +457,7 @@ CONTAINS
       max_tangent_deviation = 0.0_dp
       max_gradient_norm = 0.0_dp
       max_descent_deviation = 0.0_dp
+      max_strict_deviation = 0.0_dp
 
       CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, use_real_wfn=use_real_wfn, kp_range=kp_range, &
                            nkp_groups=nkp_groups, kp_dist=kp_dist, sab_nl=sab_nl, &
@@ -565,6 +579,7 @@ CONTAINS
             CALL cp_cfm_create(hsmall, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
             CALL cp_cfm_create(gsmall, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
             CALL cp_cfm_create(dxmos, mo_struct)
+            CALL cp_cfm_create(cnewmos, mo_struct)
             CALL ot_kp_pack_mos(kp, ispin, use_real_wfn, cmos)
             CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, cksmat, cmos, czero, hcmos)
             CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, csmat, cmos, czero, scmos)
@@ -628,6 +643,10 @@ CONTAINS
                END DO
             END DO
 
+            CALL ot_kp_check_strict_retraction(cmos, dxmos, csmat, mo_struct, nao, nmo, para_env, &
+                                               max_strict_deviation, cnewmos)
+            IF (do_update) CALL ot_kp_unpack_mos(cnewmos, kp, ispin, use_real_wfn)
+
             CALL para_env%max(offdiag_local)
             CALL para_env%max(eval_dev_local)
             CALL para_env%max(residual_local)
@@ -643,6 +662,7 @@ CONTAINS
             max_gradient_norm = MAX(max_gradient_norm, gradient_norm_local)
             max_descent_deviation = MAX(max_descent_deviation, descent_dev_local)
 
+            CALL cp_cfm_release(cnewmos)
             CALL cp_cfm_release(dxmos)
             CALL cp_cfm_release(gsmall)
             CALL cp_cfm_release(hsmall)
@@ -678,6 +698,7 @@ CONTAINS
          CALL kpoints%para_env_inter_kp%max(max_tangent_deviation)
          CALL kpoints%para_env_inter_kp%max(max_gradient_norm)
          CALL kpoints%para_env_inter_kp%max(max_descent_deviation)
+         CALL kpoints%para_env_inter_kp%max(max_strict_deviation)
       END IF
 
       CALL dbcsr_deallocate_matrix(rmatrix)
@@ -694,6 +715,130 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE ot_kp_check_hamiltonian
+
+
+! **************************************************************************************************
+!> \brief Check the STRICT/TOD retraction algebra for one k-point/spin block without writing it back.
+!> \param cmos          current reference orbitals C0
+!> \param dxmos         current search direction D
+!> \param csmat         overlap matrix S(k)
+!> \param mo_struct     matrix structure for MO-like complex matrices
+!> \param nao           number of AO functions
+!> \param nmo           number of MOs in the occupied subspace
+!> \param para_env      BLACS/parallel environment
+!> \param max_deviation maximum local S-orthonormality deviation after the trial retraction
+!> \param cnew_out      optional output orbitals from the trial STRICT retraction
+! **************************************************************************************************
+   SUBROUTINE ot_kp_check_strict_retraction(cmos, dxmos, csmat, mo_struct, nao, nmo, para_env, &
+                                            max_deviation, cnew_out)
+
+      TYPE(cp_cfm_type), INTENT(IN)                      :: cmos, dxmos, csmat
+      TYPE(cp_fm_struct_type), POINTER                   :: mo_struct
+      INTEGER, INTENT(IN)                                :: nao, nmo
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      REAL(KIND=dp), INTENT(INOUT)                       :: max_deviation
+      TYPE(cp_cfm_type), OPTIONAL, INTENT(INOUT)          :: cnew_out
+
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_kp_check_strict_retraction'
+      COMPLEX(KIND=dp), PARAMETER                        :: cone = (1.0_dp, 0.0_dp), &
+                                                            czero = (0.0_dp, 0.0_dp)
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: col_scaling
+      COMPLEX(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: overlap_local
+      INTEGER                                            :: handle, icol, irow, ncol_local, nrow_local
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp)                                      :: local_deviation, theta
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues
+      TYPE(cp_cfm_type)                                  :: cnew, cosmat, eigvecs, overlap, scnew, &
+                                                            sincmat, small_work, sdxmos, sxmos, xmos
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (col_indices, overlap_local, row_indices)
+      local_deviation = 0.0_dp
+
+      CALL cp_cfm_create(xmos, mo_struct)
+      CALL cp_cfm_create(sxmos, mo_struct)
+      CALL cp_cfm_create(sdxmos, mo_struct)
+      CALL cp_cfm_create(cnew, mo_struct)
+      CALL cp_cfm_create(scnew, mo_struct)
+      CALL cp_cfm_create(overlap, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+      CALL cp_cfm_create(eigvecs, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+      CALL cp_cfm_create(small_work, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+      CALL cp_cfm_create(cosmat, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+      CALL cp_cfm_create(sincmat, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+      ALLOCATE (eigenvalues(nmo), col_scaling(nmo))
+
+      ! Project the search direction to the S-orthogonal complement of C0:
+      ! X = alpha * (D - C0 * (C0^H S D)).
+      CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, csmat, dxmos, czero, sdxmos)
+      CALL cp_cfm_gemm('C', 'N', nmo, nmo, nao, cone, cmos, sdxmos, czero, overlap)
+      CALL cp_cfm_to_cfm(dxmos, xmos)
+      CALL cp_cfm_gemm('N', 'N', nao, nmo, nmo, -cone, cmos, overlap, cone, xmos)
+      CALL cp_cfm_scale_and_add(CMPLX(ot_kp_trial_step, 0.0_dp, KIND=dp), xmos)
+
+      ! Build P = X^H S X and the matrix functions cos(P^1/2) and sin(P^1/2)/P^1/2.
+      CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, csmat, xmos, czero, sxmos)
+      CALL cp_cfm_gemm('C', 'N', nmo, nmo, nao, cone, xmos, sxmos, czero, overlap)
+      CALL cp_cfm_heevd(overlap, eigvecs, eigenvalues)
+
+      DO icol = 1, nmo
+         theta = SQRT(MAX(eigenvalues(icol), 0.0_dp))
+         col_scaling(icol) = CMPLX(COS(theta), 0.0_dp, KIND=dp)
+      END DO
+      CALL cp_cfm_to_cfm(eigvecs, small_work)
+      CALL cp_cfm_column_scale(small_work, col_scaling)
+      CALL cp_cfm_gemm('N', 'C', nmo, nmo, nmo, cone, small_work, eigvecs, czero, cosmat)
+
+      DO icol = 1, nmo
+         theta = SQRT(MAX(eigenvalues(icol), 0.0_dp))
+         IF (theta > 1.0E-12_dp) THEN
+            col_scaling(icol) = CMPLX(SIN(theta)/theta, 0.0_dp, KIND=dp)
+         ELSE
+            col_scaling(icol) = CMPLX(1.0_dp, 0.0_dp, KIND=dp)
+         END IF
+      END DO
+      CALL cp_cfm_to_cfm(eigvecs, small_work)
+      CALL cp_cfm_column_scale(small_work, col_scaling)
+      CALL cp_cfm_gemm('N', 'C', nmo, nmo, nmo, cone, small_work, eigvecs, czero, sincmat)
+
+      ! Trial STRICT/TOD transformation: C = C0*cos(P^1/2) + X*sinc(P^1/2).
+      CALL cp_cfm_gemm('N', 'N', nao, nmo, nmo, cone, cmos, cosmat, czero, cnew)
+      CALL cp_cfm_gemm('N', 'N', nao, nmo, nmo, cone, xmos, sincmat, cone, cnew)
+
+      CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, csmat, cnew, czero, scnew)
+      CALL cp_cfm_gemm('C', 'N', nmo, nmo, nao, cone, cnew, scnew, czero, overlap)
+      CALL cp_cfm_get_info(overlap, nrow_local=nrow_local, ncol_local=ncol_local, &
+                           row_indices=row_indices, col_indices=col_indices, &
+                           local_data=overlap_local, para_env=para_env)
+      DO icol = 1, ncol_local
+         DO irow = 1, nrow_local
+            IF (row_indices(irow) == col_indices(icol)) THEN
+               local_deviation = MAX(local_deviation, ABS(overlap_local(irow, icol) - cone))
+            ELSE
+               local_deviation = MAX(local_deviation, ABS(overlap_local(irow, icol)))
+            END IF
+         END DO
+      END DO
+      CALL para_env%max(local_deviation)
+      max_deviation = MAX(max_deviation, local_deviation)
+      IF (PRESENT(cnew_out)) CALL cp_cfm_to_cfm(cnew, cnew_out)
+
+      DEALLOCATE (col_scaling, eigenvalues)
+      CALL cp_cfm_release(sincmat)
+      CALL cp_cfm_release(cosmat)
+      CALL cp_cfm_release(small_work)
+      CALL cp_cfm_release(eigvecs)
+      CALL cp_cfm_release(overlap)
+      CALL cp_cfm_release(scnew)
+      CALL cp_cfm_release(cnew)
+      CALL cp_cfm_release(sdxmos)
+      CALL cp_cfm_release(sxmos)
+      CALL cp_cfm_release(xmos)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE ot_kp_check_strict_retraction
 
 
 END MODULE qs_ot_kp

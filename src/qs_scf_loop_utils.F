@@ -397,10 +397,11 @@ CONTAINS
                                     diis_step, diis_error, qs_env)
             scf_env%iter_method = "Init/OT-k"
          ELSE
-            scf_env%iter_method = "Zero/OT-k"
+            scf_env%iter_method = "Step/OT-k"
          END IF
          CALL ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env, &
                               initial_state=(scf_env%iter_count == 1), &
+                              do_update=(scf_env%iter_count > 1), &
                               gradient_norm=ot_kp_gradient_norm)
          scf_env%iter_param = ot_kp_gradient_norm
          CALL qs_scf_update_density_kp_ot(qs_env, scf_env, kpoints, matrix_s)
