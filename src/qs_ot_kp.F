@@ -10,6 +10,7 @@
 ! **************************************************************************************************
 MODULE qs_ot_kp
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_gemm,&
+                                              cp_cfm_scale_and_add,&
                                               cp_cfm_scale_and_add_fm
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
@@ -65,7 +66,8 @@ MODULE qs_ot_kp
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ot_kp'
    REAL(KIND=dp), PARAMETER, PRIVATE    :: eps_ortho_check = 1.0E-8_dp, &
-                                             eps_hamiltonian_check = 1.0E-6_dp
+                                             eps_hamiltonian_check = 1.0E-6_dp, &
+                                             eps_tangent_check = 1.0E-8_dp
 
    PUBLIC :: ot_scf_mini_kp
 
@@ -88,8 +90,10 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_mini_kp'
 
       INTEGER                                            :: handle
-      REAL(KIND=dp)                                      :: max_deviation, max_eval_deviation, &
-                                                            max_offdiag, max_residual
+      REAL(KIND=dp)                                      :: max_deviation, max_descent_deviation, &
+                                                            max_eval_deviation, max_gradient_norm, &
+                                                            max_offdiag, max_residual, &
+                                                            max_tangent_deviation
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
 
       CALL timeset(routineN, handle)
@@ -109,13 +113,19 @@ CONTAINS
       ! Rebuild H(k), apply it to the initialized MOs, and verify that C(k)^H H(k) C(k)
       ! is consistent with the eigenvalues produced by the initialization diagonalization.
       CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, max_offdiag, &
-                                      max_eval_deviation, max_residual)
-      IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check) THEN
+                                      max_eval_deviation, max_residual, max_tangent_deviation, &
+                                      max_gradient_norm, max_descent_deviation)
+      IF (MAX(max_offdiag, max_eval_deviation, max_residual) > eps_hamiltonian_check .OR. &
+          max_tangent_deviation > eps_tangent_check .OR. &
+          max_descent_deviation > eps_tangent_check) THEN
          CALL cp_abort(__LOCATION__, &
-                       "KP code: initial OT-k Hamiltonian check failed; max offdiag = "// &
+                       "KP code: initial OT-k Hamiltonian/gradient check failed; max offdiag = "// &
                        cp_to_string(max_offdiag)//", max eval deviation = "// &
                        cp_to_string(max_eval_deviation)//", max residual = "// &
-                       cp_to_string(max_residual))
+                       cp_to_string(max_residual)//", max |C^H G| = "// &
+                       cp_to_string(max_tangent_deviation)//", max gradient norm = "// &
+                       cp_to_string(max_gradient_norm)//", max descent deviation = "// &
+                       cp_to_string(max_descent_deviation))
       END IF
 
       CALL timestop(handle)
@@ -280,22 +290,27 @@ CONTAINS
 !> \param kpoints            k-point environment
 !> \param max_offdiag        maximum absolute off-diagonal element of C^H H C
 !> \param max_eval_deviation maximum absolute deviation between diag(C^H H C) and eigenvalues
-!> \param max_residual       maximum absolute residual of H C - S C (C^H H C)
+!> \param max_residual          maximum absolute residual of H C - S C (C^H H C)
+!> \param max_tangent_deviation maximum absolute deviation of C^H G from zero
+!> \param max_gradient_norm     maximum Frobenius norm of the tentative tangent gradient
+!> \param max_descent_deviation maximum deviation of <G,-G> from -||G||^2
 ! **************************************************************************************************
    SUBROUTINE ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, max_offdiag, &
-                                      max_eval_deviation, max_residual)
+                                      max_eval_deviation, max_residual, max_tangent_deviation, &
+                                      max_gradient_norm, max_descent_deviation)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
       REAL(KIND=dp), INTENT(OUT)                         :: max_offdiag, max_eval_deviation, &
-                                                            max_residual
+                                                            max_residual, max_tangent_deviation, &
+                                                            max_gradient_norm, max_descent_deviation
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_kp_check_hamiltonian'
       COMPLEX(KIND=dp), PARAMETER                        :: cone = (1.0_dp, 0.0_dp), &
                                                             czero = (0.0_dp, 0.0_dp)
 
-      COMPLEX(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: h_local, r_local
+      COMPLEX(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: d_local, g_local, h_local, r_local
       INTEGER                                            :: handle, icol, igroup, ik, ikp, &
                                                             indx, ispin, irow, kplocal, &
                                                             nao, ncol_local, nmo, &
@@ -306,11 +321,13 @@ CONTAINS
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       LOGICAL                                            :: my_kpgrp, use_real_wfn
-      REAL(KIND=dp)                                      :: eval_dev_local, offdiag_local, residual_local
+      REAL(KIND=dp)                                      :: descent_dev_local, descent_local, eval_dev_local, &
+                                                            gradient_norm_local, gradient_norm_sq_local, &
+                                                            offdiag_local, residual_local, tangent_local
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
       TYPE(copy_info_type), ALLOCATABLE, DIMENSION(:, :) :: info
-      TYPE(cp_cfm_type)                                  :: cksmat, cmos, csmat, hcmos, hsmall, scmos
+      TYPE(cp_cfm_type)                                  :: cksmat, cmos, csmat, dxmos, gsmall, hcmos, hsmall, scmos
       TYPE(cp_fm_pool_p_type), DIMENSION(:), POINTER     :: ao_ao_fm_pools
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct, mo_struct
       TYPE(cp_fm_type)                                   :: fmdummy, fmlocal, rksmat, rsmat
@@ -329,6 +346,9 @@ CONTAINS
       max_offdiag = 0.0_dp
       max_eval_deviation = 0.0_dp
       max_residual = 0.0_dp
+      max_tangent_deviation = 0.0_dp
+      max_gradient_norm = 0.0_dp
+      max_descent_deviation = 0.0_dp
 
       CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, use_real_wfn=use_real_wfn, kp_range=kp_range, &
                            nkp_groups=nkp_groups, kp_dist=kp_dist, sab_nl=sab_nl, &
@@ -448,6 +468,8 @@ CONTAINS
             CALL cp_cfm_create(hcmos, mo_struct)
             CALL cp_cfm_create(scmos, mo_struct)
             CALL cp_cfm_create(hsmall, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+            CALL cp_cfm_create(gsmall, mo_struct, nrow=nmo, ncol=nmo, set_zero=.TRUE.)
+            CALL cp_cfm_create(dxmos, mo_struct)
             CALL ot_kp_pack_mos(kp, ispin, use_real_wfn, cmos)
             CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, cksmat, cmos, czero, hcmos)
             CALL cp_cfm_gemm('N', 'N', nao, nmo, nao, cone, csmat, cmos, czero, scmos)
@@ -475,19 +497,56 @@ CONTAINS
             CALL cp_cfm_get_info(hcmos, nrow_local=nrow_local, ncol_local=ncol_local, &
                                  local_data=r_local, para_env=para_env)
             residual_local = 0.0_dp
+            gradient_norm_sq_local = 0.0_dp
             DO icol = 1, ncol_local
                DO irow = 1, nrow_local
                   residual_local = MAX(residual_local, ABS(r_local(irow, icol)))
+                  gradient_norm_sq_local = gradient_norm_sq_local + ABS(r_local(irow, icol))**2
+               END DO
+            END DO
+
+            ! Treat the residual as the first unpreconditioned tangent gradient candidate.
+            ! It should satisfy C^H G = 0 for the diagonalization-based initial state.
+            CALL cp_cfm_gemm('C', 'N', nmo, nmo, nao, cone, cmos, hcmos, czero, gsmall)
+            CALL cp_cfm_get_info(gsmall, nrow_local=nrow_local, ncol_local=ncol_local, &
+                                 local_data=g_local, para_env=para_env)
+            tangent_local = 0.0_dp
+            DO icol = 1, ncol_local
+               DO irow = 1, nrow_local
+                  tangent_local = MAX(tangent_local, ABS(g_local(irow, icol)))
+               END DO
+            END DO
+
+            ! The first steepest-descent direction would be D = -G.  Check the complex
+            ! inner-product convention that will later be used by CG and line search.
+            CALL cp_cfm_to_cfm(hcmos, dxmos)
+            CALL cp_cfm_scale_and_add(-cone, dxmos)
+            CALL cp_cfm_get_info(dxmos, nrow_local=nrow_local, ncol_local=ncol_local, &
+                                 local_data=d_local, para_env=para_env)
+            descent_local = 0.0_dp
+            DO icol = 1, ncol_local
+               DO irow = 1, nrow_local
+                  descent_local = descent_local + REAL(CONJG(r_local(irow, icol))*d_local(irow, icol), KIND=dp)
                END DO
             END DO
 
             CALL para_env%max(offdiag_local)
             CALL para_env%max(eval_dev_local)
             CALL para_env%max(residual_local)
+            CALL para_env%max(tangent_local)
+            CALL para_env%sum(gradient_norm_sq_local)
+            CALL para_env%sum(descent_local)
+            gradient_norm_local = SQRT(MAX(gradient_norm_sq_local, 0.0_dp))
+            descent_dev_local = ABS(descent_local + gradient_norm_sq_local)
             max_offdiag = MAX(max_offdiag, offdiag_local)
             max_eval_deviation = MAX(max_eval_deviation, eval_dev_local)
             max_residual = MAX(max_residual, residual_local)
+            max_tangent_deviation = MAX(max_tangent_deviation, tangent_local)
+            max_gradient_norm = MAX(max_gradient_norm, gradient_norm_local)
+            max_descent_deviation = MAX(max_descent_deviation, descent_dev_local)
 
+            CALL cp_cfm_release(dxmos)
+            CALL cp_cfm_release(gsmall)
             CALL cp_cfm_release(hsmall)
             CALL cp_cfm_release(scmos)
             CALL cp_cfm_release(hcmos)
@@ -518,6 +577,9 @@ CONTAINS
          CALL kpoints%para_env_inter_kp%max(max_offdiag)
          CALL kpoints%para_env_inter_kp%max(max_eval_deviation)
          CALL kpoints%para_env_inter_kp%max(max_residual)
+         CALL kpoints%para_env_inter_kp%max(max_tangent_deviation)
+         CALL kpoints%para_env_inter_kp%max(max_gradient_norm)
+         CALL kpoints%para_env_inter_kp%max(max_descent_deviation)
       END IF
 
       CALL dbcsr_deallocate_matrix(rmatrix)
