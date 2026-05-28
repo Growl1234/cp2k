@@ -42,6 +42,7 @@ MODULE qs_ot_kp_types
       INTEGER :: kplocal = -1
       INTEGER :: nspin = -1
       LOGICAL :: has_history = .FALSE.
+      LOGICAL :: needs_baseline = .FALSE.
       REAL(KIND=dp) :: gnorm = -1.0_dp
       REAL(KIND=dp) :: gnorm_old = -1.0_dp
       REAL(KIND=dp) :: step_size = 1.0E-4_dp

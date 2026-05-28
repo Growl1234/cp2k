@@ -103,6 +103,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_mini_kp'
 
       INTEGER                                            :: handle
+      LOGICAL                                            :: baseline_pass, do_trial_update
       REAL(KIND=dp)                                      :: max_deviation, max_descent_deviation, &
                                                             max_eval_deviation, max_gradient_norm, &
                                                             max_offdiag, max_residual, &
@@ -129,17 +130,28 @@ CONTAINS
       ! The residual is stored as the first persistent unpreconditioned gradient candidate.
       CALL ot_kp_ensure_env(scf_env%qs_ot_kp_env, kpoints)
       step_size = scf_env%qs_ot_kp_env%step_size
+      baseline_pass = .FALSE.
+      IF (initial_state) THEN
+         ! The diagonalization-based initialization only defines the starting subspace.
+         ! The next inner-SCF pass is used as the first baseline evaluation before
+         ! any k-point OT trial step is written back.
+         scf_env%qs_ot_kp_env%needs_baseline = .TRUE.
+      ELSE IF (scf_env%qs_ot_kp_env%needs_baseline) THEN
+         baseline_pass = .TRUE.
+         scf_env%qs_ot_kp_env%needs_baseline = .FALSE.
+      END IF
+      do_trial_update = do_update .AND. (.NOT. initial_state) .AND. (.NOT. baseline_pass)
       IF (scf_env%qs_ot_kp_env%gnorm >= 0.0_dp) THEN
          scf_env%qs_ot_kp_env%gnorm_old = scf_env%qs_ot_kp_env%gnorm
          scf_env%qs_ot_kp_env%has_history = .TRUE.
       END IF
-      CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, scf_env%qs_ot_kp_env, do_update, &
+      CALL ot_kp_check_hamiltonian(matrix_ks, matrix_s, kpoints, fmwork, scf_env%qs_ot_kp_env, do_trial_update, &
                                       step_size, max_offdiag, max_eval_deviation, max_residual, &
                                       max_tangent_deviation, max_gradient_norm, max_descent_deviation, max_strict_deviation)
       gradient_norm = max_gradient_norm
       scf_env%qs_ot_kp_env%gnorm = max_gradient_norm
       scf_env%qs_ot_kp_env%last_step_size = step_size
-      IF (do_update .AND. scf_env%qs_ot_kp_env%has_history .AND. &
+      IF (do_trial_update .AND. scf_env%qs_ot_kp_env%has_history .AND. &
           max_gradient_norm > scf_env%qs_ot_kp_env%gnorm_old) THEN
          scf_env%qs_ot_kp_env%step_size = MAX(0.5_dp*scf_env%qs_ot_kp_env%step_size, &
                                               ot_kp_min_step)
@@ -170,9 +182,8 @@ CONTAINS
                        cp_to_string(max_strict_deviation))
       END IF
 
-      ! No orbital update is performed yet. This scaffold intentionally returns after
-      ! checking the current k-point OT objects, so that the SCF driver can rebuild
-      ! the density matrix and exercise the full k-point OT control flow.
+      ! Return after the current checks and, except for the initialization and the
+      ! first baseline pass, after writing one trial STRICT step back to the k-point MOs.
       CALL timestop(handle)
 
    END SUBROUTINE ot_scf_mini_kp
@@ -206,6 +217,7 @@ CONTAINS
       ot_kp_env%kplocal = kplocal
       ot_kp_env%nspin = nspin
       ot_kp_env%has_history = .FALSE.
+      ot_kp_env%needs_baseline = .FALSE.
       ot_kp_env%gnorm = -1.0_dp
       ot_kp_env%gnorm_old = -1.0_dp
       ot_kp_env%step_size = ot_kp_default_step
