@@ -15,12 +15,16 @@ MODULE qs_scf_loop_utils
                                               dbcsr_p_type,&
                                               dbcsr_type
    USE cp_external_control,             ONLY: external_control
+   USE cp_fm_types,                     ONLY: cp_fm_type
    USE cp_log_handling,                 ONLY: cp_to_string
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_string_length,&
                                               dp
-   USE kpoint_methods,                  ONLY: kpoint_set_mo_occupation_fixed
-   USE kpoint_types,                    ONLY: kpoint_type
+   USE kpoint_methods,                  ONLY: kpoint_density_matrices,&
+                                              kpoint_density_transform,&
+                                              kpoint_set_mo_occupation_fixed
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE qs_density_matrices,             ONLY: calculate_density_matrix
    USE qs_density_mixing_types,         ONLY: broyden_mixing_nr,&
@@ -39,6 +43,7 @@ MODULE qs_scf_loop_utils
    USE qs_ks_types,                     ONLY: qs_ks_did_change,&
                                               qs_ks_env_type
    USE qs_mixing_utils,                 ONLY: self_consistency_check
+   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_mo_occupation,                ONLY: set_mo_occupation
    USE qs_mo_types,                     ONLY: mo_set_type
    USE qs_mom_methods,                  ONLY: do_mom_diag
@@ -325,17 +330,21 @@ CONTAINS
       INTEGER                                            :: handle, ispin
       LOGICAL                                            :: disable_diis, has_unit_metric
       REAL(dp)                                           :: diis_error, saved_eps_diis
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s, rho_ao_kp
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mo_set_type), DIMENSION(:, :), POINTER        :: mos
       TYPE(qs_energy_type), POINTER                      :: energy
+      TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_nl
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (dft_control, kpoints, matrix_ks, matrix_s)
+      NULLIFY (dft_control, kpoints, matrix_ks, matrix_s, rho, rho_ao_kp, sab_nl, fmwork)
 
-      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, kpoints=kpoints)
+      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, kpoints=kpoints, rho=rho)
       scf_env%iter_param = 0.0_dp
       disable_diis = dft_control%qs_control%xtb_control%do_tblite .AND. &
                      tb_native_scc_mixer_active(dft_control)
@@ -390,9 +399,16 @@ CONTAINS
             CALL do_general_diag_kp(matrix_ks, matrix_s, kpoints, scf_env, scf_control, .FALSE., &
                                     diis_step, diis_error, qs_env)
             CALL kpoint_set_mo_occupation_fixed(kpoints)
+            CALL kpoint_density_matrices(kpoints)
+            CALL qs_rho_get(rho, rho_ao_kp=rho_ao_kp)
+            CALL get_kpoint_info(kpoints, sab_nl=sab_nl)
+            fmwork => scf_env%scf_work1
+            CALL kpoint_density_transform(kpoints, rho_ao_kp, .FALSE., &
+                                          matrix_s(1, 1)%matrix, sab_nl, fmwork)
             scf_env%iter_method = "Init/OT-k"
          END IF
          CALL ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env)
+         scf_env%iter_method = "Zero/OT-k"
       CASE (ot_diag_method_nr, &
             block_krylov_diag_method_nr, &
             block_davidson_diag_method_nr)
@@ -761,10 +777,13 @@ CONTAINS
 
       SELECT CASE (scf_env%method)
       CASE (ot_method_nr)
-         DO ispin = 1, SIZE(scf_env%qs_ot_env)
-            CALL ot_scf_destroy(scf_env%qs_ot_env(ispin))
-         END DO
-         DEALLOCATE (scf_env%qs_ot_env)
+         IF (ASSOCIATED(scf_env%qs_ot_env)) THEN
+            DO ispin = 1, SIZE(scf_env%qs_ot_env)
+               CALL ot_scf_destroy(scf_env%qs_ot_env(ispin))
+            END DO
+            DEALLOCATE (scf_env%qs_ot_env)
+            NULLIFY (scf_env%qs_ot_env)
+         END IF
       CASE (ot_diag_method_nr)
          !
       CASE (general_diag_method_nr)

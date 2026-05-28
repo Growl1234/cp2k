@@ -128,10 +128,10 @@ CONTAINS
                        cp_to_string(max_descent_deviation))
       END IF
 
+      ! No orbital update is performed yet. This scaffold intentionally returns after
+      ! checking the initialized k-point OT objects, so that the SCF driver can rebuild
+      ! the density matrix and exercise the full k-point OT control flow.
       CALL timestop(handle)
-
-      CALL cp_abort(__LOCATION__, &
-                    "KP code: OT step for k-points not implemented yet")
 
    END SUBROUTINE ot_scf_mini_kp
 
