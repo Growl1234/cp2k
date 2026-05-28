@@ -174,6 +174,11 @@ MODULE qs_ot_types
       REAL(KIND=dp)    :: ds_min = -1.0_dp
       REAL(KIND=dp)    :: broyden_adaptive_sigma = -1.0_dp
 
+      ! TRUE after qs_ot_allocate has created the Gamma-point OT work arrays.
+      ! K-point OT reuses qs_ot_env only for reading settings/output, so it must
+      ! remain safe to destroy a settings-only object.
+      LOGICAL          :: workspace_initialized = .FALSE.
+
       LOGICAL          :: do_taylor = .FALSE.
       INTEGER          :: taylor_order = -1
       REAL(KIND=dp)    :: largest_eval_upper_bound = -1.0_dp
@@ -362,6 +367,7 @@ CONTAINS
 
       ALLOCATE (qs_ot_env%evals(k))
       ALLOCATE (qs_ot_env%dum(k))
+      qs_ot_env%workspace_initialized = .TRUE.
 
       NULLIFY (qs_ot_env%matrix_os)
       NULLIFY (qs_ot_env%matrix_buf1_ortho)
@@ -639,6 +645,8 @@ CONTAINS
    SUBROUTINE qs_ot_destroy(qs_ot_env)
       TYPE(qs_ot_type)                                   :: qs_ot_env
 
+      IF (.NOT. qs_ot_env%workspace_initialized) RETURN
+
       CALL mp_para_env_release(qs_ot_env%para_env)
       CALL cp_blacs_env_release(qs_ot_env%blacs_env)
 
@@ -724,6 +732,7 @@ CONTAINS
             DEALLOCATE (qs_ot_env%ener_gx_old)
          END IF
       END IF
+      qs_ot_env%workspace_initialized = .FALSE.
 
    END SUBROUTINE qs_ot_destroy
 

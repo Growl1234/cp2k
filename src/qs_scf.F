@@ -845,35 +845,32 @@ CONTAINS
       CASE (block_davidson_diag_method_nr)
          ! Preconditioner initialized within the loop, when required
       CASE (ot_method_nr)
-         IF (do_kpoints) THEN
-            ! K-point OT uses a separate initialization path in qs_scf_new_mos_kp.
-            ! The Gamma-point OT setup below requests 1D matrix pointers and sparse
-            ! MO representations, which are intentionally unavailable for k-points.
-         ELSE
+         IF (.NOT. do_kpoints) THEN
             CALL get_qs_env(qs_env, &
                             has_unit_metric=has_unit_metric, &
                             matrix_s=matrix_s, &
                             matrix_ks=matrix_ks)
 
-         ! reortho the wavefunctions if we are having an outer scf and
-         ! this is not the first iteration
-         ! this is useful to avoid the build-up of numerical noise
-         ! however, we can not play this trick if restricted (don't mix non-equivalent orbs)
-         IF (scf_control%do_outer_scf_reortho) THEN
-            IF (scf_control%outer_scf%have_scf .AND. .NOT. dft_control%restricted) THEN
-               IF (scf_env%outer_scf%iter_count > 0) THEN
-                  DO ispin = 1, dft_control%nspins
-                     CALL get_mo_set(mo_set=mos(ispin), mo_coeff=mo_coeff, nmo=nmo)
-                     IF (has_unit_metric) THEN
-                        CALL make_basis_simple(mo_coeff, nmo)
-                     ELSE
-                        CALL make_basis_sm(mo_coeff, nmo, matrix_s(1)%matrix)
-                     END IF
-                  END DO
+            ! reortho the wavefunctions if we are having an outer scf and
+            ! this is not the first iteration
+            ! this is useful to avoid the build-up of numerical noise
+            ! however, we can not play this trick if restricted (don't mix non-equivalent orbs)
+            IF (scf_control%do_outer_scf_reortho) THEN
+               IF (scf_control%outer_scf%have_scf .AND. .NOT. dft_control%restricted) THEN
+                  IF (scf_env%outer_scf%iter_count > 0) THEN
+                     DO ispin = 1, dft_control%nspins
+                        CALL get_mo_set(mo_set=mos(ispin), mo_coeff=mo_coeff, nmo=nmo)
+                        IF (has_unit_metric) THEN
+                           CALL make_basis_simple(mo_coeff, nmo)
+                        ELSE
+                           CALL make_basis_sm(mo_coeff, nmo, matrix_s(1)%matrix)
+                        END IF
+                     END DO
+                  END IF
                END IF
+            ELSE
+               ! dont need any dirty trick for the numerically stable irac algorithm.
             END IF
-         ELSE
-            ! dont need any dirty trick for the numerically stable irac algorithm.
          END IF
 
          IF (.NOT. ASSOCIATED(scf_env%qs_ot_env)) THEN
@@ -900,82 +897,85 @@ CONTAINS
                END IF
             END IF
 
-            ! keep a note that we are restricted
-            IF (dft_control%restricted) THEN
-               scf_env%qs_ot_env(1)%restricted = .TRUE.
-               ! requires rotation
-               IF (.NOT. scf_env%qs_ot_env(1)%settings%do_rotation) &
-                  CALL cp_abort(__LOCATION__, &
-                                "Restricted calculation with OT requires orbital rotation. Please "// &
-                                "activate the OT%ROTATION keyword!")
-            ELSE
-               scf_env%qs_ot_env(:)%restricted = .FALSE.
+            IF (.NOT. do_kpoints) THEN
+               ! keep a note that we are restricted
+               IF (dft_control%restricted) THEN
+                  scf_env%qs_ot_env(1)%restricted = .TRUE.
+                  ! requires rotation
+                  IF (.NOT. scf_env%qs_ot_env(1)%settings%do_rotation) &
+                     CALL cp_abort(__LOCATION__, &
+                                   "Restricted calculation with OT requires orbital rotation. Please "// &
+                                   "activate the OT%ROTATION keyword!")
+               ELSE
+                  scf_env%qs_ot_env(:)%restricted = .FALSE.
+               END IF
+
+               ! this will rotate the MOs to be eigen states, which is not compatible with rotation
+               ! e.g. mo_derivs here do not yet include potentially different occupations numbers
+               do_rotation = scf_env%qs_ot_env(1)%settings%do_rotation
+               ! only full all needs rotation
+               is_full_all = scf_env%qs_ot_env(1)%settings%preconditioner_type == ot_precond_full_all
+               IF (do_rotation .AND. is_full_all) &
+                  CPABORT('PRECONDITIONER FULL_ALL is not compatible with ROTATION.')
+
+               ! might need the KS matrix to init properly
+               CALL qs_ks_update_qs_env(qs_env, just_energy=.FALSE., &
+                                        calculate_forces=.FALSE.)
+
+               ! if an old preconditioner is still around (i.e. outer SCF is active),
+               ! remove it if this could be worthwhile
+               IF (.NOT. reuse_precond) &
+                  CALL restart_preconditioner(qs_env, scf_env%ot_preconditioner, &
+                                              scf_env%qs_ot_env(1)%settings%preconditioner_type, &
+                                              dft_control%nspins)
+
+               !
+               ! preconditioning still needs to be done correctly with has_unit_metric
+               ! notice that a big part of the preconditioning (S^-1) is fine anyhow
+               !
+               IF (has_unit_metric) THEN
+                  NULLIFY (orthogonality_metric)
+               ELSE
+                  orthogonality_metric => matrix_s(1)%matrix
+               END IF
+
+               IF (.NOT. reuse_precond) &
+                  CALL prepare_preconditioner(qs_env, mos, matrix_ks, matrix_s, scf_env%ot_preconditioner, &
+                                              scf_env%qs_ot_env(1)%settings%preconditioner_type, &
+                                              scf_env%qs_ot_env(1)%settings%precond_solver_type, &
+                                              scf_env%qs_ot_env(1)%settings%energy_gap, dft_control%nspins, &
+                                              has_unit_metric=has_unit_metric, &
+                                              chol_type=scf_env%qs_ot_env(1)%settings%cholesky_type)
+               IF (reuse_precond) reuse_precond = .FALSE.
+
+               CALL ot_scf_init(mo_array=mos, matrix_s=orthogonality_metric, &
+                                broyden_adaptive_sigma=qs_env%broyden_adaptive_sigma, &
+                                qs_ot_env=scf_env%qs_ot_env, matrix_ks=matrix_ks(1)%matrix)
+
+               SELECT CASE (scf_env%qs_ot_env(1)%settings%preconditioner_type)
+               CASE (ot_precond_none)
+               CASE (ot_precond_full_all, ot_precond_full_single_inverse)
+                  DO ispin = 1, SIZE(scf_env%qs_ot_env)
+                     CALL qs_ot_new_preconditioner(scf_env%qs_ot_env(ispin), &
+                                                   scf_env%ot_preconditioner(ispin)%preconditioner)
+                  END DO
+               CASE (ot_precond_s_inverse, ot_precond_full_single)
+                  DO ispin = 1, SIZE(scf_env%qs_ot_env)
+                     CALL qs_ot_new_preconditioner(scf_env%qs_ot_env(ispin), &
+                                                   scf_env%ot_preconditioner(1)%preconditioner)
+                  END DO
+               CASE DEFAULT
+                  DO ispin = 1, SIZE(scf_env%qs_ot_env)
+                     CALL qs_ot_new_preconditioner(scf_env%qs_ot_env(ispin), &
+                                                   scf_env%ot_preconditioner(1)%preconditioner)
+                  END DO
+               END SELECT
             END IF
-
-            ! this will rotate the MOs to be eigen states, which is not compatible with rotation
-            ! e.g. mo_derivs here do not yet include potentially different occupations numbers
-            do_rotation = scf_env%qs_ot_env(1)%settings%do_rotation
-            ! only full all needs rotation
-            is_full_all = scf_env%qs_ot_env(1)%settings%preconditioner_type == ot_precond_full_all
-            IF (do_rotation .AND. is_full_all) &
-               CPABORT('PRECONDITIONER FULL_ALL is not compatible with ROTATION.')
-
-            ! might need the KS matrix to init properly
-            CALL qs_ks_update_qs_env(qs_env, just_energy=.FALSE., &
-                                     calculate_forces=.FALSE.)
-
-            ! if an old preconditioner is still around (i.e. outer SCF is active),
-            ! remove it if this could be worthwhile
-            IF (.NOT. reuse_precond) &
-               CALL restart_preconditioner(qs_env, scf_env%ot_preconditioner, &
-                                           scf_env%qs_ot_env(1)%settings%preconditioner_type, &
-                                           dft_control%nspins)
-
-            !
-            ! preconditioning still needs to be done correctly with has_unit_metric
-            ! notice that a big part of the preconditioning (S^-1) is fine anyhow
-            !
-            IF (has_unit_metric) THEN
-               NULLIFY (orthogonality_metric)
-            ELSE
-               orthogonality_metric => matrix_s(1)%matrix
-            END IF
-
-            IF (.NOT. reuse_precond) &
-               CALL prepare_preconditioner(qs_env, mos, matrix_ks, matrix_s, scf_env%ot_preconditioner, &
-                                           scf_env%qs_ot_env(1)%settings%preconditioner_type, &
-                                           scf_env%qs_ot_env(1)%settings%precond_solver_type, &
-                                           scf_env%qs_ot_env(1)%settings%energy_gap, dft_control%nspins, &
-                                           has_unit_metric=has_unit_metric, &
-                                           chol_type=scf_env%qs_ot_env(1)%settings%cholesky_type)
-            IF (reuse_precond) reuse_precond = .FALSE.
-
-            CALL ot_scf_init(mo_array=mos, matrix_s=orthogonality_metric, &
-                             broyden_adaptive_sigma=qs_env%broyden_adaptive_sigma, &
-                             qs_ot_env=scf_env%qs_ot_env, matrix_ks=matrix_ks(1)%matrix)
-
-            SELECT CASE (scf_env%qs_ot_env(1)%settings%preconditioner_type)
-            CASE (ot_precond_none)
-            CASE (ot_precond_full_all, ot_precond_full_single_inverse)
-               DO ispin = 1, SIZE(scf_env%qs_ot_env)
-                  CALL qs_ot_new_preconditioner(scf_env%qs_ot_env(ispin), &
-                                                scf_env%ot_preconditioner(ispin)%preconditioner)
-               END DO
-            CASE (ot_precond_s_inverse, ot_precond_full_single)
-               DO ispin = 1, SIZE(scf_env%qs_ot_env)
-                  CALL qs_ot_new_preconditioner(scf_env%qs_ot_env(ispin), &
-                                                scf_env%ot_preconditioner(1)%preconditioner)
-               END DO
-            CASE DEFAULT
-               DO ispin = 1, SIZE(scf_env%qs_ot_env)
-                  CALL qs_ot_new_preconditioner(scf_env%qs_ot_env(ispin), &
-                                                scf_env%ot_preconditioner(1)%preconditioner)
-               END DO
-            END SELECT
          END IF
 
-         ! if we have non-uniform occupations we should be using rotation
-         do_rotation = scf_env%qs_ot_env(1)%settings%do_rotation
+         IF (.NOT. do_kpoints) THEN
+            ! if we have non-uniform occupations we should be using rotation
+            do_rotation = scf_env%qs_ot_env(1)%settings%do_rotation
             DO ispin = 1, SIZE(mos)
                IF (.NOT. mos(ispin)%uniform_occupation) THEN
                   CPASSERT(do_rotation)

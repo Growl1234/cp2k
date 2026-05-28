@@ -912,15 +912,15 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_scf_check_ot_kpoints_supported'
 
       INTEGER                                            :: handle
-      LOGICAL                                            :: full_grid
+      LOGICAL                                            :: full_grid, symmetry
 
       CALL timeset(routineN, handle)
 
       CPASSERT(ASSOCIATED(kpoints))
-      CALL get_kpoint_info(kpoints, full_grid=full_grid)
+      CALL get_kpoint_info(kpoints, full_grid=full_grid, symmetry=symmetry)
 
-      IF (.NOT. full_grid) &
-         CPABORT("OT with k-points currently requires a full k-point grid")
+      IF (symmetry .AND. .NOT. full_grid) &
+         CPABORT("OT with k-points does not support symmetry reduction")
       IF (scf_control%diagonalization%ot_settings%ot_algorithm /= "TOD") &
          CPABORT("OT with k-points currently supports only ALGORITHM STRICT")
       IF (scf_control%diagonalization%ot_settings%ot_method /= "CG") &

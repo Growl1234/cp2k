@@ -336,7 +336,7 @@ CONTAINS
       LOGICAL                                            :: do_mixing, explicit
       REAL(KIND=dp), DIMENSION(:), POINTER               :: roks_parameter
       TYPE(section_vals_type), POINTER                   :: gce_section, mixing_section, &
-                                                            outer_scf_section, scf_section, &
+                                                            ot_section, outer_scf_section, scf_section, &
                                                             smear_section
 
       CALL timeset(routineN, handle)
@@ -368,6 +368,9 @@ CONTAINS
          IF (explicit) THEN
             CALL section_vals_val_get(scf_section, "EPS_DIIS", r_val=scf_control%eps_diis)
          END IF
+
+         ot_section => section_vals_get_subs_vals(scf_section, "OT")
+         CALL ot_readwrite_input(scf_control%diagonalization%ot_settings, ot_section, -1)
       ELSE
          CALL section_vals_val_get(scf_section, "EPS_DIIS", r_val=scf_control%eps_diis)
       END IF

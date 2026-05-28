@@ -395,9 +395,9 @@ CONTAINS
          IF (scf_env%iter_count == 1) THEN
             CALL do_general_diag_kp(matrix_ks, matrix_s, kpoints, scf_env, scf_control, .FALSE., &
                                     diis_step, diis_error, qs_env)
-            scf_env%iter_method = "Init/OT-k"
+            scf_env%iter_method = "OT CG"
          ELSE
-            scf_env%iter_method = "Step/OT-k"
+            scf_env%iter_method = "OT CG"
          END IF
          CALL ot_scf_mini_kp(matrix_ks, matrix_s, kpoints, scf_env, &
                               initial_state=(scf_env%iter_count == 1), &
