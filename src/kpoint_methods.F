@@ -1587,8 +1587,6 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: pmat_diag
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'lowdin_kp_trans'
-      COMPLEX(KIND=dp), PARAMETER                        :: cone = (1.0_dp, 0.0_dp), &
-                                                            czero = (0.0_dp, 0.0_dp)
 
       INTEGER                                            :: handle, ikpgr, ispin, kplocal, nao, nspin
       INTEGER, DIMENSION(2)                              :: kp_range
@@ -1627,18 +1625,16 @@ CONTAINS
             IF (kpoint%use_real_wfn) THEN
                pmat => kp%pmat(1, ispin)
                shalf => kp%shalf
-               CALL parallel_gemm("N", "N", nao, nao, nao, 1.0_dp, pmat, shalf, 0.0_dp, f1work)
-               CALL parallel_gemm("N", "N", nao, nao, nao, 1.0_dp, shalf, f1work, 0.0_dp, f2work)
+               CALL lowdin_kp_diag(use_real_wfn=kpoint%use_real_wfn, nao=nao, dele=dele, &
+                                   pmat=pmat, shalf=shalf, f1work=f1work, f2work=f2work)
             ELSE
                rpmat => kp%pmat(1, ispin)
                cpmat => kp%pmat(2, ispin)
                cshalf => kp%cshalf
-               CALL cp_fm_to_cfm(rpmat, cpmat, cf1work)
-               CALL parallel_gemm("N", "N", nao, nao, nao, cone, cf1work, cshalf, czero, cf2work)
-               CALL parallel_gemm("N", "N", nao, nao, nao, cone, cshalf, cf2work, czero, cf1work)
-               CALL cp_cfm_to_fm(cf1work, mtargetr=f2work)
+               CALL lowdin_kp_diag(use_real_wfn=kpoint%use_real_wfn, nao=nao, dele=dele, &
+                                   rpmat=rpmat, cpmat=cpmat, cshalf=cshalf, &
+                                   cf1work=cf1work, cf2work=cf2work, f2work=f2work)
             END IF
-            CALL cp_fm_get_diag(f2work, dele)
             pmat_diag(1:nao, ispin) = pmat_diag(1:nao, ispin) + kp%wkp*dele(1:nao)
          END DO
       END DO
@@ -1659,6 +1655,66 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE lowdin_kp_trans
+
+! **************************************************************************************************
+!> \brief Calculate the diagonal elements of S(k)^1/2 P(k) S(k)^1/2
+!> \param use_real_wfn Use real k-point wavefunctions
+!> \param nao          Number of atomic orbitals
+!> \param dele         Diagonal elements of the Lowdin-transformed density matrix
+!> \param pmat         Real density matrix P(k) for real wavefunctions
+!> \param shalf        Real S(k)^1/2 matrix
+!> \param f1work       Real work matrix
+!> \param f2work       Real work matrix and temporary target for the real part
+!> \param rpmat        Real part of P(k) for complex wavefunctions
+!> \param cpmat        Imaginary part of P(k) for complex wavefunctions
+!> \param cshalf       Complex S(k)^1/2 matrix
+!> \param cf1work      Complex work matrix
+!> \param cf2work      Complex work matrix
+! **************************************************************************************************
+   SUBROUTINE lowdin_kp_diag(use_real_wfn, nao, dele, pmat, shalf, f1work, f2work, &
+                             rpmat, cpmat, cshalf, cf1work, cf2work)
+
+      LOGICAL, INTENT(IN)                                :: use_real_wfn
+      INTEGER, INTENT(IN)                                :: nao
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: dele
+      TYPE(cp_cfm_type), OPTIONAL                        :: cf1work, cf2work
+      TYPE(cp_cfm_type), OPTIONAL, POINTER               :: cshalf
+      TYPE(cp_fm_type), OPTIONAL                         :: f1work, f2work
+      TYPE(cp_fm_type), OPTIONAL, POINTER                :: cpmat, pmat, rpmat, shalf
+
+      COMPLEX(KIND=dp), PARAMETER                        :: cone = (1.0_dp, 0.0_dp), &
+                                                            czero = (0.0_dp, 0.0_dp)
+
+      IF (use_real_wfn) THEN
+         CPASSERT(PRESENT(pmat))
+         CPASSERT(PRESENT(shalf))
+         CPASSERT(PRESENT(f1work))
+         CPASSERT(PRESENT(f2work))
+         CPASSERT(ASSOCIATED(pmat))
+         CPASSERT(ASSOCIATED(shalf))
+
+         CALL parallel_gemm("N", "N", nao, nao, nao, 1.0_dp, pmat, shalf, 0.0_dp, f1work)
+         CALL parallel_gemm("N", "N", nao, nao, nao, 1.0_dp, shalf, f1work, 0.0_dp, f2work)
+      ELSE
+         CPASSERT(PRESENT(rpmat))
+         CPASSERT(PRESENT(cpmat))
+         CPASSERT(PRESENT(cshalf))
+         CPASSERT(PRESENT(cf1work))
+         CPASSERT(PRESENT(cf2work))
+         CPASSERT(PRESENT(f2work))
+         CPASSERT(ASSOCIATED(rpmat))
+         CPASSERT(ASSOCIATED(cpmat))
+         CPASSERT(ASSOCIATED(cshalf))
+
+         CALL cp_fm_to_cfm(rpmat, cpmat, cf1work)
+         CALL parallel_gemm("N", "N", nao, nao, nao, cone, cf1work, cshalf, czero, cf2work)
+         CALL parallel_gemm("N", "N", nao, nao, nao, cone, cshalf, cf2work, czero, cf1work)
+         CALL cp_cfm_to_fm(cf1work, mtargetr=f2work)
+      END IF
+
+      CALL cp_fm_get_diag(f2work, dele)
+
+   END SUBROUTINE lowdin_kp_diag
 
 ! **************************************************************************************************
 !> \brief Calculate S(k)^1/2 C(k) for real or complex k-point wavefunctions
