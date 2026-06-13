@@ -59,7 +59,8 @@ MODULE dft_plus_u
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_string_length,&
                                               dp
-   USE kpoint_methods,                  ONLY: lowdin_kp_trans
+   USE kpoint_methods,                  ONLY: lowdin_kp_trans, &
+                                              lowdin_kp_trans_rs
    USE kpoint_types,                    ONLY: kpoint_type
    USE mathlib,                         ONLY: jacobi
    USE message_passing,                 ONLY: mp_para_env_type
@@ -312,13 +313,15 @@ CONTAINS
          IF (PRESENT(matrix_w)) THEN
             CPABORT("Lowdin DFT+U forces/stress with k-points NYA")
          END IF
-         ! Diagnostic only: evaluate the existing k-point Lowdin population
-         ! path, but do not use it to build a DFT+U energy or Hamiltonian.
+         ! Diagnostic path: evaluate the Lowdin occupations from the current
+         ! real-space density matrix used for the SCF build. The resulting
+         ! diagonal populations are used below to construct E_U and V_U, but
+         ! the k-point Hamiltonian update remains NYA.
          ALLOCATE (orbq(nsgf, nspin))
-         CALL lowdin_kp_trans(kpoints, orbq)
+         CALL lowdin_kp_trans_rs(kpoints, matrix_p, orbq, scf_env%scf_work1)
          IF (should_output .AND. output_unit > 0) THEN
             WRITE (UNIT=output_unit, FMT="(/,T3,A)") &
-               "LOWDIN DFT+U k-point occupation diagnostic"
+               "LOWDIN DFT+U k-point occupation diagnostic from rho_ao_kp"
             DO ispin = 1, nspin
                WRITE (UNIT=output_unit, FMT="(T3,A,I0,A,F18.10,A,F18.10,A,F18.10)") &
                   "Spin ", ispin, ": sum = ", SUM(orbq(:, ispin)), &
@@ -326,22 +329,17 @@ CONTAINS
                   ", max = ", MAXVAL(orbq(:, ispin))
             END DO
          END IF
-         DEALLOCATE (orbq)
-         IF (PRESENT(matrix_h)) THEN
-            CPABORT("Lowdin DFT+U Hamiltonian with k-points NYA")
-         END IF
-         CPABORT("Lowdin DFT+U energy with k-points NYA")
       ELSE
          ! Retrieve S^(1/2) from the SCF environment
          fm_s_half => scf_env%s_half
          CPASSERT(ASSOCIATED(fm_s_half))
          ! work matrices
          CALL cp_fm_get_info(fm_s_half, matrix_struct=fmstruct)
+         CALL cp_fm_create(matrix=fm_work1, matrix_struct=fmstruct, &
+                           name="FULL WORK MATRIX 1")
+         CALL cp_fm_create(matrix=fm_work2, matrix_struct=fmstruct, &
+                           name="FULL WORK MATRIX 2")
       END IF
-      CALL cp_fm_create(matrix=fm_work1, matrix_struct=fmstruct, &
-                        name="FULL WORK MATRIX 1")
-      CALL cp_fm_create(matrix=fm_work2, matrix_struct=fmstruct, &
-                        name="FULL WORK MATRIX 2")
 
       ! Calculate S eigenvectors and Lambda matrix for forces
       ! See sTDA forces (get_lowdin_mo_coefficients in qs_tddfpt2_stda_utils
@@ -392,7 +390,23 @@ CONTAINS
          CALL dbcsr_set(sm_v, 0.0_dp)
 
          IF (do_kpoints) THEN
-            CPABORT("Lowdin option with k-points NYA in DFT+U")
+            ! Reconstruct a sparse block-diagonal Lowdin occupation matrix from
+            ! the diagonal populations obtained in k-space. This keeps the
+            ! subsequent gamma-only E_U / V_U construction unchanged.
+            DO iatom = 1, natom
+               NULLIFY (q_block)
+               CALL dbcsr_get_block_p(matrix=sm_q, &
+                                      row=iatom, &
+                                      col=iatom, &
+                                      block=q_block, &
+                                      found=found)
+               IF (.NOT. ASSOCIATED(q_block)) CYCLE
+               j = first_sgf_atom(iatom)
+               DO isgf = 1, SIZE(q_block, 1)
+                  q_block(isgf, isgf) = orbq(j, ispin)
+                  j = j + 1
+               END DO
+            END DO
          ELSE
             ! Calculate S^(1/2)*P*S^(1/2) as a full matrix (Lowdin)
             sm_p => matrix_p(ispin, 1)%matrix
@@ -735,7 +749,7 @@ CONTAINS
          END DO ! next atomic kind "ikind"
 
          ! Add V(i,j)[U] to V(i,j)[DFT]
-         IF (PRESENT(matrix_h)) THEN
+         IF (PRESENT(matrix_h) .AND. (.NOT. do_kpoints)) THEN
             sm_h => matrix_h(ispin, 1)%matrix
             CALL cp_dbcsr_sm_fm_multiply(sm_v, fm_s_half, fm_work1, nsgf)
             CALL cp_fm_transpose(fm_work1, fm_work2)
@@ -773,15 +787,28 @@ CONTAINS
 
       CALL para_env%sum(energy%dft_plus_u)
 
+      IF (do_kpoints .AND. should_output .AND. output_unit > 0) THEN
+         WRITE (UNIT=output_unit, FMT="(T3,A,F18.10)") &
+            "LOWDIN DFT+U k-point energy diagnostic = ", energy%dft_plus_u
+      END IF
+
       IF (energy%dft_plus_u < 0.0_dp) &
          CALL cp_warn(__LOCATION__, &
                       "DFT+U energy contribution is negative possibly due "// &
                       "to unphysical Lowdin charges!")
 
+      IF (do_kpoints .AND. PRESENT(matrix_h)) THEN
+         CPABORT("Lowdin DFT+U Hamiltonian with k-points NYA")
+      END IF
+
       ! Release (local) full matrices
-      NULLIFY (fm_s_half)
-      CALL cp_fm_release(matrix=fm_work1)
-      CALL cp_fm_release(matrix=fm_work2)
+      IF (do_kpoints) THEN
+         DEALLOCATE (orbq)
+      ELSE
+         NULLIFY (fm_s_half)
+         CALL cp_fm_release(matrix=fm_work1)
+         CALL cp_fm_release(matrix=fm_work2)
+      END IF
 
       ! Release (local) sparse matrices
       CALL dbcsr_release(sm_q)

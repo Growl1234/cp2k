@@ -26,14 +26,15 @@ MODULE kpoint_methods
                                               cp_fm_to_cfm
    USE cp_control_types,                ONLY: hairy_probes_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_distribute, &
-        dbcsr_distribution_get, dbcsr_distribution_type, dbcsr_get_block_p, dbcsr_get_info, &
+        dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
+        dbcsr_distribute, dbcsr_distribution_get, dbcsr_distribution_type, dbcsr_get_block_p, dbcsr_get_info, &
         dbcsr_get_stored_coordinates, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
         dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, &
         dbcsr_replicate_all, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, &
         dbcsr_type_no_symmetry, dbcsr_type_symmetric
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations,             ONLY: copy_fm_to_dbcsr
+   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
+                                              copy_fm_to_dbcsr
    USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale
    USE cp_fm_pool_types,                ONLY: cp_fm_pool_p_type,&
                                               fm_pool_create_fm,&
@@ -105,7 +106,7 @@ MODULE kpoint_methods
    PUBLIC :: kpoint_initialize, kpoint_env_initialize, kpoint_initialize_mos, kpoint_initialize_mo_set
    PUBLIC :: kpoint_init_cell_index, kpoint_set_mo_occupation
    PUBLIC :: kpoint_density_matrices, kpoint_density_transform
-   PUBLIC :: rskp_transform, lowdin_kp_trans, lowdin_kp_mo_coeff
+   PUBLIC :: rskp_transform, lowdin_kp_trans, lowdin_kp_trans_rs, lowdin_kp_mo_coeff
 
 ! **************************************************************************************************
 
@@ -1657,6 +1658,186 @@ CONTAINS
    END SUBROUTINE lowdin_kp_trans
 
 ! **************************************************************************************************
+!> \brief Calculate Lowdin populations from real-space density matrices.
+!> \param kpoint    K-point environment
+!> \param rsmat     Real-space density matrices P(R)
+!> \param pmat_diag Sum over k-points of diagonal elements
+!> \param fmwork    Work matrices on the global BLACS grid
+! **************************************************************************************************
+   SUBROUTINE lowdin_kp_trans_rs(kpoint, rsmat, pmat_diag, fmwork)
+
+      TYPE(kpoint_type), POINTER                         :: kpoint
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rsmat
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: pmat_diag
+      TYPE(cp_fm_type), DIMENSION(:)                     :: fmwork
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'lowdin_kp_trans_rs'
+
+      INTEGER                                            :: handle, igroup, ik, ikp, indx, ispin, &
+                                                            kplocal, nao, nkp, nkp_groups, nspin
+      INTEGER, DIMENSION(2)                              :: kp_range
+      INTEGER, DIMENSION(:, :), POINTER                  :: kp_dist
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      LOGICAL                                            :: my_kpgrp, use_real_wfn
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dele
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
+      TYPE(copy_info_type), ALLOCATABLE, DIMENSION(:, :) :: info
+      TYPE(cp_cfm_type)                                  :: cf1work, cf2work
+      TYPE(cp_cfm_type), POINTER                         :: cshalf
+      TYPE(cp_fm_pool_p_type), DIMENSION(:), POINTER     :: ao_ao_fm_pools
+      TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
+      TYPE(cp_fm_type)                                   :: f1work, f2work, fmdummy, fplocal_r, &
+                                                            fplocal_i
+      TYPE(dbcsr_type), POINTER                          :: cmatrix, rmatrix, tmpmat
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_inter_kp
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_nl
+      TYPE(qs_matrix_pools_type), POINTER                :: mpools
+
+      CALL timeset(routineN, handle)
+
+      nspin = SIZE(pmat_diag, 2)
+      pmat_diag = 0.0_dp
+
+      NULLIFY (sab_nl)
+      CALL get_kpoint_info(kpoint, nkp=nkp, xkp=xkp, use_real_wfn=use_real_wfn, &
+                           kp_range=kp_range, nkp_groups=nkp_groups, kp_dist=kp_dist, &
+                           sab_nl=sab_nl, cell_to_index=cell_to_index, mpools=mpools, &
+                           para_env_inter_kp=para_env_inter_kp)
+      CPASSERT(ASSOCIATED(sab_nl))
+      kplocal = kp_range(2) - kp_range(1) + 1
+
+      IF (use_real_wfn) THEN
+         CPASSERT(SIZE(fmwork) >= 1)
+      ELSE
+         CPASSERT(SIZE(fmwork) >= 2)
+      END IF
+
+      ALLOCATE (rmatrix, cmatrix, tmpmat)
+      CALL dbcsr_create(rmatrix, template=rsmat(1, 1)%matrix, &
+                        matrix_type=dbcsr_type_symmetric)
+      CALL dbcsr_create(cmatrix, template=rsmat(1, 1)%matrix, &
+                        matrix_type=dbcsr_type_antisymmetric)
+      CALL dbcsr_create(tmpmat, template=rsmat(1, 1)%matrix, &
+                        matrix_type=dbcsr_type_no_symmetry)
+      CALL cp_dbcsr_alloc_block_from_nbl(rmatrix, sab_nl)
+      CALL cp_dbcsr_alloc_block_from_nbl(cmatrix, sab_nl)
+
+      CALL mpools_get(mpools, ao_ao_fm_pools=ao_ao_fm_pools)
+      CALL fm_pool_create_fm(ao_ao_fm_pools(1)%pool, fplocal_r)
+      CALL cp_fm_get_info(fplocal_r, matrix_struct=matrix_struct, nrow_global=nao)
+      CALL cp_fm_create(f1work, matrix_struct, nrow=nao, ncol=nao)
+      CALL cp_fm_create(f2work, matrix_struct, nrow=nao, ncol=nao)
+      IF (.NOT. use_real_wfn) THEN
+         CALL fm_pool_create_fm(ao_ao_fm_pools(1)%pool, fplocal_i)
+         CALL cp_cfm_create(cf1work, matrix_struct, nrow=nao, ncol=nao)
+         CALL cp_cfm_create(cf2work, matrix_struct, nrow=nao, ncol=nao)
+      END IF
+      ALLOCATE (dele(nao))
+
+      para_env => kpoint%blacs_env_all%para_env
+      ALLOCATE (info(kplocal*nkp_groups, 2))
+
+      DO ispin = 1, nspin
+
+         indx = 0
+         DO ikp = 1, kplocal
+            DO igroup = 1, nkp_groups
+               ik = kp_dist(1, igroup) + ikp - 1
+               my_kpgrp = (ik >= kpoint%kp_range(1) .AND. ik <= kpoint%kp_range(2))
+               indx = indx + 1
+
+               CALL dbcsr_set(rmatrix, 0.0_dp)
+               IF (use_real_wfn) THEN
+                  CALL rskp_transform(rmatrix=rmatrix, rsmat=rsmat, ispin=ispin, &
+                                      xkp=xkp(1:3, ik), cell_to_index=cell_to_index, sab_nl=sab_nl)
+                  CALL dbcsr_desymmetrize(rmatrix, tmpmat)
+                  CALL copy_dbcsr_to_fm(tmpmat, fmwork(1))
+                  IF (my_kpgrp) THEN
+                     CALL cp_fm_start_copy_general(fmwork(1), fplocal_r, para_env, info(indx, 1))
+                  ELSE
+                     CALL cp_fm_start_copy_general(fmwork(1), fmdummy, para_env, info(indx, 1))
+                  END IF
+               ELSE
+                  CALL dbcsr_set(cmatrix, 0.0_dp)
+                  CALL rskp_transform(rmatrix=rmatrix, cmatrix=cmatrix, rsmat=rsmat, ispin=ispin, &
+                                      xkp=xkp(1:3, ik), cell_to_index=cell_to_index, sab_nl=sab_nl)
+                  CALL dbcsr_desymmetrize(rmatrix, tmpmat)
+                  CALL copy_dbcsr_to_fm(tmpmat, fmwork(1))
+                  CALL dbcsr_desymmetrize(cmatrix, tmpmat)
+                  CALL copy_dbcsr_to_fm(tmpmat, fmwork(2))
+                  IF (my_kpgrp) THEN
+                     CALL cp_fm_start_copy_general(fmwork(1), fplocal_r, para_env, info(indx, 1))
+                     CALL cp_fm_start_copy_general(fmwork(2), fplocal_i, para_env, info(indx, 2))
+                  ELSE
+                     CALL cp_fm_start_copy_general(fmwork(1), fmdummy, para_env, info(indx, 1))
+                     CALL cp_fm_start_copy_general(fmwork(2), fmdummy, para_env, info(indx, 2))
+                  END IF
+               END IF
+            END DO
+         END DO
+
+         indx = 0
+         DO ikp = 1, kplocal
+            DO igroup = 1, nkp_groups
+               ik = kp_dist(1, igroup) + ikp - 1
+               my_kpgrp = (ik >= kpoint%kp_range(1) .AND. ik <= kpoint%kp_range(2))
+               indx = indx + 1
+               IF (my_kpgrp) THEN
+                  kp => kpoint%kp_env(ikp)%kpoint_env
+                  IF (use_real_wfn) THEN
+                     CALL cp_fm_finish_copy_general(fplocal_r, info(indx, 1))
+                     CALL lowdin_kp_diag(use_real_wfn=use_real_wfn, nao=nao, dele=dele, &
+                                         pmat=fplocal_r, shalf=kp%shalf, &
+                                         f1work=f1work, f2work=f2work)
+                  ELSE
+                     cshalf => kp%cshalf
+                     CALL cp_fm_finish_copy_general(fplocal_r, info(indx, 1))
+                     CALL cp_fm_finish_copy_general(fplocal_i, info(indx, 2))
+                     CALL lowdin_kp_diag(use_real_wfn=use_real_wfn, nao=nao, dele=dele, &
+                                         rpmat=fplocal_r, cpmat=fplocal_i, cshalf=cshalf, &
+                                         cf1work=cf1work, cf2work=cf2work, f2work=f2work)
+                  END IF
+                  pmat_diag(1:nao, ispin) = pmat_diag(1:nao, ispin) + kp%wkp*dele(1:nao)
+               END IF
+            END DO
+         END DO
+
+         indx = 0
+         DO ikp = 1, kplocal
+            DO igroup = 1, nkp_groups
+               indx = indx + 1
+               CALL cp_fm_cleanup_copy_general(info(indx, 1))
+               IF (.NOT. use_real_wfn) THEN
+                  CALL cp_fm_cleanup_copy_general(info(indx, 2))
+               END IF
+            END DO
+         END DO
+
+      END DO
+
+      CALL para_env_inter_kp%sum(pmat_diag)
+
+      DEALLOCATE (info)
+      DEALLOCATE (dele)
+      CALL cp_fm_release(f1work)
+      CALL cp_fm_release(f2work)
+      CALL fm_pool_give_back_fm(ao_ao_fm_pools(1)%pool, fplocal_r)
+      IF (.NOT. use_real_wfn) THEN
+         CALL fm_pool_give_back_fm(ao_ao_fm_pools(1)%pool, fplocal_i)
+         CALL cp_cfm_release(cf1work)
+         CALL cp_cfm_release(cf2work)
+      END IF
+      CALL dbcsr_deallocate_matrix(rmatrix)
+      CALL dbcsr_deallocate_matrix(cmatrix)
+      CALL dbcsr_deallocate_matrix(tmpmat)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE lowdin_kp_trans_rs
+
+! **************************************************************************************************
 !> \brief Calculate the diagonal elements of S(k)^1/2 P(k) S(k)^1/2
 !> \param use_real_wfn Use real k-point wavefunctions
 !> \param nao          Number of atomic orbitals
@@ -1678,9 +1859,9 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: nao
       REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: dele
       TYPE(cp_cfm_type), OPTIONAL                        :: cf1work, cf2work
-      TYPE(cp_cfm_type), OPTIONAL, POINTER               :: cshalf
+      TYPE(cp_cfm_type), OPTIONAL                        :: cshalf
       TYPE(cp_fm_type), OPTIONAL                         :: f1work, f2work
-      TYPE(cp_fm_type), OPTIONAL, POINTER                :: cpmat, pmat, rpmat, shalf
+      TYPE(cp_fm_type), OPTIONAL                         :: cpmat, pmat, rpmat, shalf
 
       COMPLEX(KIND=dp), PARAMETER                        :: cone = (1.0_dp, 0.0_dp), &
                                                             czero = (0.0_dp, 0.0_dp)
@@ -1690,9 +1871,6 @@ CONTAINS
          CPASSERT(PRESENT(shalf))
          CPASSERT(PRESENT(f1work))
          CPASSERT(PRESENT(f2work))
-         CPASSERT(ASSOCIATED(pmat))
-         CPASSERT(ASSOCIATED(shalf))
-
          CALL parallel_gemm("N", "N", nao, nao, nao, 1.0_dp, pmat, shalf, 0.0_dp, f1work)
          CALL parallel_gemm("N", "N", nao, nao, nao, 1.0_dp, shalf, f1work, 0.0_dp, f2work)
       ELSE
@@ -1702,10 +1880,6 @@ CONTAINS
          CPASSERT(PRESENT(cf1work))
          CPASSERT(PRESENT(cf2work))
          CPASSERT(PRESENT(f2work))
-         CPASSERT(ASSOCIATED(rpmat))
-         CPASSERT(ASSOCIATED(cpmat))
-         CPASSERT(ASSOCIATED(cshalf))
-
          CALL cp_fm_to_cfm(rpmat, cpmat, cf1work)
          CALL parallel_gemm("N", "N", nao, nao, nao, cone, cf1work, cshalf, czero, cf2work)
          CALL parallel_gemm("N", "N", nao, nao, nao, cone, cshalf, cf2work, czero, cf1work)
