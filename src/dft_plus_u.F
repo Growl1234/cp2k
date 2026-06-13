@@ -309,8 +309,28 @@ CONTAINS
       END IF
 
       IF (do_kpoints) THEN
-         fm_wmat => scf_env%scf_work1
-         fmstruct => fm_wmat(1)%matrix_struct
+         IF (PRESENT(matrix_w)) THEN
+            CPABORT("Lowdin DFT+U forces/stress with k-points NYA")
+         END IF
+         ! Diagnostic only: evaluate the existing k-point Lowdin population
+         ! path, but do not use it to build a DFT+U energy or Hamiltonian.
+         ALLOCATE (orbq(nsgf, nspin))
+         CALL lowdin_kp_trans(kpoints, orbq)
+         IF (should_output .AND. output_unit > 0) THEN
+            WRITE (UNIT=output_unit, FMT="(/,T3,A)") &
+               "LOWDIN DFT+U k-point occupation diagnostic"
+            DO ispin = 1, nspin
+               WRITE (UNIT=output_unit, FMT="(T3,A,I0,A,F18.10,A,F18.10,A,F18.10)") &
+                  "Spin ", ispin, ": sum = ", SUM(orbq(:, ispin)), &
+                  ", min = ", MINVAL(orbq(:, ispin)), &
+                  ", max = ", MAXVAL(orbq(:, ispin))
+            END DO
+         END IF
+         DEALLOCATE (orbq)
+         IF (PRESENT(matrix_h)) THEN
+            CPABORT("Lowdin DFT+U Hamiltonian with k-points NYA")
+         END IF
+         CPABORT("Lowdin DFT+U energy with k-points NYA")
       ELSE
          ! Retrieve S^(1/2) from the SCF environment
          fm_s_half => scf_env%s_half
@@ -327,9 +347,6 @@ CONTAINS
       ! See sTDA forces (get_lowdin_mo_coefficients in qs_tddfpt2_stda_utils
       ! A. Hehn et al JCTC 2022, 18, 4186
       IF (PRESENT(matrix_w)) THEN
-         IF (do_kpoints) THEN
-            CPABORT("Lowdin forces with k-points NYA in DFT+U")
-         END IF
          CALL cp_fm_create(matrix=fm_sev, matrix_struct=fmstruct)
          CALL cp_fm_create(matrix=slambda, matrix_struct=fmstruct)
          ALLOCATE (eigval(nsgf), slam(nsgf, 1))
@@ -362,12 +379,6 @@ CONTAINS
       END IF
 
       ! Calculate S^(1/2)*P*S^(1/2)
-      IF (do_kpoints) THEN
-         CPABORT("Lowdin option with k-points NYA in DFT+U")
-         ALLOCATE (orbq(nsgf, nspin))
-         CALL lowdin_kp_trans(kpoints, orbq)
-         DEALLOCATE (orbq)
-      END IF
 
       ! Create local block diagonal matrices
       sm_s => matrix_s(1, 1)%matrix
@@ -725,14 +736,10 @@ CONTAINS
 
          ! Add V(i,j)[U] to V(i,j)[DFT]
          IF (PRESENT(matrix_h)) THEN
-            IF (do_kpoints) THEN
-               CPABORT("Lowdin option with k-points NYA in DFT+U")
-            ELSE
-               sm_h => matrix_h(ispin, 1)%matrix
-               CALL cp_dbcsr_sm_fm_multiply(sm_v, fm_s_half, fm_work1, nsgf)
-               CALL cp_fm_transpose(fm_work1, fm_work2)
-               CALL cp_dbcsr_plus_fm_fm_t(sm_h, fm_s_half, fm_work2, nsgf)
-            END IF
+            sm_h => matrix_h(ispin, 1)%matrix
+            CALL cp_dbcsr_sm_fm_multiply(sm_v, fm_s_half, fm_work1, nsgf)
+            CALL cp_fm_transpose(fm_work1, fm_work2)
+            CALL cp_dbcsr_plus_fm_fm_t(sm_h, fm_s_half, fm_work2, nsgf)
          END IF ! An update of the Hamiltonian matrix is requested
 
          ! Calculate the contribution (non-Pulay part) to the derivatives
