@@ -6,13 +6,49 @@
 !--------------------------------------------------------------------------------------------------!
 
 MODULE hfx_lri_types
+   USE hfx_lri_contract,                ONLY: hfx_lri_contract_workspace_type
    USE kinds,                           ONLY: dp,&
                                               int_8
 
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_k_block_type, hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release
+   PUBLIC :: hfx_lri_k_block_type, hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release, &
+             hfx_lri_exchange_workspace_type, hfx_lri_metric_cache_entry_type, &
+             hfx_lri_metric_cache_type, hfx_lri_metric_table_type
+
+   TYPE hfx_lri_metric_cache_entry_type
+      LOGICAL                                            :: valid = .FALSE., zero = .FALSE.
+      INTEGER                                            :: kind_left = 0, kind_right = 0
+      INTEGER(int_8)                                     :: stamp = 0_int_8
+      REAL(dp)                                           :: norm2 = 0.0_dp
+      REAL(dp), DIMENSION(3)                             :: displacement = 0.0_dp
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: values
+   END TYPE hfx_lri_metric_cache_entry_type
+
+   TYPE hfx_lri_metric_cache_type
+      INTEGER(int_8)                                     :: clock = 0_int_8, hits = 0_int_8, &
+                                                            misses = 0_int_8, screened = 0_int_8
+      TYPE(hfx_lri_metric_cache_entry_type), ALLOCATABLE, DIMENSION(:) :: entries
+   END TYPE hfx_lri_metric_cache_type
+
+   ! Geometry-only two-center metric blocks.  In contrast to the small thread-private cache above,
+   ! this table is built once, is immutable during an SCF cycle, and is shared by all threads.
+   ! Keeping a single copy is essential: the same atom/cell displacement occurs in a very large
+   ! number of C-D-C paths in a periodic calculation.
+   TYPE hfx_lri_metric_table_type
+      LOGICAL                                            :: initialized = .FALSE.
+      INTEGER                                            :: capacity = 0, nentries = 0
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: slot
+      TYPE(hfx_lri_metric_cache_entry_type), ALLOCATABLE, DIMENSION(:) :: entries
+   END TYPE hfx_lri_metric_table_type
+
+   TYPE hfx_lri_exchange_workspace_type
+      INTEGER(int_8)                                     :: pair_screened = 0_int_8
+      TYPE(hfx_lri_contract_workspace_type)              :: contract
+      TYPE(hfx_lri_metric_cache_type)                    :: metric_cache
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_outer, v_sph
+   END TYPE hfx_lri_exchange_workspace_type
 
    TYPE hfx_lri_pair_block_type
       LOGICAL                                            :: onsite_pair = .FALSE.
@@ -51,8 +87,11 @@ MODULE hfx_lri_types
 
       REAL(dp) :: c_mem_mib_est = 0.0_dp
       REAL(dp) :: c_mem_mib_stored = 0.0_dp
+      REAL(dp) :: exchange_trace_raw = 0.0_dp
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
+      TYPE(hfx_lri_exchange_workspace_type), ALLOCATABLE, DIMENSION(:) :: thread_workspaces
+      TYPE(hfx_lri_metric_table_type)                    :: metric_table
 
       TYPE(hfx_lri_k_block_type) :: diagnostic_k_block
 
@@ -94,6 +133,7 @@ CONTAINS
             END DO
             DEALLOCATE (lri_kp%pair_blocks)
          END IF
+         IF (ALLOCATED(lri_kp%thread_workspaces)) DEALLOCATE (lri_kp%thread_workspaces)
          DEALLOCATE (lri_kp)
       END IF
    END SUBROUTINE hfx_lri_kp_release
