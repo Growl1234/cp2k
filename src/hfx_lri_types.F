@@ -13,7 +13,8 @@ MODULE hfx_lri_types
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_k_block_type, hfx_lri_kp_type, hfx_lri_pair_block_type, hfx_lri_kp_release, &
+   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_k_block_type, hfx_lri_kp_type, &
+             hfx_lri_metric_lattice_block_type, hfx_lri_pair_block_type, hfx_lri_kp_release, &
              hfx_lri_exchange_workspace_type, hfx_lri_metric_cache_entry_type, &
              hfx_lri_metric_cache_type, hfx_lri_metric_table_type
 
@@ -74,8 +75,26 @@ MODULE hfx_lri_types
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
    END TYPE hfx_lri_k_block_type
 
+   ! One coefficient slice with its auxiliary functions fixed on the first atom.  Lattice cells
+   ! are reduced to the finite k-mesh quotient before these blocks are stored.
+   TYPE hfx_lri_centered_block_type
+      LOGICAL                                            :: inner_active = .TRUE.
+      REAL(dp)                                           :: norm2 = 0.0_dp
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: values
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: remote_flat
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: inner_values
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: inner_remote_flat
+   END TYPE hfx_lri_centered_block_type
+
+   ! Periodized two-center metric block on the finite k-mesh lattice quotient.
+   TYPE hfx_lri_metric_lattice_block_type
+      REAL(dp)                                           :: norm2 = 0.0_dp
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: values
+   END TYPE hfx_lri_metric_lattice_block_type
+
    TYPE hfx_lri_kp_type
       LOGICAL :: initialized = .FALSE.
+      LOGICAL :: loop3_ready = .FALSE.
 
       INTEGER :: npairs = 0
       INTEGER :: npair_blocks = 0
@@ -88,6 +107,19 @@ MODULE hfx_lri_types
       REAL(dp) :: c_mem_mib_est = 0.0_dp
       REAL(dp) :: c_mem_mib_stored = 0.0_dp
       REAL(dp) :: exchange_trace_raw = 0.0_dp
+
+      INTEGER                                            :: lattice_natom = 0, lattice_ncell = 0, &
+                                                            lattice_total_nao = 0
+      INTEGER, DIMENSION(3)                              :: lattice_grid = 1, lattice_twist = 1
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_ao_offset, atom_kind, atom_nao, &
+                                                            atom_naux, centered_atom_count, &
+                                                            centered_atom_offset, centered_atom_refs, &
+                                                            centered_remote_count, &
+                                                            centered_remote_offset, &
+                                                            centered_remote_refs
+      TYPE(hfx_lri_centered_block_type), ALLOCATABLE, DIMENSION(:) :: centered_blocks
+      TYPE(hfx_lri_metric_lattice_block_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: lattice_metric
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
       TYPE(hfx_lri_exchange_workspace_type), ALLOCATABLE, DIMENSION(:) :: thread_workspaces
