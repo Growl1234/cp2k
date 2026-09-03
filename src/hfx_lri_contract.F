@@ -18,12 +18,18 @@ MODULE hfx_lri_contract
    PUBLIC :: hfx_lri_contract_exchange, hfx_lri_contract_exchange_add, &
              hfx_lri_contract_outer_accumulate, hfx_lri_contract_outer_finalize, &
              hfx_lri_contract_outer_prepare, hfx_lri_contract_workspace_type, &
-             hfx_lri_density_cell, hfx_lri_product_index, hfx_lri_right_cell
+             hfx_lri_density_cell, hfx_lri_loop3_aux_transform, &
+             hfx_lri_loop3_central_contract, hfx_lri_loop3_density_c_add, &
+             hfx_lri_loop3_pack_aux, hfx_lri_loop3_remote_contract, &
+             hfx_lri_product_index, hfx_lri_right_cell
 
    TYPE hfx_lri_contract_workspace_type
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: density_right, left_coeff, right_coeff, &
                                                 weighted_left, weighted_right_flat, left_flat, &
-                                                left_metric_flat, outer_density_sum
+                                                left_metric_flat, outer_density_sum, loop3_c_flat, &
+                                                loop3_s_flat, loop3_t_flat, loop3_u_flat, &
+                                                loop3_w_flat, loop3_block
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :) :: loop3_s, loop3_t, loop3_u, loop3_w
    END TYPE hfx_lri_contract_workspace_type
 
 CONTAINS
@@ -387,5 +393,311 @@ CONTAINS
                  nmu, workspace%weighted_left, nsigma*nq, 1.0_dp, k_block, nmu)
 
    END SUBROUTINE hfx_lri_contract_outer_finalize
+
+! **************************************************************************************************
+!> \brief Adds D times one atom-centred C tensor to a loop3 intermediate.
+!> \param centered C(center,remote,aux)
+!> \param density density(first,contracted)
+!> \param result result(first,uncontracted,aux)
+!> \param factor boundary-phase factor
+!> \param first overwrite rather than add to result
+!> \param transpose_centered contract the remote rather than the central C index
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_loop3_density_c_add(centered, density, result, factor, first, &
+                                          transpose_centered, centered_remote_flat)
+
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)          :: centered
+      REAL(dp), DIMENSION(:, :), INTENT(IN)             :: density
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), &
+         INTENT(INOUT)                                   :: result
+      REAL(dp), INTENT(IN)                               :: factor
+      LOGICAL, INTENT(IN)                                :: first, transpose_centered
+      REAL(dp), DIMENSION(:, :), INTENT(IN), OPTIONAL   :: centered_remote_flat
+
+      INTEGER                                            :: iaux, ncontract, nfirst, nout
+      REAL(dp)                                           :: beta
+
+      nfirst = SIZE(density, 1)
+      ncontract = SIZE(density, 2)
+      IF (transpose_centered) THEN
+         nout = SIZE(centered, 1)
+         IF (SIZE(centered, 2) /= ncontract) THEN
+            CPABORT("Inconsistent remote C dimension in LRI loop3 density contraction")
+         END IF
+      ELSE
+         nout = SIZE(centered, 2)
+         IF (SIZE(centered, 1) /= ncontract) THEN
+            CPABORT("Inconsistent central C dimension in LRI loop3 density contraction")
+         END IF
+      END IF
+
+      IF (ALLOCATED(result)) THEN
+         IF (ANY(SHAPE(result) /= [nfirst, nout, SIZE(centered, 3)])) DEALLOCATE (result)
+      END IF
+      IF (.NOT. ALLOCATED(result)) THEN
+         ALLOCATE (result(nfirst, nout, SIZE(centered, 3)), SOURCE=0.0_dp)
+      ELSE IF (first) THEN
+         result(:, :, :) = 0.0_dp
+      END IF
+      beta = MERGE(0.0_dp, 1.0_dp, first)
+      IF (.NOT. transpose_centered) THEN
+         ! C(center,remote,aux) is already a contiguous center-by-(remote*aux) matrix.
+         CALL dgemm("N", "N", nfirst, nout*SIZE(centered, 3), ncontract, factor, &
+                    density(1, 1), nfirst, centered(1, 1, 1), ncontract, beta, &
+                    result(1, 1, 1), nfirst)
+      ELSE IF (PRESENT(centered_remote_flat)) THEN
+         IF (ANY(SHAPE(centered_remote_flat) /= &
+                 [nout*SIZE(centered, 3), ncontract])) THEN
+            CPABORT("Inconsistent packed C dimensions in LRI loop3 density contraction")
+         END IF
+         CALL dgemm("N", "T", nfirst, nout*SIZE(centered, 3), ncontract, factor, &
+                    density(1, 1), nfirst, centered_remote_flat(1, 1), &
+                    nout*SIZE(centered, 3), beta, result(1, 1, 1), nfirst)
+      ELSE
+         ! Compatibility path for callers which do not retain the packed C view.
+         DO iaux = 1, SIZE(centered, 3)
+            CALL dgemm("N", "T", nfirst, nout, ncontract, factor, density, nfirst, &
+                       centered(:, :, iaux), nout, beta, result(:, :, iaux), nfirst)
+         END DO
+      END IF
+
+   END SUBROUTINE hfx_lri_loop3_density_c_add
+
+! **************************************************************************************************
+!> \brief Transforms the auxiliary index of a loop3 tensor and optionally accumulates the result.
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_loop3_aux_transform(source, metric, target, factor, first, transpose_metric)
+
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)          :: source
+      REAL(dp), DIMENSION(:, :), INTENT(IN)             :: metric
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), &
+         INTENT(INOUT)                                   :: target
+      REAL(dp), INTENT(IN)                               :: factor
+      LOGICAL, INTENT(IN)                                :: first
+      LOGICAL, INTENT(IN), OPTIONAL                      :: transpose_metric
+
+      INTEGER                                            :: nflat, nleft, nright
+      LOGICAL                                            :: metric_t
+      REAL(dp)                                           :: beta
+
+      nflat = SIZE(source, 1)*SIZE(source, 2)
+      metric_t = .FALSE.
+      IF (PRESENT(transpose_metric)) metric_t = transpose_metric
+      IF (metric_t) THEN
+         nright = SIZE(metric, 1)
+         nleft = SIZE(metric, 2)
+      ELSE
+         nright = SIZE(metric, 2)
+         nleft = SIZE(metric, 1)
+      END IF
+      IF (SIZE(source, 3) /= nright) THEN
+         CPABORT("Inconsistent metric dimension in LRI loop3 auxiliary contraction")
+      END IF
+      IF (ALLOCATED(target)) THEN
+         IF (ANY(SHAPE(target) /= [SIZE(source, 1), SIZE(source, 2), nleft])) THEN
+            DEALLOCATE (target)
+         END IF
+      END IF
+      IF (.NOT. ALLOCATED(target)) THEN
+         ALLOCATE (target(SIZE(source, 1), SIZE(source, 2), nleft), SOURCE=0.0_dp)
+      ELSE IF (first) THEN
+         target(:, :, :) = 0.0_dp
+      END IF
+      beta = MERGE(0.0_dp, 1.0_dp, first)
+      IF (metric_t) THEN
+         CALL dgemm("N", "N", nflat, nleft, nright, factor, source(1, 1, 1), nflat, &
+                    metric(1, 1), nright, beta, target(1, 1, 1), nflat)
+      ELSE
+         CALL dgemm("N", "T", nflat, nleft, nright, factor, source(1, 1, 1), nflat, &
+                    metric(1, 1), nleft, beta, target(1, 1, 1), nflat)
+      END IF
+
+   END SUBROUTINE hfx_lri_loop3_aux_transform
+
+! **************************************************************************************************
+!> \brief Packs tensor(first,second,aux) as matrix(first*aux,second).
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_loop3_pack_aux(source, packed)
+
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)          :: source
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(INOUT)                                   :: packed
+
+      INTEGER                                            :: iaux, naux, nfirst, nsecond
+
+      nfirst = SIZE(source, 1)
+      nsecond = SIZE(source, 2)
+      naux = SIZE(source, 3)
+      IF (ALLOCATED(packed)) THEN
+         IF (ANY(SHAPE(packed) /= [nfirst*naux, nsecond])) DEALLOCATE (packed)
+      END IF
+      IF (.NOT. ALLOCATED(packed)) ALLOCATE (packed(nfirst*naux, nsecond))
+      DO iaux = 1, naux
+         packed((iaux - 1)*nfirst + 1:iaux*nfirst, :) = source(:, :, iaux)
+      END DO
+
+   END SUBROUTINE hfx_lri_loop3_pack_aux
+
+! **************************************************************************************************
+!> \brief Contracts C(center,remote,aux) with U(center,output,aux), leaving remote/output.
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_loop3_remote_contract(centered, intermediate, block, workspace, &
+                                            centered_remote_flat, intermediate_aux_flat)
+
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)          :: centered, intermediate
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(INOUT)                                   :: block
+      TYPE(hfx_lri_contract_workspace_type), &
+         INTENT(INOUT)                                   :: workspace
+      REAL(dp), DIMENSION(:, :), INTENT(IN), OPTIONAL   :: centered_remote_flat
+      REAL(dp), DIMENSION(:, :), INTENT(IN), OPTIONAL   :: intermediate_aux_flat
+
+      INTEGER                                            :: iaux, naux, ncenter, nout, nremote
+
+      ncenter = SIZE(centered, 1)
+      nremote = SIZE(centered, 2)
+      naux = SIZE(centered, 3)
+      nout = SIZE(intermediate, 2)
+      IF (SIZE(intermediate, 1) /= ncenter .OR. SIZE(intermediate, 3) /= naux) THEN
+         CPABORT("Inconsistent tensor dimensions in LRI loop3 remote contraction")
+      END IF
+      IF (PRESENT(centered_remote_flat)) THEN
+         IF (ANY(SHAPE(centered_remote_flat) /= [ncenter*naux, nremote])) THEN
+            CPABORT("Inconsistent packed C dimensions in LRI loop3 remote contraction")
+         END IF
+      ELSE
+         IF (ALLOCATED(workspace%loop3_c_flat)) THEN
+            IF (ANY(SHAPE(workspace%loop3_c_flat) /= [ncenter*naux, nremote])) THEN
+               DEALLOCATE (workspace%loop3_c_flat)
+            END IF
+         END IF
+         IF (.NOT. ALLOCATED(workspace%loop3_c_flat)) THEN
+            ALLOCATE (workspace%loop3_c_flat(ncenter*naux, nremote))
+         END IF
+         DO iaux = 1, naux
+            workspace%loop3_c_flat((iaux - 1)*ncenter + 1:iaux*ncenter, :) = &
+               centered(:, :, iaux)
+         END DO
+      END IF
+      IF (PRESENT(intermediate_aux_flat)) THEN
+         IF (ANY(SHAPE(intermediate_aux_flat) /= [ncenter*naux, nout])) THEN
+            CPABORT("Inconsistent packed intermediate in LRI loop3 remote contraction")
+         END IF
+      ELSE
+         CALL hfx_lri_loop3_pack_aux(intermediate, workspace%loop3_u_flat)
+      END IF
+      IF (ALLOCATED(block)) THEN
+         IF (ANY(SHAPE(block) /= [nremote, nout])) DEALLOCATE (block)
+      END IF
+      IF (.NOT. ALLOCATED(block)) ALLOCATE (block(nremote, nout))
+      IF (PRESENT(centered_remote_flat)) THEN
+         IF (PRESENT(intermediate_aux_flat)) THEN
+            CALL dgemm("T", "N", nremote, nout, ncenter*naux, 1.0_dp, &
+                       centered_remote_flat(1, 1), ncenter*naux, &
+                       intermediate_aux_flat(1, 1), ncenter*naux, &
+                       0.0_dp, block(1, 1), nremote)
+         ELSE
+            CALL dgemm("T", "N", nremote, nout, ncenter*naux, 1.0_dp, &
+                       centered_remote_flat(1, 1), ncenter*naux, &
+                       workspace%loop3_u_flat(1, 1), ncenter*naux, &
+                       0.0_dp, block(1, 1), nremote)
+         END IF
+      ELSE
+         IF (PRESENT(intermediate_aux_flat)) THEN
+            CALL dgemm("T", "N", nremote, nout, ncenter*naux, 1.0_dp, &
+                       workspace%loop3_c_flat(1, 1), ncenter*naux, &
+                       intermediate_aux_flat(1, 1), ncenter*naux, &
+                       0.0_dp, block(1, 1), nremote)
+         ELSE
+            CALL dgemm("T", "N", nremote, nout, ncenter*naux, 1.0_dp, &
+                       workspace%loop3_c_flat(1, 1), ncenter*naux, &
+                       workspace%loop3_u_flat(1, 1), ncenter*naux, &
+                       0.0_dp, block(1, 1), nremote)
+         END IF
+      END IF
+
+   END SUBROUTINE hfx_lri_loop3_remote_contract
+
+! **************************************************************************************************
+!> \brief Contracts C(center,remote,P) V(P,Q) S(remote,output,Q), leaving center/output.
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_loop3_central_contract(centered, metric, intermediate, block, workspace, &
+                                             transpose_metric, intermediate_aux_flat)
+
+      REAL(dp), DIMENSION(:, :, :), INTENT(IN)          :: centered, intermediate
+      REAL(dp), DIMENSION(:, :), INTENT(IN)             :: metric
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(INOUT)                                   :: block
+      TYPE(hfx_lri_contract_workspace_type), &
+         INTENT(INOUT)                                   :: workspace
+      LOGICAL, INTENT(IN), OPTIONAL                      :: transpose_metric
+      REAL(dp), DIMENSION(:, :), INTENT(IN), OPTIONAL   :: intermediate_aux_flat
+
+      INTEGER                                            :: naux, ncenter, nout, nremote
+      LOGICAL                                            :: metric_t
+
+      ncenter = SIZE(centered, 1)
+      nremote = SIZE(centered, 2)
+      naux = SIZE(centered, 3)
+      nout = SIZE(intermediate, 2)
+      metric_t = .FALSE.
+      IF (PRESENT(transpose_metric)) metric_t = transpose_metric
+      IF (SIZE(intermediate, 1) /= nremote) THEN
+         CPABORT("Inconsistent tensor dimensions in LRI loop3 central contraction")
+      END IF
+      IF ((.NOT. metric_t .AND. &
+           (SIZE(metric, 1) /= naux .OR. SIZE(metric, 2) /= SIZE(intermediate, 3))) .OR. &
+          (metric_t .AND. &
+           (SIZE(metric, 2) /= naux .OR. SIZE(metric, 1) /= SIZE(intermediate, 3)))) THEN
+         CPABORT("Inconsistent auxiliary dimensions in LRI loop3 central contraction")
+      END IF
+      IF (PRESENT(intermediate_aux_flat)) THEN
+         IF (ANY(SHAPE(intermediate_aux_flat) /= &
+                 [nremote*SIZE(intermediate, 3), nout])) THEN
+            CPABORT("Inconsistent packed intermediate in LRI loop3 central contraction")
+         END IF
+         IF (ALLOCATED(workspace%loop3_w)) THEN
+            IF (ANY(SHAPE(workspace%loop3_w) /= &
+                    [ncenter, nremote, SIZE(intermediate, 3)])) THEN
+               DEALLOCATE (workspace%loop3_w)
+            END IF
+         END IF
+         IF (.NOT. ALLOCATED(workspace%loop3_w)) THEN
+            ALLOCATE (workspace%loop3_w(ncenter, nremote, SIZE(intermediate, 3)))
+         END IF
+         IF (metric_t) THEN
+            CALL dgemm("N", "T", ncenter*nremote, SIZE(intermediate, 3), naux, &
+                       1.0_dp, centered(1, 1, 1), ncenter*nremote, metric(1, 1), &
+                       SIZE(metric, 1), 0.0_dp, workspace%loop3_w(1, 1, 1), &
+                       ncenter*nremote)
+         ELSE
+            CALL dgemm("N", "N", ncenter*nremote, SIZE(intermediate, 3), naux, &
+                       1.0_dp, centered(1, 1, 1), ncenter*nremote, metric(1, 1), &
+                       SIZE(metric, 1), 0.0_dp, workspace%loop3_w(1, 1, 1), &
+                       ncenter*nremote)
+         END IF
+      ELSE
+         CALL hfx_lri_loop3_aux_transform( &
+            intermediate, metric, workspace%loop3_w, 1.0_dp, .TRUE., metric_t)
+         CALL hfx_lri_loop3_pack_aux(workspace%loop3_w, workspace%loop3_w_flat)
+      END IF
+      IF (ALLOCATED(block)) THEN
+         IF (ANY(SHAPE(block) /= [ncenter, nout])) DEALLOCATE (block)
+      END IF
+      IF (.NOT. ALLOCATED(block)) ALLOCATE (block(ncenter, nout))
+      IF (PRESENT(intermediate_aux_flat)) THEN
+         ! The transformed C tensor is contiguous as (center,remote*intermediate_aux).
+         CALL dgemm("N", "N", ncenter, nout, nremote*SIZE(intermediate, 3), &
+                    1.0_dp, workspace%loop3_w(1, 1, 1), ncenter, &
+                    intermediate_aux_flat(1, 1), nremote*SIZE(intermediate, 3), &
+                    0.0_dp, block(1, 1), ncenter)
+      ELSE
+         ! centered is already a contiguous (center,remote*aux) matrix.
+         CALL dgemm("N", "N", ncenter, nout, nremote*naux, 1.0_dp, &
+                    centered(1, 1, 1), ncenter, workspace%loop3_w_flat(1, 1), &
+                    nremote*naux, 0.0_dp, block(1, 1), ncenter)
+      END IF
+
+   END SUBROUTINE hfx_lri_loop3_central_contract
 
 END MODULE hfx_lri_contract
