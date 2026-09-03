@@ -17,6 +17,8 @@ MODULE hfx_lri_kp
    USE cp_dbcsr_api,                    ONLY: dbcsr_get_block_p,&
                                               dbcsr_p_type
    USE gamma,                           ONLY: init_md_ftable
+   USE hfx_lri_contract,                ONLY: hfx_lri_contract_exchange,&
+                                              hfx_lri_density_cell
    USE hfx_lri_types,                   ONLY: hfx_lri_kp_release,&
                                               hfx_lri_pair_block_type
    USE hfx_types,                       ONLY: hfx_ri_type
@@ -96,6 +98,9 @@ CONTAINS
 
       IF (ri_data%hfx_pot%potential_type /= do_potential_short) THEN
          CPABORT("LRI-HFXk is currently restricted to short-range/HSE exchange")
+      END IF
+      IF (nspins /= 1) THEN
+         CPABORT("LRI-HFXk currently supports only spin-unpolarized calculations")
       END IF
 
       ! Keep dummy arguments referenced in this scaffold.
@@ -1378,7 +1383,7 @@ CONTAINS
    END SUBROUTINE hfx_lri_store_k_block
 
 ! **************************************************************************************************
-!> \brief Accumulates a debug K block for one target pair using nearest-origin density pairs.
+!> \brief Accumulates an exchange K block for one output pair.
 !> \param basis_set_RI ...
 !> \param rho_ao ...
 !> \param cell_to_index ...
@@ -1416,14 +1421,12 @@ CONTAINS
       INTEGER, INTENT(OUT) :: skipped_image, skipped_cell_bounds, skipped_img_index, &
          skipped_missing_rho, skipped_rho_dim, skipped_small_rho, skipped_no_kblock
 
-      INTEGER                                            :: img_pair, img_rev, ipair, ipair_best, &
-                                                            lb1, lb2, lb3, search_iter, ub1, ub2, &
+      INTEGER                                            :: img_pair, img_rev, ipair_left, &
+                                                            ipair_right, lb1, lb2, lb3, ub1, ub2, &
                                                             ub3
-      INTEGER, DIMENSION(3)                              :: cell_rev
+      INTEGER, DIMENSION(3)                              :: cell_density, cell_rev
       LOGICAL                                            :: found, found_rev
-      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: tried_density_pair
-      REAL(dp)                                           :: best_r2, pair_r2, rho_norm2_accum, &
-                                                            rho_pair_norm
+      REAL(dp)                                           :: rho_norm2_accum, rho_pair_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_pair_block, rho_work
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block, rho_block_rev
 
@@ -1448,118 +1451,121 @@ CONTAINS
 
       ALLOCATE (k_accum_block(ri_data%lri_kp%pair_blocks(ipair_target)%nao_i, &
                               ri_data%lri_kp%pair_blocks(ipair_target)%nao_j), SOURCE=0.0_dp)
-      ALLOCATE (tried_density_pair(ri_data%lri_kp%npair_blocks), SOURCE=.FALSE.)
       rho_norm2_accum = 0.0_dp
 
-      DO search_iter = 1, ri_data%lri_kp%npair_blocks
-         ipair_best = 0
-         best_r2 = HUGE(1.0_dp)
-         DO ipair = 1, ri_data%lri_kp%npair_blocks
-            IF (tried_density_pair(ipair)) CYCLE
-            IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
-            IF (ri_data%lri_kp%pair_blocks(ipair)%iatom /= &
-                ri_data%lri_kp%pair_blocks(ipair_target)%iatom) CYCLE
-            pair_r2 = SUM((ri_data%lri_kp%pair_blocks(ipair)%rab - &
-                           ri_data%lri_kp%pair_blocks(ipair_target)%rab)**2)
-            IF (pair_r2 >= best_r2) CYCLE
-            ipair_best = ipair
-            best_r2 = pair_r2
-         END DO
-         IF (ipair_best == 0) EXIT
-         tried_density_pair(ipair_best) = .TRUE.
-         candidate_pairs = candidate_pairs + 1
+      IF (ASSOCIATED(cell_to_index)) THEN
+         lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
+         lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
+         lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
+      END IF
 
-         img_pair = 1
-         IF (ASSOCIATED(cell_to_index)) THEN
-            lb1 = LBOUND(cell_to_index, 1); ub1 = UBOUND(cell_to_index, 1)
-            lb2 = LBOUND(cell_to_index, 2); ub2 = UBOUND(cell_to_index, 2)
-            lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
-            IF (.NOT. (ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell >= [lb1, lb2, lb3]) .AND. &
-                       ALL(ri_data%lri_kp%pair_blocks(ipair_best)%cell <= [ub1, ub2, ub3]))) THEN
-               skipped_cell_bounds = skipped_cell_bounds + 1
+      ! For K_IK(R_IK), combine the fitting pairs I-J(R_IJ) and K-L(R_KL)
+      ! with D_JL(R_JL), where R_JL = R_IK + R_KL - R_IJ. The second
+      ! fitting pair is translated by R_IK when its auxiliary metric is built.
+      DO ipair_left = 1, ri_data%lri_kp%npair_blocks
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_left)%c_fit)) CYCLE
+         IF (ri_data%lri_kp%pair_blocks(ipair_left)%iatom /= &
+             ri_data%lri_kp%pair_blocks(ipair_target)%iatom) CYCLE
+
+         DO ipair_right = 1, ri_data%lri_kp%npair_blocks
+            IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_right)%c_fit)) CYCLE
+            IF (ri_data%lri_kp%pair_blocks(ipair_right)%iatom /= &
+                ri_data%lri_kp%pair_blocks(ipair_target)%jatom) CYCLE
+
+            candidate_pairs = candidate_pairs + 1
+            cell_density(:) = hfx_lri_density_cell( &
+                              ri_data%lri_kp%pair_blocks(ipair_target)%cell, &
+                              ri_data%lri_kp%pair_blocks(ipair_left)%cell, &
+                              ri_data%lri_kp%pair_blocks(ipair_right)%cell)
+
+            img_pair = 1
+            IF (ASSOCIATED(cell_to_index)) THEN
+               IF (.NOT. (ALL(cell_density >= [lb1, lb2, lb3]) .AND. &
+                          ALL(cell_density <= [ub1, ub2, ub3]))) THEN
+                  skipped_cell_bounds = skipped_cell_bounds + 1
+                  skipped_image = skipped_image + 1
+                  CYCLE
+               END IF
+               img_pair = cell_to_index(cell_density(1), cell_density(2), cell_density(3))
+            END IF
+            IF (img_pair < 1 .OR. img_pair > SIZE(rho_ao, 2)) THEN
+               skipped_img_index = skipped_img_index + 1
                skipped_image = skipped_image + 1
                CYCLE
             END IF
-            img_pair = cell_to_index(ri_data%lri_kp%pair_blocks(ipair_best)%cell(1), &
-                                     ri_data%lri_kp%pair_blocks(ipair_best)%cell(2), &
-                                     ri_data%lri_kp%pair_blocks(ipair_best)%cell(3))
-         END IF
-         IF (img_pair < 1 .OR. img_pair > SIZE(rho_ao, 2)) THEN
-            skipped_img_index = skipped_img_index + 1
-            skipped_image = skipped_image + 1
-            CYCLE
-         END IF
 
-         CALL dbcsr_get_block_p(matrix=rho_ao(1, img_pair)%matrix, &
-                                row=ri_data%lri_kp%pair_blocks(ipair_best)%iatom, &
-                                col=ri_data%lri_kp%pair_blocks(ipair_best)%jatom, &
-                                block=rho_block, found=found)
-         IF (ALLOCATED(rho_work)) DEALLOCATE (rho_work)
-         IF (found) THEN
-            IF (SIZE(rho_block, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i .OR. &
-                SIZE(rho_block, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j) THEN
-               skipped_rho_dim = skipped_rho_dim + 1
-               CYCLE
-            END IF
-            ALLOCATE (rho_work(ri_data%lri_kp%pair_blocks(ipair_best)%nao_i, &
-                               ri_data%lri_kp%pair_blocks(ipair_best)%nao_j))
-            rho_work(:, :) = rho_block(1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_i, &
-                                       1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_j)
-         ELSE
-            ! In the image representation the transposed block may be stored as D_ji(-R)^T.
-            ! Try this fallback before treating the density block as missing.
-            found_rev = .FALSE.
-            cell_rev(:) = -ri_data%lri_kp%pair_blocks(ipair_best)%cell(:)
-            img_rev = 0
-            IF (ASSOCIATED(cell_to_index)) THEN
-               IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
-                  img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
+            NULLIFY (rho_block, rho_block_rev)
+            CALL dbcsr_get_block_p(matrix=rho_ao(1, img_pair)%matrix, &
+                                   row=ri_data%lri_kp%pair_blocks(ipair_left)%jatom, &
+                                   col=ri_data%lri_kp%pair_blocks(ipair_right)%jatom, &
+                                   block=rho_block, found=found)
+            IF (ALLOCATED(rho_work)) DEALLOCATE (rho_work)
+            IF (found) THEN
+               IF (SIZE(rho_block, 1) < ri_data%lri_kp%pair_blocks(ipair_left)%nao_j .OR. &
+                   SIZE(rho_block, 2) < ri_data%lri_kp%pair_blocks(ipair_right)%nao_j) THEN
+                  skipped_rho_dim = skipped_rho_dim + 1
+                  CYCLE
                END IF
+               ALLOCATE (rho_work(ri_data%lri_kp%pair_blocks(ipair_left)%nao_j, &
+                                  ri_data%lri_kp%pair_blocks(ipair_right)%nao_j))
+               rho_work(:, :) = rho_block(1:ri_data%lri_kp%pair_blocks(ipair_left)%nao_j, &
+                                          1:ri_data%lri_kp%pair_blocks(ipair_right)%nao_j)
             ELSE
-               img_rev = 1
+               ! In the image representation the transposed block may be stored as D_LJ(-R)^T.
+               found_rev = .FALSE.
+               cell_rev(:) = -cell_density(:)
+               img_rev = 0
+               IF (ASSOCIATED(cell_to_index)) THEN
+                  IF (ALL(cell_rev >= [lb1, lb2, lb3]) .AND. ALL(cell_rev <= [ub1, ub2, ub3])) THEN
+                     img_rev = cell_to_index(cell_rev(1), cell_rev(2), cell_rev(3))
+                  END IF
+               ELSE
+                  img_rev = 1
+               END IF
+               IF (img_rev >= 1 .AND. img_rev <= SIZE(rho_ao, 2)) THEN
+                  CALL dbcsr_get_block_p(matrix=rho_ao(1, img_rev)%matrix, &
+                                         row=ri_data%lri_kp%pair_blocks(ipair_right)%jatom, &
+                                         col=ri_data%lri_kp%pair_blocks(ipair_left)%jatom, &
+                                         block=rho_block_rev, found=found_rev)
+               END IF
+               IF (.NOT. found_rev) THEN
+                  skipped_missing_rho = skipped_missing_rho + 1
+                  CYCLE
+               END IF
+               IF (SIZE(rho_block_rev, 1) < ri_data%lri_kp%pair_blocks(ipair_right)%nao_j .OR. &
+                   SIZE(rho_block_rev, 2) < ri_data%lri_kp%pair_blocks(ipair_left)%nao_j) THEN
+                  skipped_rho_dim = skipped_rho_dim + 1
+                  CYCLE
+               END IF
+               ALLOCATE (rho_work(ri_data%lri_kp%pair_blocks(ipair_left)%nao_j, &
+                                  ri_data%lri_kp%pair_blocks(ipair_right)%nao_j))
+               rho_work(:, :) = &
+                  TRANSPOSE(rho_block_rev(1:ri_data%lri_kp%pair_blocks(ipair_right)%nao_j, &
+                                          1:ri_data%lri_kp%pair_blocks(ipair_left)%nao_j))
             END IF
-            IF (img_rev >= 1 .AND. img_rev <= SIZE(rho_ao, 2)) THEN
-               CALL dbcsr_get_block_p(matrix=rho_ao(1, img_rev)%matrix, &
-                                      row=ri_data%lri_kp%pair_blocks(ipair_best)%jatom, &
-                                      col=ri_data%lri_kp%pair_blocks(ipair_best)%iatom, &
-                                      block=rho_block_rev, found=found_rev)
-            END IF
-            IF (.NOT. found_rev) THEN
-               skipped_missing_rho = skipped_missing_rho + 1
-               CYCLE
-            END IF
-            IF (SIZE(rho_block_rev, 1) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_j .OR. &
-                SIZE(rho_block_rev, 2) < ri_data%lri_kp%pair_blocks(ipair_best)%nao_i) THEN
-               skipped_rho_dim = skipped_rho_dim + 1
-               CYCLE
-            END IF
-            ALLOCATE (rho_work(ri_data%lri_kp%pair_blocks(ipair_best)%nao_i, &
-                               ri_data%lri_kp%pair_blocks(ipair_best)%nao_j))
-            rho_work(:, :) = TRANSPOSE(rho_block_rev(1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_j, &
-                                                     1:ri_data%lri_kp%pair_blocks(ipair_best)%nao_i))
-         END IF
-         rho_pair_norm = SQRT(SUM(rho_work*rho_work))
-         IF (rho_pair_norm < lri_debug_rho_threshold) THEN
-            skipped_small_rho = skipped_small_rho + 1
-            CYCLE
-         END IF
 
-         CALL hfx_lri_contract_pair_pair_density_realv(basis_set_RI, &
-                                                       ri_data%lri_kp%pair_blocks(ipair_target), &
-                                                       ri_data%lri_kp%pair_blocks(ipair_best), &
-                                                       ri_data, rho_work, k_pair_block)
-         IF (.NOT. ALLOCATED(k_pair_block)) THEN
-            skipped_no_kblock = skipped_no_kblock + 1
-            CYCLE
-         END IF
-         k_accum_block(:, :) = k_accum_block(:, :) + k_pair_block(:, :)
-         rho_norm2_accum = rho_norm2_accum + rho_pair_norm*rho_pair_norm
-         used_pairs = used_pairs + 1
-         DEALLOCATE (k_pair_block)
+            rho_pair_norm = SQRT(SUM(rho_work*rho_work))
+            IF (rho_pair_norm < lri_debug_rho_threshold) THEN
+               skipped_small_rho = skipped_small_rho + 1
+               CYCLE
+            END IF
+
+            CALL hfx_lri_contract_pair_pair_density_realv( &
+               basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_target), &
+               ri_data%lri_kp%pair_blocks(ipair_left), &
+               ri_data%lri_kp%pair_blocks(ipair_right), ri_data, rho_work, k_pair_block)
+            IF (.NOT. ALLOCATED(k_pair_block)) THEN
+               skipped_no_kblock = skipped_no_kblock + 1
+               CYCLE
+            END IF
+            k_accum_block(:, :) = k_accum_block(:, :) + k_pair_block(:, :)
+            rho_norm2_accum = rho_norm2_accum + rho_pair_norm*rho_pair_norm
+            used_pairs = used_pairs + 1
+            DEALLOCATE (k_pair_block)
+         END DO
       END DO
 
       IF (ALLOCATED(rho_work)) DEALLOCATE (rho_work)
-      IF (ALLOCATED(tried_density_pair)) DEALLOCATE (tried_density_pair)
       rho_accum_norm = SQRT(rho_norm2_accum)
       IF (used_pairs <= 0) THEN
          IF (ALLOCATED(k_accum_block)) DEALLOCATE (k_accum_block)
@@ -1802,8 +1808,11 @@ CONTAINS
             skipped_small_rho = skipped_small_rho + 1
             CYCLE
          END IF
+         IF (ri_data%lri_kp%pair_blocks(ipair_best)%iatom /= &
+             ri_data%lri_kp%pair_blocks(ipair_sel)%jatom) CYCLE
 
          CALL hfx_lri_contract_pair_pair_density_realv(basis_set_RI, &
+                                                       ri_data%lri_kp%pair_blocks(ipair_sel), &
                                                        ri_data%lri_kp%pair_blocks(ipair_sel), &
                                                        ri_data%lri_kp%pair_blocks(ipair_best), &
                                                        ri_data, rho_work, k_pair_block)
@@ -2188,6 +2197,8 @@ CONTAINS
             candidate_index = candidate_index + 1
             IF (MOD(candidate_index - 1, sample_stride) /= 0) CYCLE
             IF (n_tests >= lri_debug_max_general_tests) CYCLE
+            IF (ri_data%lri_kp%pair_blocks(ipair_density)%iatom /= &
+                ri_data%lri_kp%pair_blocks(ipair_target)%jatom) CYCLE
             n_tests = n_tests + 1
 
             img_pair = 1
@@ -2246,6 +2257,7 @@ CONTAINS
             n_rho_active = n_rho_active + 1
 
             CALL hfx_lri_contract_pair_pair_density_realv(basis_set_RI, &
+                                                          ri_data%lri_kp%pair_blocks(ipair_target), &
                                                           ri_data%lri_kp%pair_blocks(ipair_target), &
                                                           ri_data%lri_kp%pair_blocks(ipair_density), &
                                                           ri_data, rho_work, k_block)
@@ -2317,7 +2329,8 @@ CONTAINS
          lb3 = LBOUND(cell_to_index, 3); ub3 = UBOUND(cell_to_index, 3)
       END IF
 
-      scale = hf_fraction
+      ! rho_ao is the spin-summed RKS density. Its same-spin density is rho_ao/2.
+      scale = -0.5_dp*hf_fraction
       debug_img = 0
       debug_found = .FALSE.
       debug_before_norm = 0.0_dp
@@ -2605,7 +2618,9 @@ CONTAINS
       IF (ASSOCIATED(para_env)) THEN
          CALL para_env%sum(e_unscaled_global)
       END IF
-      e_scaled_global = hf_fraction*e_unscaled_global
+      ! e_unscaled_global already contains the conventional 1/2 Tr[D K_raw].
+      ! The RKS Fock contribution is -hf_fraction*K_raw/2.
+      e_scaled_global = -0.5_dp*hf_fraction*e_unscaled_global
       ehfx = e_scaled_global
 
       skipped_blocks = ri_data%lri_kp%nk_blocks - added_blocks
@@ -2628,69 +2643,54 @@ CONTAINS
    END SUBROUTINE hfx_lri_compute_rank_local_energy
 
 ! **************************************************************************************************
-!> \brief Contracts a target pair with a density pair and a real pair-pair auxiliary metric.
+!> \brief Contracts two fitting pairs and a density block into one exchange K block.
 !> \param basis_set_RI ...
-!> \param pair_target ...
-!> \param pair_density ...
+!> \param pair_output ...
+!> \param pair_left ...
+!> \param pair_right ...
 !> \param ri_data ...
 !> \param rho_block ...
 !> \param k_block ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_contract_pair_pair_density_realv(basis_set_RI, pair_target, pair_density, &
-                                                       ri_data, rho_block, k_block)
+   SUBROUTINE hfx_lri_contract_pair_pair_density_realv(basis_set_RI, pair_output, pair_left, &
+                                                       pair_right, ri_data, rho_block, k_block)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_RI
-      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_target, pair_density
+      TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_output, pair_left, pair_right
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: rho_block
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
          INTENT(OUT)                                     :: k_block
 
-      INTEGER                                            :: iao, irow, jao
-      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: aux_density, aux_target, d_vec, k_vec
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_density, c_target, v_sph
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: v_sph
 
-      IF (.NOT. ALLOCATED(pair_target%c_fit)) RETURN
-      IF (.NOT. ALLOCATED(pair_density%c_fit)) RETURN
-      IF (SIZE(rho_block, 1) < pair_density%nao_i .OR. &
-          SIZE(rho_block, 2) < pair_density%nao_j) RETURN
+      IF (.NOT. ALLOCATED(pair_left%c_fit)) RETURN
+      IF (.NOT. ALLOCATED(pair_right%c_fit)) RETURN
+      IF (pair_left%iatom /= pair_output%iatom .OR. &
+          pair_right%iatom /= pair_output%jatom) THEN
+         CPABORT("Inconsistent atom labels in LRI-HFXk exchange contraction")
+      END IF
+      IF (pair_left%nao_i /= pair_output%nao_i .OR. &
+          pair_right%nao_i /= pair_output%nao_j) THEN
+         CPABORT("Inconsistent output dimensions in LRI-HFXk exchange contraction")
+      END IF
+      IF (SIZE(rho_block, 1) < pair_left%nao_j .OR. &
+          SIZE(rho_block, 2) < pair_right%nao_j) RETURN
 
-      CALL hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_target, pair_density, ri_data, v_sph)
+      CALL hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_left, pair_right, ri_data, v_sph, &
+                                         right_shift=pair_output%rab)
       IF (.NOT. ALLOCATED(v_sph)) RETURN
-      IF (SIZE(v_sph, 1) /= pair_target%naux_pair .OR. &
-          SIZE(v_sph, 2) /= pair_density%naux_pair) THEN
+      IF (SIZE(v_sph, 1) /= pair_left%naux_pair .OR. &
+          SIZE(v_sph, 2) /= pair_right%naux_pair) THEN
          CPABORT("Inconsistent auxiliary dimension in LRI-HFXk pair-pair density contraction")
       END IF
 
-      CALL hfx_lri_flatten_pair_coefficients(pair_target, c_target)
-      CALL hfx_lri_flatten_pair_coefficients(pair_density, c_density)
+      CALL hfx_lri_contract_exchange( &
+         pair_left%c_fit, pair_right%c_fit, v_sph, &
+         rho_block(1:pair_left%nao_j, 1:pair_right%nao_j), k_block)
 
-      ALLOCATE (d_vec(pair_density%nao_i*pair_density%nao_j), SOURCE=0.0_dp)
-      irow = 0
-      DO jao = 1, pair_density%nao_j
-         DO iao = 1, pair_density%nao_i
-            irow = irow + 1
-            d_vec(irow) = rho_block(iao, jao)
-         END DO
-      END DO
-
-      ALLOCATE (aux_density(pair_density%naux_pair), aux_target(pair_target%naux_pair), &
-                k_vec(SIZE(c_target, 1)), SOURCE=0.0_dp)
-      aux_density = MATMUL(TRANSPOSE(c_density), d_vec)
-      aux_target = MATMUL(v_sph, aux_density)
-      k_vec = MATMUL(c_target, aux_target)
-
-      ALLOCATE (k_block(pair_target%nao_i, pair_target%nao_j), SOURCE=0.0_dp)
-      irow = 0
-      DO jao = 1, pair_target%nao_j
-         DO iao = 1, pair_target%nao_i
-            irow = irow + 1
-            k_block(iao, jao) = k_vec(irow)
-         END DO
-      END DO
-
-      DEALLOCATE (k_vec, aux_target, aux_density, d_vec, c_density, c_target, v_sph)
+      DEALLOCATE (v_sph)
 
    END SUBROUTINE hfx_lri_contract_pair_pair_density_realv
 
@@ -2746,8 +2746,10 @@ CONTAINS
 !> \param pair_right ...
 !> \param ri_data ...
 !> \param v_sph ...
+!> \param right_shift ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_left, pair_right, ri_data, v_sph)
+   SUBROUTINE hfx_lri_build_pair_pair_v_sph(basis_set_RI, pair_left, pair_right, ri_data, v_sph, &
+                                            right_shift)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_RI
@@ -2755,6 +2757,7 @@ CONTAINS
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
          INTENT(OUT)                                     :: v_sph
+      REAL(dp), DIMENSION(3), INTENT(IN), OPTIONAL       :: right_shift
 
       INTEGER                                            :: ic_left, ic_right, maxl_all, &
                                                             maxl_center, naux_left, naux_right, &
@@ -2762,6 +2765,7 @@ CONTAINS
       INTEGER, DIMENSION(2)                              :: raw_offset_left, raw_offset_right
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sphi_center, sphi_left, sphi_right, tmp, &
                                                             v_raw
+      REAL(dp), DIMENSION(3)                             :: shift_right
       TYPE(cp_libint_t)                                  :: lib2
       TYPE(gto_basis_set_type), POINTER                  :: rbas_left, rbas_right
 
@@ -2770,6 +2774,9 @@ CONTAINS
       IF (ALLOCATED(v_sph)) DEALLOCATE (v_sph)
       IF (pair_left%naux_centers <= 0 .OR. pair_right%naux_centers <= 0) RETURN
       IF (pair_left%naux_centers > 2 .OR. pair_right%naux_centers > 2) RETURN
+
+      shift_right(:) = 0.0_dp
+      IF (PRESENT(right_shift)) shift_right(:) = right_shift(:)
 
       nraw_left = 0
       nraw_right = 0
@@ -2814,7 +2821,7 @@ CONTAINS
          DO ic_right = 1, pair_right%naux_centers
             rbas_right => basis_set_RI(pair_right%aux_kind(ic_right))%gto_basis_set
             CALL hfx_lri_fill_2c_block(rbas_left, rbas_right, pair_left%aux_r(:, ic_left), &
-                                       pair_right%aux_r(:, ic_right), lib2, ri_data, v_raw, &
+                                       pair_right%aux_r(:, ic_right) + shift_right, lib2, ri_data, v_raw, &
                                        raw_offset_left(ic_left), raw_offset_right(ic_right))
          END DO
       END DO
