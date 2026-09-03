@@ -16,7 +16,8 @@ MODULE coulomb_integral_interface
                                               library_libint,&
                                               library_native
    USE kinds,                           ONLY: dp
-   USE libint_2c_3c,                    ONLY: eri_2center,&
+   USE libint_2c_3c,                    ONLY: coulomb_cutoff_screen_factor => cutoff_screen_factor,&
+                                              eri_2center,&
                                               eri_3center
    USE libint_wrapper,                  ONLY: cp_libint_cleanup_2eri,&
                                               cp_libint_cleanup_3eri,&
@@ -32,6 +33,7 @@ MODULE coulomb_integral_interface
    PRIVATE
 
    PUBLIC :: coulomb_integral_cleanup, &
+             coulomb_cutoff_screen_factor, &
              coulomb_integral_init, &
              coulomb_operator_type, &
              compute_coulomb_2c, &
