@@ -13,6 +13,11 @@ MODULE hfx_lri_kp
    USE basis_set_types,                 ONLY: get_gto_basis_set,&
                                               gto_basis_set_p_type,&
                                               gto_basis_set_type
+   USE coulomb_integral_interface,      ONLY: compute_coulomb_2c,&
+                                              compute_coulomb_3c,&
+                                              coulomb_integral_cleanup,&
+                                              coulomb_integral_context_type,&
+                                              coulomb_integral_init
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_get_block_p,&
                                               dbcsr_p_type
@@ -23,18 +28,12 @@ MODULE hfx_lri_kp
                                               hfx_lri_pair_block_type
    USE hfx_types,                       ONLY: hfx_ri_type
    USE input_constants,                 ONLY: do_potential_short
+   USE integral_library_types,          ONLY: active_integral_library,&
+                                              library_libint
    USE kinds,                           ONLY: dp,&
                                               int_8
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_type
-   USE libint_2c_3c,                    ONLY: eri_2center,&
-                                              eri_3center
-   USE libint_wrapper,                  ONLY: cp_libint_cleanup_2eri,&
-                                              cp_libint_cleanup_3eri,&
-                                              cp_libint_init_2eri,&
-                                              cp_libint_init_3eri,&
-                                              cp_libint_set_contrdepth,&
-                                              cp_libint_t
    USE message_passing,                 ONLY: mp_para_env_type
    USE orbital_pointers,                ONLY: ncoset
    USE qs_environment_types,            ONLY: get_qs_env,&
@@ -98,6 +97,10 @@ CONTAINS
 
       IF (ri_data%hfx_pot%potential_type /= do_potential_short) THEN
          CPABORT("LRI-HFXk is currently restricted to short-range/HSE exchange")
+      END IF
+      IF (active_integral_library%coulomb2_library /= library_libint .OR. &
+          active_integral_library%coulomb3_library /= library_libint) THEN
+         CPABORT("LRI-HFXk requires LIBINT for COULOMB_2C and COULOMB_3C")
       END IF
       IF (nspins /= 1) THEN
          CPABORT("LRI-HFXk currently supports only spin-unpolarized calculations")
@@ -589,7 +592,7 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: c_sph, cvc_block, j_block, j_sph, metric_block, &
          metric_sph, sphi_aux, sphi_i, sphi_j, sphi_pair, sphi_ri_i, sphi_ri_j, tmp_cvc, tmp_sph
       REAL(dp), DIMENSION(3)                             :: r0
-      TYPE(cp_libint_t)                                  :: lib2, lib3
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
 
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
@@ -639,10 +642,8 @@ CONTAINS
       mmax = MAX(maxl_ri + maxl_rj, maxl_ai + maxl_aj + MAX(maxl_ri, maxl_rj))
       CALL init_md_ftable(nmax=mmax)
 
-      CALL cp_libint_init_2eri(lib2, MAX(maxl_ri, maxl_rj))
-      CALL cp_libint_set_contrdepth(lib2, 1)
-      CALL cp_libint_init_3eri(lib3, MAX(maxl_ai, maxl_aj, maxl_ri, maxl_rj))
-      CALL cp_libint_set_contrdepth(lib3, 1)
+      CALL coulomb_integral_init(integral_context, max_am_2c=MAX(maxl_ri, maxl_rj), &
+                                 max_am_3c=MAX(maxl_ai, maxl_aj, maxl_ri, maxl_rj))
 
       r0(:) = 0.0_dp
       metric_norm2 = 0.0_dp
@@ -655,19 +656,19 @@ CONTAINS
       onsite_aux = (NORM2(rab) <= 1.0E-12_dp .AND. ikind == jkind)
 
       IF (do_debug_probe) THEN
-         CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_i, r0, r0, lib2, ri_data, metric_ncart, &
+         CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_i, r0, r0, integral_context, ri_data, metric_ncart, &
                                          metric_norm2)
          IF (.NOT. onsite_aux) THEN
-            CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_j, r0, rab, lib2, ri_data, metric_ncart, &
+            CALL hfx_lri_accumulate_2c_norm(rbas_i, rbas_j, r0, rab, integral_context, ri_data, metric_ncart, &
                                             metric_norm2, prefactor=2.0_dp)
-            CALL hfx_lri_accumulate_2c_norm(rbas_j, rbas_j, rab, rab, lib2, ri_data, metric_ncart, &
+            CALL hfx_lri_accumulate_2c_norm(rbas_j, rbas_j, rab, rab, integral_context, ri_data, metric_ncart, &
                                             metric_norm2)
          END IF
 
-         CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_i, r0, rab, r0, lib3, ri_data, &
+         CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_i, r0, rab, r0, integral_context, ri_data, &
                                          threec_i_ncart, threec_i_norm2)
          IF (.NOT. onsite_aux) THEN
-            CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_j, r0, rab, rab, lib3, ri_data, &
+            CALL hfx_lri_accumulate_3c_norm(obas_i, obas_j, rbas_j, r0, rab, rab, integral_context, ri_data, &
                                             threec_j_ncart, threec_j_norm2)
          END IF
       END IF
@@ -685,16 +686,16 @@ CONTAINS
          ALLOCATE (metric_block(metric_dim, metric_dim), SOURCE=0.0_dp)
          ALLOCATE (j_block(threec_rows, threec_cols), SOURCE=0.0_dp)
 
-         CALL hfx_lri_fill_2c_block(rbas_i, rbas_i, r0, r0, lib2, ri_data, metric_block, 0, 0)
-         CALL hfx_lri_fill_3c_block(obas_i, obas_j, rbas_i, r0, rab, r0, lib3, ri_data, &
+         CALL hfx_lri_fill_2c_block(rbas_i, rbas_i, r0, r0, integral_context, ri_data, metric_block, 0, 0)
+         CALL hfx_lri_fill_3c_block(obas_i, obas_j, rbas_i, r0, rab, r0, integral_context, ri_data, &
                                     j_block, 0, ncart_aj)
          IF (.NOT. onsite_aux) THEN
             offset_j = ncart_ri
-            CALL hfx_lri_fill_2c_block(rbas_i, rbas_j, r0, rab, lib2, ri_data, metric_block, 0, &
+            CALL hfx_lri_fill_2c_block(rbas_i, rbas_j, r0, rab, integral_context, ri_data, metric_block, 0, &
                                        offset_j, symmetric=.TRUE.)
-            CALL hfx_lri_fill_2c_block(rbas_j, rbas_j, rab, rab, lib2, ri_data, metric_block, &
+            CALL hfx_lri_fill_2c_block(rbas_j, rbas_j, rab, rab, integral_context, ri_data, metric_block, &
                                        offset_j, offset_j)
-            CALL hfx_lri_fill_3c_block(obas_i, obas_j, rbas_j, r0, rab, rab, lib3, ri_data, &
+            CALL hfx_lri_fill_3c_block(obas_i, obas_j, rbas_j, r0, rab, rab, integral_context, ri_data, &
                                        j_block, offset_j, ncart_aj)
          END IF
 
@@ -774,8 +775,7 @@ CONTAINS
          DEALLOCATE (j_block, metric_block)
       END IF
 
-      CALL cp_libint_cleanup_2eri(lib2)
-      CALL cp_libint_cleanup_3eri(lib3)
+      CALL coulomb_integral_cleanup(integral_context)
 
       metric_norm = SQRT(metric_norm2)
       threec_i_norm = SQRT(threec_i_norm2)
@@ -789,18 +789,18 @@ CONTAINS
 !> \param basis_b ...
 !> \param ra ...
 !> \param rb ...
-!> \param lib ...
+!> \param integral_context ...
 !> \param ri_data ...
 !> \param ncart_total ...
 !> \param norm2_total ...
 !> \param prefactor ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_accumulate_2c_norm(basis_a, basis_b, ra, rb, lib, ri_data, ncart_total, &
+   SUBROUTINE hfx_lri_accumulate_2c_norm(basis_a, basis_b, ra, rb, integral_context, ri_data, ncart_total, &
                                          norm2_total, prefactor)
 
       TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb
-      TYPE(cp_libint_t), INTENT(INOUT)                   :: lib
+      TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       INTEGER, INTENT(INOUT)                             :: ncart_total
       REAL(dp), INTENT(INOUT)                            :: norm2_total
@@ -809,7 +809,7 @@ CONTAINS
       INTEGER                                            :: iset, jset, ncoa, ncob, nseta, nsetb
       INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmin_a, lmin_b, npgf_a, &
                                                             npgf_b
-      REAL(dp)                                           :: dab, pfac
+      REAL(dp)                                           :: pfac
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sij
       REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, zeta_a, zeta_b
 
@@ -820,7 +820,6 @@ CONTAINS
 
       pfac = 1.0_dp
       IF (PRESENT(prefactor)) pfac = prefactor
-      dab = NORM2(rb - ra)
 
       DO iset = 1, nseta
          ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
@@ -828,9 +827,10 @@ CONTAINS
             ncob = npgf_b(jset)*ncoset(lmax_b(jset))
             IF (ncoa*ncob == 0) CYCLE
             ALLOCATE (sij(ncoa, ncob), SOURCE=0.0_dp)
-            CALL eri_2center(sij, lmin_a(iset), lmax_a(iset), npgf_a(iset), zeta_a(:, iset), &
-                             rpgf_a(:, iset), ra, lmin_b(jset), lmax_b(jset), npgf_b(jset), &
-                             zeta_b(:, jset), rpgf_b(:, jset), rb, dab, lib, ri_data%hfx_pot)
+            CALL compute_coulomb_2c(integral_context, lmin_a(iset), lmax_a(iset), &
+                                    lmin_b(jset), lmax_b(jset), npgf_a(iset), npgf_b(jset), &
+                                    zeta_a(:, iset), zeta_b(:, jset), rpgf_a(:, iset), &
+                                    rpgf_b(:, jset), ra, rb, sij, ri_data%hfx_pot)
             ncart_total = ncart_total + SIZE(sij)
             norm2_total = norm2_total + pfac*SUM(sij*sij)
             DEALLOCATE (sij)
@@ -847,17 +847,17 @@ CONTAINS
 !> \param ra ...
 !> \param rb ...
 !> \param rc ...
-!> \param lib ...
+!> \param integral_context ...
 !> \param ri_data ...
 !> \param ncart_total ...
 !> \param norm2_total ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_accumulate_3c_norm(basis_a, basis_b, basis_c, ra, rb, rc, lib, ri_data, &
+   SUBROUTINE hfx_lri_accumulate_3c_norm(basis_a, basis_b, basis_c, ra, rb, rc, integral_context, ri_data, &
                                          ncart_total, norm2_total)
 
       TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b, basis_c
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb, rc
-      TYPE(cp_libint_t), INTENT(INOUT)                   :: lib
+      TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       INTEGER, INTENT(INOUT)                             :: ncart_total
       REAL(dp), INTENT(INOUT)                            :: norm2_total
@@ -866,7 +866,6 @@ CONTAINS
                                                             nseta, nsetb, nsetc
       INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmax_c, lmin_a, lmin_b, &
                                                             lmin_c, npgf_a, npgf_b, npgf_c
-      REAL(dp)                                           :: dab, dac, dbc
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: sijk
       REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, rpgf_c, zeta_a, zeta_b, &
                                                             zeta_c
@@ -878,10 +877,6 @@ CONTAINS
       CALL get_gto_basis_set(basis_c, lmax=lmax_c, lmin=lmin_c, npgf=npgf_c, nset=nsetc, &
                              pgf_radius=rpgf_c, zet=zeta_c)
 
-      dab = NORM2(rb - ra)
-      dac = NORM2(rc - ra)
-      dbc = NORM2(rc - rb)
-
       DO iset = 1, nseta
          ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
          DO jset = 1, nsetb
@@ -890,11 +885,12 @@ CONTAINS
                ncoc = npgf_c(kset)*ncoset(lmax_c(kset))
                IF (ncoa*ncob*ncoc == 0) CYCLE
                ALLOCATE (sijk(ncoa, ncob, ncoc), SOURCE=0.0_dp)
-               CALL eri_3center(sijk, lmin_a(iset), lmax_a(iset), npgf_a(iset), zeta_a(:, iset), &
-                                rpgf_a(:, iset), ra, lmin_b(jset), lmax_b(jset), npgf_b(jset), &
-                                zeta_b(:, jset), rpgf_b(:, jset), rb, lmin_c(kset), lmax_c(kset), &
-                                npgf_c(kset), zeta_c(:, kset), rpgf_c(:, kset), rc, dab, dac, dbc, &
-                                lib, ri_data%hfx_pot)
+               CALL compute_coulomb_3c(integral_context, lmin_a(iset), lmax_a(iset), &
+                                       lmin_b(jset), lmax_b(jset), lmin_c(kset), lmax_c(kset), &
+                                       npgf_a(iset), npgf_b(jset), npgf_c(kset), zeta_a(:, iset), &
+                                       zeta_b(:, jset), zeta_c(:, kset), rpgf_a(:, iset), &
+                                       rpgf_b(:, jset), rpgf_c(:, kset), ra, rb, rc, sijk, &
+                                       ri_data%hfx_pot)
                ncart_total = ncart_total + SIZE(sijk)
                norm2_total = norm2_total + SUM(sijk*sijk)
                DEALLOCATE (sijk)
@@ -930,19 +926,19 @@ CONTAINS
 !> \param basis_b ...
 !> \param ra ...
 !> \param rb ...
-!> \param lib ...
+!> \param integral_context ...
 !> \param ri_data ...
 !> \param mat ...
 !> \param offset_a ...
 !> \param offset_b ...
 !> \param symmetric ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_fill_2c_block(basis_a, basis_b, ra, rb, lib, ri_data, mat, offset_a, &
+   SUBROUTINE hfx_lri_fill_2c_block(basis_a, basis_b, ra, rb, integral_context, ri_data, mat, offset_a, &
                                     offset_b, symmetric)
 
       TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb
-      TYPE(cp_libint_t), INTENT(INOUT)                   :: lib
+      TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: mat
       INTEGER, INTENT(IN)                                :: offset_a, offset_b
@@ -953,7 +949,6 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmin_a, lmin_b, npgf_a, &
                                                             npgf_b
       LOGICAL                                            :: do_sym
-      REAL(dp)                                           :: dab
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sij
       REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, zeta_a, zeta_b
 
@@ -964,7 +959,6 @@ CONTAINS
 
       do_sym = .FALSE.
       IF (PRESENT(symmetric)) do_sym = symmetric
-      dab = NORM2(rb - ra)
       ia0 = offset_a
       DO iset = 1, nseta
          ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
@@ -973,9 +967,10 @@ CONTAINS
             ncob = npgf_b(jset)*ncoset(lmax_b(jset))
             IF (ncoa*ncob > 0) THEN
                ALLOCATE (sij(ncoa, ncob), SOURCE=0.0_dp)
-               CALL eri_2center(sij, lmin_a(iset), lmax_a(iset), npgf_a(iset), zeta_a(:, iset), &
-                                rpgf_a(:, iset), ra, lmin_b(jset), lmax_b(jset), npgf_b(jset), &
-                                zeta_b(:, jset), rpgf_b(:, jset), rb, dab, lib, ri_data%hfx_pot)
+               CALL compute_coulomb_2c(integral_context, lmin_a(iset), lmax_a(iset), &
+                                       lmin_b(jset), lmax_b(jset), npgf_a(iset), npgf_b(jset), &
+                                       zeta_a(:, iset), zeta_b(:, jset), rpgf_a(:, iset), &
+                                       rpgf_b(:, jset), ra, rb, sij, ri_data%hfx_pot)
                mat(ia0 + 1:ia0 + ncoa, ib0 + 1:ib0 + ncob) = sij
                IF (do_sym) THEN
                   mat(ib0 + 1:ib0 + ncob, ia0 + 1:ia0 + ncoa) = TRANSPOSE(sij)
@@ -997,18 +992,18 @@ CONTAINS
 !> \param ra ...
 !> \param rb ...
 !> \param rc ...
-!> \param lib ...
+!> \param integral_context ...
 !> \param ri_data ...
 !> \param mat ...
 !> \param offset_c ...
 !> \param ncart_b ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_fill_3c_block(basis_a, basis_b, basis_c, ra, rb, rc, lib, ri_data, mat, &
+   SUBROUTINE hfx_lri_fill_3c_block(basis_a, basis_b, basis_c, ra, rb, rc, integral_context, ri_data, mat, &
                                     offset_c, ncart_b)
 
       TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b, basis_c
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb, rc
-      TYPE(cp_libint_t), INTENT(INOUT)                   :: lib
+      TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: mat
       INTEGER, INTENT(IN)                                :: offset_c, ncart_b
@@ -1017,7 +1012,6 @@ CONTAINS
                                                             ncoa, ncob, ncoc, nseta, nsetb, nsetc
       INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmax_c, lmin_a, lmin_b, &
                                                             lmin_c, npgf_a, npgf_b, npgf_c
-      REAL(dp)                                           :: dab, dac, dbc
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: sijk
       REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, rpgf_c, zeta_a, zeta_b, &
                                                             zeta_c
@@ -1029,9 +1023,6 @@ CONTAINS
       CALL get_gto_basis_set(basis_c, lmax=lmax_c, lmin=lmin_c, npgf=npgf_c, nset=nsetc, &
                              pgf_radius=rpgf_c, zet=zeta_c)
 
-      dab = NORM2(rb - ra)
-      dac = NORM2(rc - ra)
-      dbc = NORM2(rc - rb)
       ia0 = 0
       DO iset = 1, nseta
          ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
@@ -1043,11 +1034,12 @@ CONTAINS
                ncoc = npgf_c(kset)*ncoset(lmax_c(kset))
                IF (ncoa*ncob*ncoc > 0) THEN
                   ALLOCATE (sijk(ncoa, ncob, ncoc), SOURCE=0.0_dp)
-                  CALL eri_3center(sijk, lmin_a(iset), lmax_a(iset), npgf_a(iset), zeta_a(:, iset), &
-                                   rpgf_a(:, iset), ra, lmin_b(jset), lmax_b(jset), npgf_b(jset), &
-                                   zeta_b(:, jset), rpgf_b(:, jset), rb, lmin_c(kset), lmax_c(kset), &
-                                   npgf_c(kset), zeta_c(:, kset), rpgf_c(:, kset), rc, dab, dac, &
-                                   dbc, lib, ri_data%hfx_pot)
+                  CALL compute_coulomb_3c(integral_context, lmin_a(iset), lmax_a(iset), &
+                                          lmin_b(jset), lmax_b(jset), lmin_c(kset), lmax_c(kset), &
+                                          npgf_a(iset), npgf_b(jset), npgf_c(kset), zeta_a(:, iset), &
+                                          zeta_b(:, jset), zeta_c(:, kset), rpgf_a(:, iset), &
+                                          rpgf_b(:, jset), rpgf_c(:, kset), ra, rb, rc, sijk, &
+                                          ri_data%hfx_pot)
                   DO ia = 1, ncoa
                      DO ib = 1, ncob
                         mat((ia0 + ia - 1)*ncart_b + ib0 + ib, &
@@ -2766,7 +2758,7 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sphi_center, sphi_left, sphi_right, tmp, &
                                                             v_raw
       REAL(dp), DIMENSION(3)                             :: shift_right
-      TYPE(cp_libint_t)                                  :: lib2
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(gto_basis_set_type), POINTER                  :: rbas_left, rbas_right
 
       NULLIFY (rbas_left, rbas_right)
@@ -2812,8 +2804,7 @@ CONTAINS
       END IF
 
       CALL init_md_ftable(nmax=2*maxl_all)
-      CALL cp_libint_init_2eri(lib2, maxl_all)
-      CALL cp_libint_set_contrdepth(lib2, 1)
+      CALL coulomb_integral_init(integral_context, max_am_2c=maxl_all)
 
       ALLOCATE (v_raw(nraw_left, nraw_right), SOURCE=0.0_dp)
       DO ic_left = 1, pair_left%naux_centers
@@ -2821,8 +2812,8 @@ CONTAINS
          DO ic_right = 1, pair_right%naux_centers
             rbas_right => basis_set_RI(pair_right%aux_kind(ic_right))%gto_basis_set
             CALL hfx_lri_fill_2c_block(rbas_left, rbas_right, pair_left%aux_r(:, ic_left), &
-                                       pair_right%aux_r(:, ic_right) + shift_right, lib2, ri_data, v_raw, &
-                                       raw_offset_left(ic_left), raw_offset_right(ic_right))
+                                       pair_right%aux_r(:, ic_right) + shift_right, integral_context, &
+                                       ri_data, v_raw, raw_offset_left(ic_left), raw_offset_right(ic_right))
          END DO
       END DO
 
@@ -2851,7 +2842,7 @@ CONTAINS
       v_sph = MATMUL(TRANSPOSE(sphi_left), tmp)
 
       DEALLOCATE (tmp, sphi_right, sphi_left, v_raw)
-      CALL cp_libint_cleanup_2eri(lib2)
+      CALL coulomb_integral_cleanup(integral_context)
 
    END SUBROUTINE hfx_lri_build_pair_pair_v_sph
 
