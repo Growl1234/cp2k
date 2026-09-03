@@ -59,6 +59,9 @@ CONTAINS
       TYPE(coulomb_integral_context_type), INTENT(INOUT) :: context
       INTEGER, INTENT(IN), OPTIONAL                      :: max_am_2c, max_am_3c
 
+      context%initialized_2c = .FALSE.
+      context%initialized_3c = .FALSE.
+
       IF (PRESENT(max_am_2c)) THEN
          SELECT CASE (active_integral_library%coulomb2_library)
          CASE (library_libint)
