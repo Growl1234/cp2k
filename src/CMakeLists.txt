@@ -246,6 +246,7 @@ list(
   hfx_exx.F
   hfx_helpers.F
   hfx_libint_interface.F
+  hfx_lri_contract.F
   hfx_lri_kp.F
   hfx_lri_types.F
   hfx_load_balance_methods.F
@@ -1567,6 +1568,7 @@ set(CP2K_PROGS_F
     common/parallel_rng_types_unittest.F
     kpoint_lattice_fft_unittest.F
     kpoint_smearing_unittest.F
+    hfx_lri_contract_unittest.F
     qs_ot_minimizer_unittest.F
     optbas_frontier_orbitals_utils_unittest.F
     rirs_grid_utils_unittest.F
@@ -1982,6 +1984,7 @@ list(
   "parallel_rng_types_unittest"
   "kpoint_lattice_fft_unittest"
   "kpoint_smearing_unittest"
+  "hfx_lri_contract_unittest"
   "qs_ot_minimizer_unittest"
   "optbas_frontier_orbitals_utils_unittest"
   "rirs_grid_utils_unittest"
@@ -2013,6 +2016,7 @@ add_executable(memory_utilities_unittest common/memory_utilities_unittest.F)
 add_executable(parallel_rng_types_unittest common/parallel_rng_types_unittest.F)
 add_executable(kpoint_lattice_fft_unittest kpoint_lattice_fft_unittest.F)
 add_executable(kpoint_smearing_unittest kpoint_smearing_unittest.F)
+add_executable(hfx_lri_contract_unittest hfx_lri_contract_unittest.F)
 add_executable(qs_ot_minimizer_unittest qs_ot_minimizer_unittest.F)
 add_executable(optbas_frontier_orbitals_utils_unittest
                optbas_frontier_orbitals_utils_unittest.F)
