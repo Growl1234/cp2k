@@ -69,14 +69,12 @@ MODULE admm_methods
                                               cp_print_key_finished_output,&
                                               cp_print_key_should_output,&
                                               cp_print_key_unit_nr
-   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: do_admm_purify_cauchy,&
                                               do_admm_purify_cauchy_subspace,&
                                               do_admm_purify_mo_diag,&
                                               do_admm_purify_mo_no_diag,&
                                               do_admm_purify_none
-   USE input_section_types,             ONLY: section_vals_get_subs_vals,&
-                                              section_vals_type,&
+   USE input_section_types,             ONLY: section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: default_string_length,&
                                               dp
@@ -288,6 +286,7 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
       CHARACTER(len=*), PARAMETER :: routineN = 'admm_mo_calc_rho_aux_kp'
+
       CHARACTER(LEN=default_string_length)               :: basis_type
       INTEGER                                            :: handle, i, igroup, ik, ikp, img, indx, &
                                                             ispin, kplocal, nao_aux_fit, nao_orb, &
@@ -320,11 +319,6 @@ CONTAINS
       TYPE(kpoint_env_type), POINTER                     :: kp
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos, mos_aux_fit
-      CHARACTER(len=*), PARAMETER :: real_space_density_warning = &
-         "K-point ADMM is initializing P(k) from the real-space density because populated "// &
-         "k-point MOs are unavailable. This is expected for ATOMIC and density-only restart "// &
-         "guesses; a converged GGA restart is recommended for difficult hybrid SCF cycles."
-
       TYPE(mo_set_type), DIMENSION(:, :), POINTER        :: mos_aux_fit_kp, mos_kp
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
@@ -397,7 +391,7 @@ CONTAINS
 
       CALL cp_fm_struct_create(struct_aux_orb, context=kpoints%blacs_env, para_env=kpoints%para_env_kp, &
                                nrow_global=nao_aux_fit, ncol_global=nao_orb)
-      CALL cp_fm_create(work_aux_orb, struct_aux_orb)
+      CALL cp_fm_create(work_aux_orb, struct_orb_orb)
 
       IF (.NOT. use_real_wfn) THEN
          CALL cp_cfm_create(cpmatrix, struct_orb_orb)
@@ -457,9 +451,7 @@ CONTAINS
       pmat_from_rs = .FALSE.
       IF (maxval_mos < EPSILON(0.0_dp)) pmat_from_rs = .TRUE.
 
-      IF (pmat_from_rs) THEN
-         CPWARN(real_space_density_warning)
-      END IF
+      !TODO: issue a warning when doing ADMM with ATOMIC guess. If small number of K-points => leads to bad things
 
       ALLOCATE (info(kplocal*nspins*nkp_groups, 2))
       !Start communication: only P matrix, and only if required
@@ -544,12 +536,6 @@ CONTAINS
                occ_num_aux(1:nmo) = occ_num(1:nmo)
 
                IF (pmat_from_rs) THEN
-                  ! Keep the main-basis k-point density synchronized with the exact matrix that is
-                  ! projected below.  A density-only restart (and the ATOMIC guess) enters through
-                  ! the real-space matrix, so kp_env%pmat has not otherwise been constructed from
-                  ! MOs yet.  Downstream ADMM overlap-force and validation paths require this P(k).
-                  CALL cp_fm_to_fm( &
-                     work_orb_orb, kpoints%kp_env(ikp)%kpoint_env%pmat(1, ispin))
                   !We project on the AUX basis: P_aux = A * P *A^T
                   CALL parallel_gemm('N', 'N', nao_aux_fit, nao_orb, nao_orb, 1.0_dp, kp%amat(1, 1), &
                                      work_orb_orb, 0.0_dp, work_aux_orb)
@@ -593,12 +579,6 @@ CONTAINS
                END DO
 
                IF (pmat_from_rs) THEN
-                  ! See the real-wavefunction branch above.  Store both Hermitian components of
-                  ! the current main-basis P(k) before forming P_aux=A*P*A^H.
-                  CALL cp_cfm_to_fm( &
-                     cpmatrix, &
-                     mtargetr=kpoints%kp_env(ikp)%kpoint_env%pmat(1, ispin), &
-                     mtargeti=kpoints%kp_env(ikp)%kpoint_env%pmat(2, ispin))
                   CALL parallel_gemm('N', 'N', nao_aux_fit, nao_orb, nao_orb, z_one, cA, &
                                      cpmatrix, z_zero, cwork_aux_orb)
                   CALL parallel_gemm('N', 'C', nao_aux_fit, nao_aux_fit, nao_orb, z_one, cwork_aux_orb, &
@@ -1968,18 +1948,13 @@ CONTAINS
       COMPLEX(dp)                                        :: fac, fac2
       INTEGER                                            :: handle, i, igroup, ik, ikp, img, indx, &
                                                             ispin, kplocal, nao_aux_fit, nao_orb, &
-                                                            natom, nkp, nkp_groups, nspins, &
-                                                            output_unit
+                                                            natom, nkp, nkp_groups, nspins
       INTEGER, DIMENSION(2)                              :: kp_range
       INTEGER, DIMENSION(:, :), POINTER                  :: kp_dist
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      LOGICAL                                            :: lri_validate, my_kpgrp, use_real_wfn, &
-                                                            validate_admm_projection
-      REAL(dp) :: a_abs_max, a_norm_max, admm_aux_trace, admm_density_residual, admm_orb_trace, &
-         admm_trace_residual, aux_density_norm_max, aux_k_norm_max, aux_trace_k, &
-         density_difference, density_scale, ener_k(2), ener_x(2), ener_x1(2), &
-         orb_density_norm_max, orb_k_norm_max, orb_trace_k, projection_gain_max, tmp, trace_tmp, &
-         trace_tmp_two
+      LOGICAL                                            :: my_kpgrp, use_real_wfn
+      REAL(dp)                                           :: ener_k(2), ener_x(2), ener_x1(2), tmp, &
+                                                            trace_tmp, trace_tmp_two
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
       TYPE(admm_type), POINTER                           :: admm_env
       TYPE(copy_info_type), ALLOCATABLE, DIMENSION(:, :) :: info
@@ -1991,14 +1966,13 @@ CONTAINS
                                                             work_aux_orb
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fmwork
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_ks
-      TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER :: matrix_k_tilde, matrix_ks_aux_fit, &
          matrix_ks_aux_fit_dft, matrix_ks_aux_fit_hfx, matrix_ks_kp, matrix_s, matrix_s_aux_fit, &
          rho_ao_aux
       TYPE(dbcsr_type)                                   :: tmpmatrix_ks
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:)        :: ksmatrix
       TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(kpoint_env_type), POINTER                     :: kp, kp_orb
+      TYPE(kpoint_env_type), POINTER                     :: kp
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
@@ -2006,23 +1980,20 @@ CONTAINS
       TYPE(qs_energy_type), POINTER                      :: energy
       TYPE(qs_rho_type), POINTER                         :: rho_aux_fit
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
-      TYPE(section_vals_type), POINTER                   :: input, ri_section
 
       CALL timeset(routineN, handle)
       NULLIFY (admm_env, rho_ao_aux, rho_aux_fit, &
                matrix_s_aux_fit, energy, &
                para_env, kpoints, sab_aux_fit, &
                matrix_k_tilde, matrix_ks_kp, matrix_ks_aux_fit, scf_env, &
-               struct_orb_orb, struct_aux_orb, struct_aux_aux, kp, kp_orb, &
+               struct_orb_orb, struct_aux_orb, struct_aux_aux, kp, &
                matrix_ks_aux_fit_hfx, matrix_ks_aux_fit_dft)
-      NULLIFY (input, logger, ri_section)
 
       CALL get_qs_env(qs_env, &
                       admm_env=admm_env, &
                       dft_control=dft_control, &
                       matrix_ks_kp=matrix_ks_kp, &
                       matrix_s_kp=matrix_s, &
-                      input=input, &
                       para_env=para_env, &
                       scf_env=scf_env, &
                       natom=natom, &
@@ -2045,18 +2016,6 @@ CONTAINS
       nao_aux_fit = admm_env%nao_aux_fit
       nao_orb = admm_env%nao_orb
       nspins = dft_control%nspins
-      lri_validate = .FALSE.
-      IF (ASSOCIATED(input)) THEN
-         ri_section => section_vals_get_subs_vals(input, "DFT%XC%HF%RI")
-         IF (ASSOCIATED(ri_section)) THEN
-            CALL section_vals_val_get(ri_section, "KP_LRI_VALIDATE", l_val=lri_validate)
-         END IF
-      END IF
-      validate_admm_projection = lri_validate .AND. ASSOCIATED(para_env)
-      IF (validate_admm_projection) validate_admm_projection = para_env%num_pe == 1
-      logger => cp_get_default_logger()
-      output_unit = -1
-      IF (ASSOCIATED(logger)) output_unit = logger%default_global_unit_nr
 
       !Case study on ADMMQ, ADMMS and ADMMP
 
@@ -2236,17 +2195,6 @@ CONTAINS
          END DO
       END DO
 
-      admm_aux_trace = 0.0_dp
-      admm_orb_trace = 0.0_dp
-      admm_trace_residual = 0.0_dp
-      admm_density_residual = 0.0_dp
-      a_abs_max = 0.0_dp
-      a_norm_max = 0.0_dp
-      aux_density_norm_max = 0.0_dp
-      aux_k_norm_max = 0.0_dp
-      orb_density_norm_max = 0.0_dp
-      orb_k_norm_max = 0.0_dp
-      projection_gain_max = 0.0_dp
       indx = 0
       DO ikp = 1, kplocal
          DO ispin = 1, nspins
@@ -2265,22 +2213,7 @@ CONTAINS
             END DO
 
             kp => kpoints%kp_aux_env(ikp)%kpoint_env
-            kp_orb => kpoints%kp_env(ikp)%kpoint_env
             IF (use_real_wfn) THEN
-
-               IF (admm_env%do_admmq .OR. admm_env%do_admms) THEN
-                  ! Match the complex-k branch: K_aux <- gsi*(K_aux-lambda*S_aux).
-                  CALL cp_fm_scale_and_add( &
-                     1.0_dp, work_aux_aux, -admm_env%lambda_merlot(ispin), kp%smat(1, 1))
-                  CALL cp_fm_scale(admm_env%gsi(ispin), work_aux_aux)
-               END IF
-
-               IF (admm_env%do_admmp) THEN
-                  ! Match the complex-k branch: K_aux <- gsi**2*K_aux-gsi*lambda*S_aux.
-                  CALL cp_fm_scale_and_add( &
-                     admm_env%gsi(ispin)**2, work_aux_aux, &
-                     -admm_env%gsi(ispin)*admm_env%lambda_merlot(ispin), kp%smat(1, 1))
-               END IF
 
                !! K*A
                CALL parallel_gemm('N', 'N', nao_aux_fit, nao_orb, nao_aux_fit, &
@@ -2319,143 +2252,8 @@ CONTAINS
 
                CALL cp_cfm_to_fm(cwork_orb_orb, mtargetr=fm_ks(ikp, 1, ispin), mtargeti=fm_ks(ikp, 2, ispin))
             END IF
-
-            IF (validate_admm_projection) THEN
-               IF (.NOT. ASSOCIATED(kp%pmat) .OR. .NOT. ASSOCIATED(kp_orb%pmat)) THEN
-                  CPABORT("Missing k-point density matrix in the ADMM projection validation")
-               END IF
-               IF (use_real_wfn) THEN
-                  aux_trace_k = SUM( &
-                                work_aux_aux%local_data*kp%pmat(1, ispin)%local_data)
-                  orb_trace_k = SUM( &
-                                fm_ks(ikp, 1, ispin)%local_data* &
-                                kp_orb%pmat(1, ispin)%local_data)
-                  a_abs_max = MAX(a_abs_max, MAXVAL(ABS(kp%amat(1, 1)%local_data)))
-                  a_norm_max = MAX(a_norm_max, SQRT(SUM(kp%amat(1, 1)%local_data**2)))
-                  aux_k_norm_max = MAX(aux_k_norm_max, &
-                                       SQRT(SUM(work_aux_aux%local_data**2)))
-                  orb_k_norm_max = MAX(orb_k_norm_max, &
-                                       SQRT(SUM(fm_ks(ikp, 1, ispin)%local_data**2)))
-                  projection_gain_max = MAX(projection_gain_max, &
-                                            SQRT(SUM(fm_ks(ikp, 1, ispin)%local_data**2))/ &
-                                            MAX(TINY(1.0_dp), &
-                                                SQRT(SUM(work_aux_aux%local_data**2))))
-                  aux_density_norm_max = MAX(aux_density_norm_max, &
-                                             SQRT(SUM(kp%pmat(1, ispin)%local_data**2)))
-                  orb_density_norm_max = MAX(orb_density_norm_max, &
-                                             SQRT(SUM(kp_orb%pmat(1, ispin)%local_data**2)))
-
-                  CALL parallel_gemm('N', 'N', nao_aux_fit, nao_orb, nao_orb, &
-                                     1.0_dp, kp%amat(1, 1), kp_orb%pmat(1, ispin), &
-                                     0.0_dp, work_aux_orb)
-                  CALL parallel_gemm('N', 'T', nao_aux_fit, nao_aux_fit, nao_orb, &
-                                     1.0_dp, work_aux_orb, kp%amat(1, 1), &
-                                     0.0_dp, work_aux_aux)
-                  density_difference = SQRT(SUM( &
-                                            (work_aux_aux%local_data - &
-                                             kp%pmat(1, ispin)%local_data)**2))
-                  density_scale = MAX(TINY(1.0_dp), &
-                                      SQRT(SUM(work_aux_aux%local_data**2)), &
-                                      SQRT(SUM(kp%pmat(1, ispin)%local_data**2)))
-               ELSE
-                  ! cK contains any ADMMS/ADMMQ/ADMMP scaling applied above.  Copy it back
-                  ! only in validation mode so the production projection remains untouched.
-                  CALL cp_cfm_to_fm(cK, mtargetr=work_aux_aux, mtargeti=work_aux_aux2)
-                  aux_trace_k = SUM( &
-                                work_aux_aux%local_data*kp%pmat(1, ispin)%local_data + &
-                                work_aux_aux2%local_data*kp%pmat(2, ispin)%local_data)
-                  orb_trace_k = SUM( &
-                                fm_ks(ikp, 1, ispin)%local_data* &
-                                kp_orb%pmat(1, ispin)%local_data + &
-                                fm_ks(ikp, 2, ispin)%local_data* &
-                                kp_orb%pmat(2, ispin)%local_data)
-                  a_abs_max = MAX(a_abs_max, &
-                                  MAXVAL(SQRT(kp%amat(1, 1)%local_data**2 + &
-                                              kp%amat(2, 1)%local_data**2)))
-                  a_norm_max = MAX(a_norm_max, &
-                                   SQRT(SUM(kp%amat(1, 1)%local_data**2 + &
-                                            kp%amat(2, 1)%local_data**2)))
-                  aux_k_norm_max = MAX(aux_k_norm_max, &
-                                       SQRT(SUM(work_aux_aux%local_data**2 + &
-                                                work_aux_aux2%local_data**2)))
-                  orb_k_norm_max = MAX(orb_k_norm_max, &
-                                       SQRT(SUM(fm_ks(ikp, 1, ispin)%local_data**2 + &
-                                                fm_ks(ikp, 2, ispin)%local_data**2)))
-                  projection_gain_max = MAX(projection_gain_max, &
-                                            SQRT(SUM(fm_ks(ikp, 1, ispin)%local_data**2 + &
-                                                     fm_ks(ikp, 2, ispin)%local_data**2))/ &
-                                            MAX(TINY(1.0_dp), SQRT(SUM( &
-                                                                   work_aux_aux%local_data**2 + &
-                                                                   work_aux_aux2%local_data**2))))
-                  aux_density_norm_max = MAX(aux_density_norm_max, &
-                                             SQRT(SUM(kp%pmat(1, ispin)%local_data**2 + &
-                                                      kp%pmat(2, ispin)%local_data**2)))
-                  orb_density_norm_max = MAX(orb_density_norm_max, &
-                                             SQRT(SUM(kp_orb%pmat(1, ispin)%local_data**2 + &
-                                                      kp_orb%pmat(2, ispin)%local_data**2)))
-
-                  CALL cp_fm_to_cfm(kp_orb%pmat(1, ispin), &
-                                    kp_orb%pmat(2, ispin), cwork_orb_orb)
-                  CALL parallel_gemm('N', 'N', nao_aux_fit, nao_orb, nao_orb, &
-                                     z_one, cA, cwork_orb_orb, z_zero, cwork_aux_orb)
-                  CALL parallel_gemm('N', 'C', nao_aux_fit, nao_aux_fit, nao_orb, &
-                                     z_one, cwork_aux_orb, cA, z_zero, cwork_aux_aux)
-                  density_difference = SQRT(SUM(ABS( &
-                                                cwork_aux_aux%local_data - CMPLX( &
-                                                kp%pmat(1, ispin)%local_data, &
-                                                kp%pmat(2, ispin)%local_data, dp))**2))
-                  density_scale = MAX(TINY(1.0_dp), &
-                                      SQRT(SUM(ABS(cwork_aux_aux%local_data)**2)), &
-                                      SQRT(SUM( &
-                                           kp%pmat(1, ispin)%local_data**2 + &
-                                           kp%pmat(2, ispin)%local_data**2)))
-               END IF
-
-               IF (.NOT. ieee_is_finite(aux_trace_k) .OR. &
-                   .NOT. ieee_is_finite(orb_trace_k) .OR. &
-                   .NOT. ieee_is_finite(density_difference) .OR. &
-                   .NOT. ieee_is_finite(density_scale)) THEN
-                  CPABORT("Non-finite matrix data in the ADMM k-point projection validation")
-               END IF
-               admm_aux_trace = admm_aux_trace + aux_trace_k
-               admm_orb_trace = admm_orb_trace + orb_trace_k
-               admm_trace_residual = MAX(admm_trace_residual, &
-                                         ABS(aux_trace_k - orb_trace_k)/ &
-                                         MAX(TINY(1.0_dp), ABS(aux_trace_k), ABS(orb_trace_k)))
-               admm_density_residual = MAX(admm_density_residual, &
-                                           density_difference/density_scale)
-            END IF
          END DO
       END DO
-
-      IF (validate_admm_projection .AND. output_unit > 0) THEN
-         WRITE (output_unit, "(/,T2,A)") "LRI-HFXk ADMM projection validation"
-         WRITE (output_unit, "(T4,A,T32,ES14.6,T50,ES14.6)") &
-            "Tr[P_aux K]/Tr[P Ktilde]", admm_aux_trace, admm_orb_trace
-         WRITE (output_unit, "(T4,A,T32,ES14.6)") &
-            "max trace relative residual", admm_trace_residual
-         WRITE (output_unit, "(T4,A,T32,ES14.6)") &
-            "max density-map residual", admm_density_residual
-         WRITE (output_unit, "(T4,A,T32,ES14.6,T50,ES14.6)") &
-            "max ||K_aux||/||Ktilde||", aux_k_norm_max, orb_k_norm_max
-         WRITE (output_unit, "(T4,A,T32,ES14.6)") &
-            "max K projection gain", projection_gain_max
-         WRITE (output_unit, "(T4,A,T32,ES14.6,T50,ES14.6)") &
-            "max ||P_aux||/||P_orb||", aux_density_norm_max, orb_density_norm_max
-         WRITE (output_unit, "(T4,A,T32,ES14.6,T50,ES14.6)") &
-            "max ||A||/|A|", a_norm_max, a_abs_max
-         WRITE (output_unit, "(T4,A,T32,2ES14.6)") &
-            "ADMM charge scale gsi", admm_env%gsi(1:nspins)
-         FLUSH (output_unit)
-      END IF
-      IF (validate_admm_projection) THEN
-         IF (admm_trace_residual > 1.0E-8_dp) THEN
-            CPABORT("ADMM k-point KS projection does not preserve the density/operator trace")
-         END IF
-         IF (admm_density_residual > 1.0E-8_dp) THEN
-            CPABORT("ADMM k-point auxiliary density disagrees with A*P*A^H")
-         END IF
-      END IF
 
       indx = 0
       DO ikp = 1, kplocal
