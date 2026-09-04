@@ -98,15 +98,6 @@ MODULE hfx_lri_kp
       TYPE(hfx_lri_metric_entry_type), ALLOCATABLE, DIMENSION(:) :: entries
    END TYPE hfx_lri_metric_cache_type
 
-   TYPE hfx_lri_pair_diagnostic_type
-      INTEGER                                            :: eigenvalues_discarded = 0
-      REAL(dp)                                           :: c_norm = 0.0_dp, &
-                                                            eig_condition = 0.0_dp, &
-                                                            eig_max = 0.0_dp, &
-                                                            eig_min = 0.0_dp, &
-                                                            fit_residual = 0.0_dp
-   END TYPE hfx_lri_pair_diagnostic_type
-
    TYPE hfx_lri_metric_table_type
       INTEGER                                            :: capacity = 0, nentries = 0
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: slot
@@ -114,13 +105,12 @@ MODULE hfx_lri_kp
    END TYPE hfx_lri_metric_table_type
 
    TYPE lri_pair_lookup_type
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_count, atom_offset, atom_pairs
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_offset, atom_pairs
    END TYPE lri_pair_lookup_type
 
    TYPE lri_density_block_type
       INTEGER                                            :: iatom = 0, ikind = 0, jatom = 0, jkind = 0
       INTEGER, DIMENSION(3)                              :: cell = 0
-      REAL(dp)                                           :: norm = 0.0_dp
       REAL(dp), DIMENSION(3)                             :: rab = 0.0_dp
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: values
    END TYPE lri_density_block_type
@@ -137,7 +127,6 @@ MODULE hfx_lri_kp
    END TYPE lri_basis_transform_type
 
    TYPE lri_loop3_density_block_type
-      REAL(dp)                                           :: norm2 = 0.0_dp
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: values
    END TYPE lri_loop3_density_block_type
 
@@ -188,12 +177,21 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: hf_fraction
 
       LOGICAL                                            :: use_delta_p
+      REAL(dp)                                           :: exchange_trace
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
       ehfx = 0.0_dp
-      NULLIFY (para_env)
+      NULLIFY (dft_control, para_env)
 
-      CALL get_qs_env(qs_env=qs_env, para_env=para_env)
+      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, para_env=para_env)
+
+      IF (.NOT. ASSOCIATED(dft_control)) THEN
+         CPABORT("LRI-HFXk could not obtain DFT control data")
+      END IF
+      IF (dft_control%do_admm) THEN
+         CPABORT("The pair-local LRI-HFXk backend does not support ADMM")
+      END IF
 
       IF (.NOT. ASSOCIATED(ri_data%ri_section)) THEN
          CPABORT("LRI-HFXk could not obtain its RI input section")
@@ -222,12 +220,14 @@ CONTAINS
 
       IF (geometry_did_change .OR. .NOT. ASSOCIATED(ri_data%lri_kp)) THEN
          CALL hfx_lri_pre_scf_kp(qs_env, ri_data)
-      ELSE IF (.NOT. ri_data%lri_kp%initialized) THEN
+      ELSE IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) THEN
          CALL hfx_lri_pre_scf_kp(qs_env, ri_data)
       END IF
 
-      CALL hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao)
-      CALL hfx_lri_compute_rank_local_energy(qs_env, ri_data, hf_fraction, ehfx)
+      CALL hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao, exchange_trace)
+      ! For an RKS spin-summed density, F_x = -hf_fraction*K_raw/2 and
+      ! E_x = Tr[D F_x]/2 = -hf_fraction*Tr[D K_raw]/4.
+      ehfx = -0.25_dp*hf_fraction*exchange_trace
       CALL hfx_lri_write_rank_local_k_blocks(qs_env, ri_data, ks_matrix, hf_fraction)
 
    END SUBROUTINE hfx_lri_update_ks_kp
@@ -246,18 +246,9 @@ CONTAINS
 
       INTEGER :: handle, iatom, ibasis, ikind, ipair_block, ithread, jatom, jkind, maxl_ao, &
          maxl_ao_kind, maxl_ri, maxl_ri_kind, mepos, mmax, nao_i, nao_j, naux_i, naux_j, &
-         naux_pair, nkind, npair_blocks_local, npair_blocks_max, npair_blocks_sum, &
-         npair_candidates, npairs_local, npairs_max, npairs_sum, nthreads
-      INTEGER(int_8) :: c_nreal_local, c_nreal_max, c_nreal_stored_local, c_nreal_stored_max, &
-         c_nreal_stored_sum, c_nreal_sum, eigenvalues_discarded_global, &
-         eigenvalues_discarded_local, sum_nao_pair_local, sum_nao_pair_max, sum_nao_pair_sum, &
-         sum_naux_pair_local, sum_naux_pair_max, sum_naux_pair_sum
+         naux_pair, nkind, npair_candidates, nthreads
       INTEGER, DIMENSION(3)                              :: cell_j
       LOGICAL                                            :: kpoint_symmetry
-      REAL(dp) :: c_mem_mib_local, c_mem_mib_max, c_mem_mib_stored_local, c_mem_mib_stored_max, &
-         c_mem_mib_stored_sum, c_mem_mib_sum, c_norm_max_global, c_norm_max_local, &
-         eig_condition_max_global, eig_condition_max_local, eig_max_global, eig_max_local, &
-         eig_min_global, eig_min_local, fit_residual_max_global, fit_residual_max_local
       REAL(dp), DIMENSION(3)                             :: rab
       TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -265,25 +256,22 @@ CONTAINS
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
       TYPE(hfx_lri_metric_cache_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: metric_caches
-      TYPE(hfx_lri_pair_diagnostic_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: pair_diagnostics
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(lri_basis_transform_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: ao_transform_cache, ri_transform_cache
-      TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: soo_list
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (qs_kind_set, soo_list, nl_iterator, para_env, dft_control, kpoints)
+      NULLIFY (qs_kind_set, soo_list, nl_iterator, dft_control, kpoints)
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
       NULLIFY (basis_set_AO, basis_set_RI)
 
       CALL timeset(routineN, handle)
 
-      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind, para_env=para_env, &
+      CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind, &
                       dft_control=dft_control, kpoints=kpoints)
       kpoint_symmetry = .FALSE.
       IF (ASSOCIATED(kpoints)) CALL get_kpoint_info(kpoints, symmetry=kpoint_symmetry)
@@ -356,14 +344,10 @@ CONTAINS
       END DO
       CALL neighbor_list_iterator_release(nl_iterator)
 
-      ALLOCATE (ri_data%lri_kp%pair_blocks(npair_candidates), &
-                pair_diagnostics(npair_candidates))
+      ALLOCATE (ri_data%lri_kp%pair_blocks(npair_candidates))
       CALL neighbor_list_iterator_create(nl_iterator, soo_list)
 
-      npairs_local = 0
-      sum_nao_pair_local = 0_int_8
-      sum_naux_pair_local = 0_int_8
-      c_nreal_local = 0_int_8
+      ipair_block = 0
       mepos = 0
       DO WHILE (neighbor_list_iterate(nl_iterator, mepos) == 0)
 
@@ -394,29 +378,22 @@ CONTAINS
             naux_pair = naux_i + naux_j
          END IF
 
-         ipair_block = ri_data%lri_kp%npair_blocks + 1
+         ipair_block = ipair_block + 1
          CALL hfx_lri_init_pair_block(ri_data%lri_kp%pair_blocks(ipair_block), iatom, jatom, &
                                       ikind, jkind, cell_j, rab, nao_i, nao_j, naux_i, naux_j, &
                                       naux_pair)
-         ri_data%lri_kp%npair_blocks = ipair_block
-
-         npairs_local = npairs_local + 1
-         sum_nao_pair_local = sum_nao_pair_local + INT(nao_i, int_8)*INT(nao_j, int_8)
-         sum_naux_pair_local = sum_naux_pair_local + INT(naux_pair, int_8)
-         c_nreal_local = c_nreal_local + &
-                         INT(nao_i, int_8)*INT(nao_j, int_8)*INT(naux_pair, int_8)
 
       END DO
 
       CALL neighbor_list_iterator_release(nl_iterator)
-      CPASSERT(ri_data%lri_kp%npair_blocks == npair_candidates)
+      CPASSERT(ipair_block == SIZE(ri_data%lri_kp%pair_blocks))
       CALL release_neighbor_list_sets(soo_list)
 
       ! The neighbor-list iterator is serial, but every fitted pair is independent. Reuse the
       ! immutable basis transforms and give every worker its own Libint engines.
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          SHARED(ao_transform_cache, basis_set_AO, basis_set_RI, maxl_ao, maxl_ri, &
-      !$OMP                 metric_caches, pair_diagnostics, ri_data, ri_transform_cache) &
+      !$OMP                 metric_caches, ri_data, ri_transform_cache) &
       !$OMP          PRIVATE(integral_context, ipair_block, ithread)
       ithread = 1
 !$    ithread = omp_get_thread_num() + 1
@@ -424,48 +401,15 @@ CONTAINS
       CALL coulomb_integral_init(integral_context, max_am_2c=maxl_ri, &
                                  max_am_3c=MAX(maxl_ao, maxl_ri))
       !$OMP DO SCHEDULE(DYNAMIC, 1)
-      DO ipair_block = 1, ri_data%lri_kp%npair_blocks
+      DO ipair_block = 1, SIZE(ri_data%lri_kp%pair_blocks)
          CALL hfx_lri_build_pair_coefficients( &
             basis_set_AO, basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_block), ri_data, &
-            integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread), &
-            pair_diagnostics(ipair_block))
+            integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread))
       END DO
       !$OMP END DO
       CALL coulomb_integral_cleanup(integral_context)
       !$OMP END PARALLEL
       DEALLOCATE (metric_caches)
-
-      c_norm_max_local = 0.0_dp
-      eig_condition_max_local = 0.0_dp
-      eig_max_local = 0.0_dp
-      eig_min_local = HUGE(1.0_dp)
-      eigenvalues_discarded_local = 0_int_8
-      fit_residual_max_local = 0.0_dp
-      DO ipair_block = 1, ri_data%lri_kp%npair_blocks
-         c_norm_max_local = MAX(c_norm_max_local, pair_diagnostics(ipair_block)%c_norm)
-         eig_condition_max_local = MAX( &
-                                   eig_condition_max_local, &
-                                   pair_diagnostics(ipair_block)%eig_condition)
-         eig_max_local = MAX(eig_max_local, pair_diagnostics(ipair_block)%eig_max)
-         IF (pair_diagnostics(ipair_block)%eig_min > 0.0_dp) THEN
-            eig_min_local = MIN(eig_min_local, pair_diagnostics(ipair_block)%eig_min)
-         END IF
-         eigenvalues_discarded_local = eigenvalues_discarded_local + &
-                                       pair_diagnostics(ipair_block)%eigenvalues_discarded
-         fit_residual_max_local = MAX( &
-                                  fit_residual_max_local, &
-                                  pair_diagnostics(ipair_block)%fit_residual)
-      END DO
-      DEALLOCATE (pair_diagnostics)
-
-      c_nreal_stored_local = 0_int_8
-      npair_blocks_local = 0
-      DO ipair_block = 1, ri_data%lri_kp%npair_blocks
-         IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit)) CYCLE
-         npair_blocks_local = npair_blocks_local + 1
-         c_nreal_stored_local = c_nreal_stored_local + &
-                                INT(SIZE(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit), int_8)
-      END DO
 
       ! Restore the standard QS screening radii after the LRI-HFXk setup.
       IF (ASSOCIATED(dft_control)) THEN
@@ -484,103 +428,12 @@ CONTAINS
       IF (ASSOCIATED(basis_set_AO)) DEALLOCATE (basis_set_AO)
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
 
-      c_mem_mib_local = REAL(c_nreal_local, KIND=dp)*8.0_dp/1024.0_dp**2
-      c_mem_mib_stored_local = REAL(c_nreal_stored_local, KIND=dp)*8.0_dp/1024.0_dp**2
-
-      npairs_sum = npairs_local
-      npairs_max = npairs_local
-      sum_nao_pair_sum = sum_nao_pair_local
-      sum_nao_pair_max = sum_nao_pair_local
-      sum_naux_pair_sum = sum_naux_pair_local
-      sum_naux_pair_max = sum_naux_pair_local
-      c_nreal_sum = c_nreal_local
-      c_nreal_max = c_nreal_local
-      c_nreal_stored_sum = c_nreal_stored_local
-      c_nreal_stored_max = c_nreal_stored_local
-      npair_blocks_sum = npair_blocks_local
-      npair_blocks_max = npair_blocks_local
-      c_norm_max_global = c_norm_max_local
-      eig_condition_max_global = eig_condition_max_local
-      eig_max_global = eig_max_local
-      eig_min_global = eig_min_local
-      eigenvalues_discarded_global = eigenvalues_discarded_local
-      fit_residual_max_global = fit_residual_max_local
-
-      IF (ASSOCIATED(para_env)) THEN
-         CALL para_env%sum(npairs_sum)
-         CALL para_env%max(npairs_max)
-         CALL para_env%sum(sum_nao_pair_sum)
-         CALL para_env%max(sum_nao_pair_max)
-         CALL para_env%sum(sum_naux_pair_sum)
-         CALL para_env%max(sum_naux_pair_max)
-         CALL para_env%sum(c_nreal_sum)
-         CALL para_env%max(c_nreal_max)
-         CALL para_env%sum(c_nreal_stored_sum)
-         CALL para_env%max(c_nreal_stored_max)
-         CALL para_env%sum(npair_blocks_sum)
-         CALL para_env%max(npair_blocks_max)
-         CALL para_env%max(c_norm_max_global)
-         CALL para_env%max(eig_condition_max_global)
-         CALL para_env%max(eig_max_global)
-         CALL para_env%min(eig_min_global)
-         CALL para_env%sum(eigenvalues_discarded_global)
-         CALL para_env%max(fit_residual_max_global)
-      END IF
-      IF (eig_min_global == HUGE(1.0_dp)) eig_min_global = 0.0_dp
-
-      c_mem_mib_sum = REAL(c_nreal_sum, KIND=dp)*8.0_dp/1024.0_dp**2
-      c_mem_mib_max = REAL(c_nreal_max, KIND=dp)*8.0_dp/1024.0_dp**2
-      c_mem_mib_stored_sum = REAL(c_nreal_stored_sum, KIND=dp)*8.0_dp/1024.0_dp**2
-      c_mem_mib_stored_max = REAL(c_nreal_stored_max, KIND=dp)*8.0_dp/1024.0_dp**2
-
-      ri_data%lri_kp%initialized = .TRUE.
-
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk pair-local setup"
          WRITE (ri_data%unit_nr, "(T4,A,T28,A)") "orbital basis", TRIM(ri_data%orb_basis_type)
          WRITE (ri_data%unit_nr, "(T4,A,T28,A)") "RI basis", TRIM(ri_data%ri_basis_type)
-         WRITE (ri_data%unit_nr, "(/,T4,A,T30,A,T43,A,T56,A)") &
-            "quantity", "local", "global", "max/rank"
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
-            "AO pairs", npairs_local, npairs_sum, npairs_max
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
-            "AO-pair size", sum_nao_pair_local, sum_nao_pair_sum, sum_nao_pair_max
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
-            "pair aux size", sum_naux_pair_local, sum_naux_pair_sum, sum_naux_pair_max
-         WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
-            "C storage/MiB", c_mem_mib_local, c_mem_mib_sum, c_mem_mib_max
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10,T54,I10)") &
-            "stored blocks", npair_blocks_local, npair_blocks_sum, npair_blocks_max
-         WRITE (ri_data%unit_nr, "(T4,A,T28,F10.4,T41,F10.4,T54,F10.4)") &
-            "stored C/MiB", c_mem_mib_stored_local, c_mem_mib_stored_sum, c_mem_mib_stored_max
-         IF (npairs_sum > 0) THEN
-            WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
-               "avg AO-pair", &
-               REAL(sum_nao_pair_local, KIND=dp)/MAX(1.0_dp, REAL(npairs_local, KIND=dp)), &
-               REAL(sum_nao_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
-               REAL(sum_nao_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
-            WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2,T41,F10.2,T54,F10.2)") &
-               "avg pair aux", &
-               REAL(sum_naux_pair_local, KIND=dp)/MAX(1.0_dp, REAL(npairs_local, KIND=dp)), &
-               REAL(sum_naux_pair_sum, KIND=dp)/REAL(npairs_sum, KIND=dp), &
-               REAL(sum_naux_pair_max, KIND=dp)/MAX(1.0_dp, REAL(npairs_max, KIND=dp))
-         END IF
-         ! These quantities are already produced by the eigensolve used to form every pair C.
-         ! Print them unconditionally: a formally converged SCF can otherwise hide an unstable
-         ! pair metric, while collecting the diagnostics adds no extra integral or diagonalization.
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI pair-fit diagnostics"
-         WRITE (ri_data%unit_nr, "(T6,A,T30,ES14.6,T48,ES14.6)") &
-            "retained eig min/max", eig_min_global, eig_max_global
-         WRITE (ri_data%unit_nr, "(T6,A,T30,ES14.6)") &
-            "max condition number", eig_condition_max_global
-         WRITE (ri_data%unit_nr, "(T6,A,T30,I14)") &
-            "discarded eigenvalues", eigenvalues_discarded_global
-         WRITE (ri_data%unit_nr, "(T6,A,T30,ES14.6)") &
-            "max C Frobenius norm", c_norm_max_global
-         IF (ri_data%check_2c_inv) THEN
-            WRITE (ri_data%unit_nr, "(T6,A,T30,ES14.6)") &
-               "max ||C M-J||/||J||", fit_residual_max_global
-         END IF
+         WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") &
+            "pair blocks", SIZE(ri_data%lri_kp%pair_blocks)
       END IF
 
       CALL timestop(handle)
@@ -855,11 +708,10 @@ CONTAINS
 !> \param ao_transform_cache ...
 !> \param ri_transform_cache ...
 !> \param metric_cache ...
-!> \param diagnostic pair-metric and fitting diagnostics
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_build_pair_coefficients(basis_set_AO, basis_set_RI, pair_block, ri_data, &
                                               integral_context, ao_transform_cache, &
-                                              ri_transform_cache, metric_cache, diagnostic)
+                                              ri_transform_cache, metric_cache)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -869,21 +721,18 @@ CONTAINS
       TYPE(lri_basis_transform_type), DIMENSION(:), &
          INTENT(IN)                                      :: ao_transform_cache, ri_transform_cache
       TYPE(hfx_lri_metric_cache_type), INTENT(INOUT)     :: metric_cache
-      TYPE(hfx_lri_pair_diagnostic_type), INTENT(OUT)    :: diagnostic
 
-      INTEGER                                            :: cache_slot, eig_small, ikind, jkind, &
-                                                            metric_dim, ncart_ai, ncart_aj, &
-                                                            ncart_ri, ncart_rj, offset_j
+      INTEGER                                            :: cache_slot, ikind, jkind, metric_dim, &
+                                                            ncart_ai, ncart_aj, ncart_ri, &
+                                                            ncart_rj, offset_j
       LOGICAL                                            :: cache_transpose, metric_zero
-      REAL(dp)                                           :: c_norm, eig_cond, eig_max, eig_min, &
-                                                            j_norm
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, fit_difference, j_aux_cart, &
-                                                            j_cart, j_sph, metric_sph, sphi_aux
+      REAL(dp)                                           :: c_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, j_aux_cart, j_cart, j_sph, &
+                                                            metric_sph, sphi_aux
       REAL(dp), DIMENSION(3)                             :: r0
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
 
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
-      diagnostic = hfx_lri_pair_diagnostic_type()
       ikind = pair_block%ikind
       jkind = pair_block%jkind
       IF (ikind < 1 .OR. ikind > SIZE(basis_set_AO) .OR. &
@@ -1009,24 +858,9 @@ CONTAINS
                                      ao_transform_cache(jkind)%sphi, j_sph)
       DEALLOCATE (j_aux_cart)
 
-      CALL hfx_lri_metric_inverse(metric_sph, j_sph, ri_data%eps_eigval, &
-                                  eig_min, eig_max, eig_cond, &
-                                  eig_small, c_norm, c_out=c_sph)
+      CALL hfx_lri_metric_inverse(metric_sph, j_sph, ri_data%eps_eigval, c_norm, c_sph)
       IF (.NOT. ALLOCATED(c_sph)) THEN
          CPABORT("Failed to build LRI-HFXk pair fitting coefficients")
-      END IF
-      diagnostic%c_norm = c_norm
-      diagnostic%eig_condition = eig_cond
-      diagnostic%eig_max = eig_max
-      diagnostic%eig_min = eig_min
-      diagnostic%eigenvalues_discarded = eig_small
-      IF (ri_data%check_2c_inv) THEN
-         ALLOCATE (fit_difference(SIZE(j_sph, 1), SIZE(j_sph, 2)))
-         fit_difference = MATMUL(c_sph, metric_sph) - j_sph
-         j_norm = SQRT(SUM(j_sph*j_sph))
-         diagnostic%fit_residual = SQRT(SUM(fit_difference*fit_difference))/ &
-                                   MAX(j_norm, TINY(1.0_dp))
-         DEALLOCATE (fit_difference)
       END IF
       CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, pair_block%nao_i, &
                                           pair_block%nao_j, pair_block%naux_pair)
@@ -1042,34 +876,21 @@ CONTAINS
 !> \param metric_block ...
 !> \param j_block ...
 !> \param eig_threshold ...
-!> \param eig_min ...
-!> \param eig_max ...
-!> \param eig_cond ...
-!> \param eig_small ...
 !> \param c_norm ...
 !> \param c_out ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_metric_inverse(metric_block, j_block, eig_threshold, &
-                                     eig_min, eig_max, eig_cond, &
-                                     eig_small, c_norm, c_out)
+   SUBROUTINE hfx_lri_metric_inverse(metric_block, j_block, eig_threshold, c_norm, c_out)
 
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: metric_block, j_block
       REAL(dp), INTENT(IN)                               :: eig_threshold
-      REAL(dp), INTENT(OUT)                              :: eig_min, eig_max, eig_cond
-      INTEGER, INTENT(OUT)                               :: eig_small
       REAL(dp), INTENT(OUT)                              :: c_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
-         INTENT(OUT), OPTIONAL                           :: c_out
+         INTENT(OUT)                                     :: c_out
 
       INTEGER                                            :: i, info, lwork, ncol, nrow
-      REAL(dp)                                           :: eig_abs
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: eigenvalues, work
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_block, eigvec, tmp
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: eigvec, tmp
 
-      eig_min = 0.0_dp
-      eig_max = 0.0_dp
-      eig_cond = 0.0_dp
-      eig_small = 0
       c_norm = 0.0_dp
       CPASSERT(eig_threshold >= 0.0_dp)
 
@@ -1096,23 +917,7 @@ CONTAINS
          CPABORT("DSYEV failed in LRI-HFXk pair metric")
       END IF
 
-      eig_max = MAXVAL(ABS(eigenvalues))
-      eig_min = HUGE(1.0_dp)
-      DO i = 1, ncol
-         eig_abs = ABS(eigenvalues(i))
-         IF (eigenvalues(i) < eig_threshold) THEN
-            eig_small = eig_small + 1
-         ELSE
-            eig_min = MIN(eig_min, eig_abs)
-         END IF
-      END DO
-      IF (eig_min < HUGE(1.0_dp) .AND. eig_max > 0.0_dp) THEN
-         eig_cond = eig_max/eig_min
-      ELSE
-         eig_min = 0.0_dp
-      END IF
-
-      ALLOCATE (tmp(nrow, ncol), c_block(nrow, ncol))
+      ALLOCATE (tmp(nrow, ncol), c_out(nrow, ncol))
       tmp(:, :) = MATMUL(j_block, eigvec)
       DO i = 1, ncol
          IF (eigenvalues(i) >= eig_threshold) THEN
@@ -1121,14 +926,8 @@ CONTAINS
             tmp(:, i) = 0.0_dp
          END IF
       END DO
-      c_block(:, :) = MATMUL(tmp, TRANSPOSE(eigvec))
-      c_norm = SQRT(SUM(c_block*c_block))
-      IF (PRESENT(c_out)) THEN
-         IF (ALLOCATED(c_out)) DEALLOCATE (c_out)
-         CALL MOVE_ALLOC(c_block, c_out)
-      END IF
-
-      IF (ALLOCATED(c_block)) DEALLOCATE (c_block)
+      c_out(:, :) = MATMUL(tmp, TRANSPOSE(eigvec))
+      c_norm = SQRT(SUM(c_out*c_out))
       DEALLOCATE (tmp, eigenvalues, eigvec)
 
    END SUBROUTINE hfx_lri_metric_inverse
@@ -1173,28 +972,15 @@ CONTAINS
 
       pair_block%onsite_pair = (iatom == jatom .AND. SUM(rab*rab) < 1.0E-20_dp)
       pair_block%naux_centers = 1
-      pair_block%aux_atom(:) = 0
       pair_block%aux_kind(:) = 0
-      pair_block%aux_cell(:, :) = 0
       pair_block%aux_r(:, :) = 0.0_dp
-      pair_block%aux_offset(:) = 0
-      pair_block%aux_size(:) = 0
 
-      pair_block%aux_atom(1) = iatom
       pair_block%aux_kind(1) = ikind
-      pair_block%aux_cell(:, 1) = 0
-      pair_block%aux_r(:, 1) = 0.0_dp
-      pair_block%aux_offset(1) = 0
-      pair_block%aux_size(1) = naux_i
 
       IF (.NOT. pair_block%onsite_pair) THEN
          pair_block%naux_centers = 2
-         pair_block%aux_atom(2) = jatom
          pair_block%aux_kind(2) = jkind
-         pair_block%aux_cell(:, 2) = cell(:)
          pair_block%aux_r(:, 2) = rab(:)
-         pair_block%aux_offset(2) = naux_i
-         pair_block%aux_size(2) = naux_j
       END IF
 
    END SUBROUTINE hfx_lri_init_pair_block
@@ -1258,11 +1044,7 @@ CONTAINS
 
       k_pair%iatom = pair_block%iatom
       k_pair%jatom = pair_block%jatom
-      k_pair%ikind = pair_block%ikind
-      k_pair%jkind = pair_block%jkind
       k_pair%cell(:) = pair_block%cell(:)
-      k_pair%nao_i = SIZE(k_block, 1)
-      k_pair%nao_j = SIZE(k_block, 2)
 
       CALL MOVE_ALLOC(k_block, k_pair%k_block)
 
@@ -1545,33 +1327,29 @@ CONTAINS
 !> \brief Builds O(1) pair lookup and contiguous per-first-atom pair lists.
 !> \param pair_lookup ...
 !> \param pair_blocks ...
-!> \param npair_blocks ...
 !> \param natom ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_pair_lookup_create(pair_lookup, pair_blocks, npair_blocks, natom)
+   SUBROUTINE hfx_lri_pair_lookup_create(pair_lookup, pair_blocks, natom)
 
       TYPE(lri_pair_lookup_type), INTENT(OUT)            :: pair_lookup
       TYPE(hfx_lri_pair_block_type), DIMENSION(:), &
          INTENT(IN)                                      :: pair_blocks
-      INTEGER, INTENT(IN)                                :: npair_blocks, natom
+      INTEGER, INTENT(IN)                                :: natom
 
-      INTEGER                                            :: capacity, existing_iatom, &
-                                                            existing_jatom, iatom, ipair, islot, &
-                                                            nprobe, nrefs, pair_ref, ref_iatom, &
-                                                            ref_jatom
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cursor, slot
+      INTEGER :: capacity, existing_iatom, existing_jatom, iatom, ipair, islot, npair_blocks, &
+         nprobe, nrefs, pair_ref, ref_iatom, ref_jatom
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_count, cursor, slot
       INTEGER, DIMENSION(3)                              :: existing_cell, ref_cell
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: include_reverse
 
-      CPASSERT(npair_blocks >= 0)
-      CPASSERT(npair_blocks <= SIZE(pair_blocks))
       CPASSERT(natom > 0)
+      npair_blocks = SIZE(pair_blocks)
 
       ! The stored neighbor list is symmetric and therefore contains only one representative of
       ! each pair. Add signed reverse aliases to the lookup without copying any C tensor.
       capacity = MAX(17, 4*npair_blocks + 1)
       ALLOCATE (slot(capacity), SOURCE=0)
-      ALLOCATE (pair_lookup%atom_count(natom), SOURCE=0)
+      ALLOCATE (atom_count(natom), SOURCE=0)
       ALLOCATE (pair_lookup%atom_offset(natom + 1), SOURCE=1)
       ALLOCATE (include_reverse(npair_blocks), SOURCE=.FALSE.)
 
@@ -1584,7 +1362,7 @@ CONTAINS
          IF (iatom < 1 .OR. iatom > natom) THEN
             CPABORT("Invalid first-atom index in an LRI-HFXk pair block")
          END IF
-         pair_lookup%atom_count(iatom) = pair_lookup%atom_count(iatom) + 1
+         atom_count(iatom) = atom_count(iatom) + 1
          islot = hfx_lri_pair_hash(ref_iatom, ref_jatom, ref_cell, capacity)
          DO nprobe = 1, capacity
             IF (slot(islot) == 0) THEN
@@ -1615,7 +1393,7 @@ CONTAINS
             IF (slot(islot) == 0) THEN
                slot(islot) = pair_ref
                include_reverse(ipair) = .TRUE.
-               pair_lookup%atom_count(ref_iatom) = pair_lookup%atom_count(ref_iatom) + 1
+               atom_count(ref_iatom) = atom_count(ref_iatom) + 1
                EXIT
             END IF
             CALL hfx_lri_pair_ref_key(pair_blocks, slot(islot), &
@@ -1632,7 +1410,7 @@ CONTAINS
       pair_lookup%atom_offset(1) = 1
       DO iatom = 1, natom
          pair_lookup%atom_offset(iatom + 1) = pair_lookup%atom_offset(iatom) + &
-                                              pair_lookup%atom_count(iatom)
+                                              atom_count(iatom)
       END DO
       nrefs = pair_lookup%atom_offset(natom + 1) - 1
       ALLOCATE (pair_lookup%atom_pairs(nrefs), SOURCE=0)
@@ -1651,6 +1429,7 @@ CONTAINS
             cursor(ref_iatom) = cursor(ref_iatom) + 1
          END IF
       END DO
+      DEALLOCATE (atom_count)
       DEALLOCATE (cursor)
       DEALLOCATE (include_reverse)
       DEALLOCATE (slot)
@@ -1843,11 +1622,8 @@ CONTAINS
       ! Match the block-norm filtering used by the extended RI-HFXk density conversion. This is
       ! the user's EPS_FILTER accuracy control, not an additional LRI-specific approximation.
       DO iblock = 1, density_cache%nblocks
-         density_cache%blocks(iblock)%norm = &
-            SQRT(SUM(density_cache%blocks(iblock)%values**2))
-         IF (density_cache%blocks(iblock)%norm < filter_eps) THEN
+         IF (SQRT(SUM(density_cache%blocks(iblock)%values**2)) < filter_eps) THEN
             DEALLOCATE (density_cache%blocks(iblock)%values)
-            density_cache%blocks(iblock)%norm = 0.0_dp
          END IF
       END DO
    END SUBROUTINE hfx_lri_density_cache_create
@@ -1859,17 +1635,15 @@ CONTAINS
 !> \param sab_nl ...
 !> \param cell_to_index ...
 !> \param nimages ...
-!> \param basis_set_AO ...
+!> \param nkind ...
 !> \param target_pairs ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_target_pairs_create(sab_nl, cell_to_index, nimages, basis_set_AO, target_pairs)
+   SUBROUTINE hfx_lri_target_pairs_create(sab_nl, cell_to_index, nimages, nkind, target_pairs)
 
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      INTEGER, INTENT(IN)                                :: nimages
-      TYPE(gto_basis_set_p_type), DIMENSION(:), &
-         INTENT(IN)                                      :: basis_set_AO
+      INTEGER, INTENT(IN)                                :: nimages, nkind
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, &
          DIMENSION(:), INTENT(OUT)                       :: target_pairs
 
@@ -1877,24 +1651,20 @@ CONTAINS
                                                             jkind, mepos, ntarget
       INTEGER, DIMENSION(3)                              :: cell
       REAL(dp), DIMENSION(3)                             :: rab
-      TYPE(gto_basis_set_type), POINTER                  :: basis_i, basis_j
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
 
-      NULLIFY (basis_i, basis_j, nl_iterator)
+      NULLIFY (nl_iterator)
       CPASSERT(ASSOCIATED(sab_nl))
       CPASSERT(nimages > 0)
+      CPASSERT(nkind > 0)
 
       ntarget = 0
       CALL neighbor_list_iterator_create(nl_iterator, sab_nl)
       mepos = 0
       DO WHILE (neighbor_list_iterate(nl_iterator, mepos) == 0)
          CALL get_iterator_info(nl_iterator, mepos=mepos, ikind=ikind, jkind=jkind, cell=cell)
-         IF (ikind < 1 .OR. ikind > SIZE(basis_set_AO) .OR. &
-             jkind < 1 .OR. jkind > SIZE(basis_set_AO)) CYCLE
-         basis_i => basis_set_AO(ikind)%gto_basis_set
-         basis_j => basis_set_AO(jkind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_i) .OR. .NOT. ASSOCIATED(basis_j)) CYCLE
+         IF (ikind < 1 .OR. ikind > nkind .OR. jkind < 1 .OR. jkind > nkind) CYCLE
          image = 1
          IF (ASSOCIATED(cell_to_index)) THEN
             IF (ANY(cell < LBOUND(cell_to_index)) .OR. ANY(cell > UBOUND(cell_to_index))) CYCLE
@@ -1912,11 +1682,7 @@ CONTAINS
       DO WHILE (neighbor_list_iterate(nl_iterator, mepos) == 0)
          CALL get_iterator_info(nl_iterator, mepos=mepos, iatom=iatom, jatom=jatom, &
                                 ikind=ikind, jkind=jkind, cell=cell, r=rab)
-         IF (ikind < 1 .OR. ikind > SIZE(basis_set_AO) .OR. &
-             jkind < 1 .OR. jkind > SIZE(basis_set_AO)) CYCLE
-         basis_i => basis_set_AO(ikind)%gto_basis_set
-         basis_j => basis_set_AO(jkind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_i) .OR. .NOT. ASSOCIATED(basis_j)) CYCLE
+         IF (ikind < 1 .OR. ikind > nkind .OR. jkind < 1 .OR. jkind > nkind) CYCLE
          image = 1
          IF (ASSOCIATED(cell_to_index)) THEN
             IF (ANY(cell < LBOUND(cell_to_index)) .OR. ANY(cell > UBOUND(cell_to_index))) CYCLE
@@ -1927,12 +1693,9 @@ CONTAINS
          ipair = ipair + 1
          target_pairs(ipair)%iatom = iatom
          target_pairs(ipair)%jatom = jatom
-         target_pairs(ipair)%ikind = ikind
          target_pairs(ipair)%jkind = jkind
          target_pairs(ipair)%cell(:) = cell(:)
          target_pairs(ipair)%rab(:) = rab(:)
-         target_pairs(ipair)%nao_i = basis_i%nsgf
-         target_pairs(ipair)%nao_j = basis_j%nsgf
       END DO
       CALL neighbor_list_iterator_release(nl_iterator)
       CPASSERT(ipair == ntarget)
@@ -2013,7 +1776,7 @@ CONTAINS
 
       ! V to the second (L) center of C_KL.  L is fixed by an I-J fitting pair and a J-L density
       ! block, so this enumeration avoids the target/right-pair Cartesian product entirely.
-      DO target_iatom = 1, SIZE(pair_lookup%atom_count)
+      DO target_iatom = 1, SIZE(pair_lookup%atom_offset) - 1
          DO ipos_left = pair_lookup%atom_offset(target_iatom), &
             pair_lookup%atom_offset(target_iatom + 1) - 1
             ipair_left_ref = pair_lookup%atom_pairs(ipos_left)
@@ -2157,54 +1920,52 @@ CONTAINS
 !> \param grid ...
 !> \param twist ...
 !> \param filter_eps ...
-!> \param stored_blocks ...
-!> \param stored_reals ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_centered_build(lri_kp, natom, grid, twist, filter_eps, &
-                                     stored_blocks, stored_reals)
+   SUBROUTINE hfx_lri_centered_build(lri_kp, natom, grid, twist, filter_eps)
 
       TYPE(hfx_lri_kp_type), INTENT(INOUT)               :: lri_kp
       INTEGER, INTENT(IN)                                :: natom
       INTEGER, DIMENSION(3), INTENT(IN)                  :: grid, twist
       REAL(dp), INTENT(IN)                               :: filter_eps
-      INTEGER, INTENT(OUT)                               :: stored_blocks
-      INTEGER(int_8), INTENT(OUT)                        :: stored_reals
 
       INTEGER                                            :: block_index, cell_index, iatom, iaux, &
                                                             ipair, jatom, nactive, ncell, &
                                                             pair_cell(3), reduced(3)
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cursor
-      REAL(dp)                                           :: factor
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_count, atom_nao, cursor, &
+                                                            remote_count
+      REAL(dp)                                           :: block_norm2, factor
 
       ncell = PRODUCT(grid)
       lri_kp%lattice_natom = natom
       lri_kp%lattice_ncell = ncell
       lri_kp%lattice_grid(:) = grid(:)
       lri_kp%lattice_twist(:) = twist(:)
-      ALLOCATE (lri_kp%atom_kind(natom), lri_kp%atom_nao(natom), lri_kp%atom_naux(natom), &
+      ALLOCATE (lri_kp%atom_kind(natom), lri_kp%atom_naux(natom), &
                 lri_kp%atom_ao_offset(natom + 1), SOURCE=0)
-      DO ipair = 1, lri_kp%npair_blocks
+      ALLOCATE (atom_nao(natom), SOURCE=0)
+      DO ipair = 1, SIZE(lri_kp%pair_blocks)
          iatom = lri_kp%pair_blocks(ipair)%iatom
          jatom = lri_kp%pair_blocks(ipair)%jatom
          lri_kp%atom_kind(iatom) = lri_kp%pair_blocks(ipair)%ikind
-         lri_kp%atom_nao(iatom) = lri_kp%pair_blocks(ipair)%nao_i
+         atom_nao(iatom) = lri_kp%pair_blocks(ipair)%nao_i
          lri_kp%atom_naux(iatom) = lri_kp%pair_blocks(ipair)%naux_i
          lri_kp%atom_kind(jatom) = lri_kp%pair_blocks(ipair)%jkind
-         lri_kp%atom_nao(jatom) = lri_kp%pair_blocks(ipair)%nao_j
+         atom_nao(jatom) = lri_kp%pair_blocks(ipair)%nao_j
          lri_kp%atom_naux(jatom) = lri_kp%pair_blocks(ipair)%naux_j
       END DO
-      IF (ANY(lri_kp%atom_kind <= 0) .OR. ANY(lri_kp%atom_nao <= 0) .OR. &
+      IF (ANY(lri_kp%atom_kind <= 0) .OR. ANY(atom_nao <= 0) .OR. &
           ANY(lri_kp%atom_naux <= 0)) THEN
          CPABORT("Incomplete atom metadata while building LRI loop3 coefficients")
       END IF
       lri_kp%atom_ao_offset(1) = 1
       DO iatom = 1, natom
-         lri_kp%atom_ao_offset(iatom + 1) = lri_kp%atom_ao_offset(iatom) + lri_kp%atom_nao(iatom)
+         lri_kp%atom_ao_offset(iatom + 1) = lri_kp%atom_ao_offset(iatom) + atom_nao(iatom)
       END DO
+      DEALLOCATE (atom_nao)
       lri_kp%lattice_total_nao = lri_kp%atom_ao_offset(natom + 1) - 1
 
       ALLOCATE (lri_kp%centered_blocks(natom*natom*ncell))
-      DO ipair = 1, lri_kp%npair_blocks
+      DO ipair = 1, SIZE(lri_kp%pair_blocks)
          IF (.NOT. ALLOCATED(lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
 
          iatom = lri_kp%pair_blocks(ipair)%iatom
@@ -2229,7 +1990,7 @@ CONTAINS
       ! A quotient self block may contain both the genuine on-site coefficient and folded
       ! non-zero translations.  Only the former has no distinct "inner" AO orientation.
       ! Retain a small override for that block instead of dropping the complete self orbit.
-      DO ipair = 1, lri_kp%npair_blocks
+      DO ipair = 1, SIZE(lri_kp%pair_blocks)
          IF (.NOT. ALLOCATED(lri_kp%pair_blocks(ipair)%c_fit)) CYCLE
          IF (.NOT. lri_kp%pair_blocks(ipair)%onsite_pair) CYCLE
          cell_index = hfx_lri_lattice_cell_index([0, 0, 0], grid)
@@ -2248,20 +2009,16 @@ CONTAINS
             lri_kp%pair_blocks(ipair)%c_fit(:, :, 1:lri_kp%pair_blocks(ipair)%naux_i)
       END DO
 
-      stored_blocks = 0
-      stored_reals = 0_int_8
-      ALLOCATE (lri_kp%centered_atom_count(natom), lri_kp%centered_remote_count(natom), SOURCE=0)
+      ALLOCATE (atom_count(natom), remote_count(natom), SOURCE=0)
       DO block_index = 1, SIZE(lri_kp%centered_blocks)
          IF (.NOT. ALLOCATED(lri_kp%centered_blocks(block_index)%values)) CYCLE
-         lri_kp%centered_blocks(block_index)%norm2 = &
-            SUM(lri_kp%centered_blocks(block_index)%values**2)
-         IF (lri_kp%centered_blocks(block_index)%norm2 < filter_eps*filter_eps) THEN
+         block_norm2 = SUM(lri_kp%centered_blocks(block_index)%values**2)
+         IF (block_norm2 < filter_eps*filter_eps) THEN
             DEALLOCATE (lri_kp%centered_blocks(block_index)%values)
             IF (ALLOCATED(lri_kp%centered_blocks(block_index)%inner_values)) THEN
                DEALLOCATE (lri_kp%centered_blocks(block_index)%inner_values)
             END IF
             lri_kp%centered_blocks(block_index)%inner_active = .FALSE.
-            lri_kp%centered_blocks(block_index)%norm2 = 0.0_dp
             CYCLE
          END IF
          ALLOCATE (lri_kp%centered_blocks(block_index)%remote_flat( &
@@ -2293,26 +2050,17 @@ CONTAINS
          END IF
          CALL hfx_lri_lattice_block_from_index( &
             block_index, natom, ncell, iatom, jatom, cell_index)
-         lri_kp%centered_atom_count(iatom) = lri_kp%centered_atom_count(iatom) + 1
-         lri_kp%centered_remote_count(jatom) = lri_kp%centered_remote_count(jatom) + 1
-         stored_blocks = stored_blocks + 1
-         stored_reals = stored_reals + &
-                        INT(SIZE(lri_kp%centered_blocks(block_index)%values), int_8) + &
-                        INT(SIZE(lri_kp%centered_blocks(block_index)%remote_flat), int_8)
-         IF (ALLOCATED(lri_kp%centered_blocks(block_index)%inner_values)) THEN
-            stored_reals = stored_reals + &
-                           INT(SIZE(lri_kp%centered_blocks(block_index)%inner_values), int_8) + &
-                           INT(SIZE(lri_kp%centered_blocks(block_index)%inner_remote_flat), int_8)
-         END IF
+         atom_count(iatom) = atom_count(iatom) + 1
+         remote_count(jatom) = remote_count(jatom) + 1
       END DO
 
       ALLOCATE (lri_kp%centered_atom_offset(natom + 1), &
                 lri_kp%centered_remote_offset(natom + 1), SOURCE=1)
       DO iatom = 1, natom
          lri_kp%centered_atom_offset(iatom + 1) = lri_kp%centered_atom_offset(iatom) + &
-                                                  lri_kp%centered_atom_count(iatom)
+                                                  atom_count(iatom)
          lri_kp%centered_remote_offset(iatom + 1) = lri_kp%centered_remote_offset(iatom) + &
-                                                    lri_kp%centered_remote_count(iatom)
+                                                    remote_count(iatom)
       END DO
       nactive = lri_kp%centered_atom_offset(natom + 1) - 1
       ALLOCATE (lri_kp%centered_atom_refs(nactive), lri_kp%centered_remote_refs(nactive), SOURCE=0)
@@ -2333,7 +2081,7 @@ CONTAINS
          lri_kp%centered_remote_refs(cursor(jatom)) = block_index
          cursor(jatom) = cursor(jatom) + 1
       END DO
-      DEALLOCATE (cursor)
+      DEALLOCATE (atom_count, cursor, remote_count)
 
    END SUBROUTINE hfx_lri_centered_build
 
@@ -2490,17 +2238,10 @@ CONTAINS
 !> \param stable_images use the deterministic k-point image gauge used by the neighbor list
 !> \param maxl_ri ...
 !> \param filter_eps ...
-!> \param unique_entries ...
-!> \param evaluated_entries ...
-!> \param screened_entries ...
-!> \param batch_mib ...
-!> \param stored_blocks ...
-!> \param stored_reals ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_metric_lattice_build( &
       ri_data, pair_lookup, density_cache, target_pairs, basis_set_RI, ri_transform_cache, &
-      particle_set, cell, stable_images, maxl_ri, filter_eps, unique_entries, evaluated_entries, &
-      screened_entries, batch_mib, stored_blocks, stored_reals)
+      particle_set, cell, stable_images, maxl_ri, filter_eps)
 
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(lri_pair_lookup_type), INTENT(IN)             :: pair_lookup
@@ -2516,19 +2257,13 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: stable_images
       INTEGER, INTENT(IN)                                :: maxl_ri
       REAL(dp), INTENT(IN)                               :: filter_eps
-      INTEGER, INTENT(OUT)                               :: unique_entries, evaluated_entries, &
-                                                            screened_entries
-      REAL(dp), INTENT(OUT)                              :: batch_mib
-      INTEGER, INTENT(OUT)                               :: stored_blocks
-      INTEGER(int_8), INTENT(OUT)                        :: stored_reals
 
       INTEGER                                            :: batch_first, batch_last, batch_size, &
-                                                            block_index, ientry, nthreads
-      INTEGER(int_8)                                     :: batch_peak_reals, batch_reals
+                                                            block_index, ientry, nthreads, &
+                                                            unique_entries
+      REAL(dp)                                           :: block_norm2
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: atom_position
       TYPE(coulomb_integral_context_type)                :: integral_context
-      TYPE(hfx_lri_metric_entry_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: compact_entries
       TYPE(hfx_lri_metric_table_type)                    :: metric_table
 
       IF (.NOT. ASSOCIATED(ri_data%lri_kp) .OR. .NOT. ASSOCIATED(particle_set) .OR. &
@@ -2551,22 +2286,14 @@ CONTAINS
       unique_entries = metric_table%nentries
       IF (unique_entries <= 0) CPABORT("LRI-HFXk collected no metric-table entries")
       DEALLOCATE (metric_table%slot)
-      metric_table%capacity = 0
-      IF (SIZE(metric_table%entries) /= unique_entries) THEN
-         ALLOCATE (compact_entries(unique_entries))
-         compact_entries(:) = metric_table%entries(1:unique_entries)
-         CALL MOVE_ALLOC(compact_entries, metric_table%entries)
-      END IF
       ALLOCATE (ri_data%lri_kp%lattice_metric( &
                 ri_data%lri_kp%lattice_natom**2*ri_data%lri_kp%lattice_ncell))
 
       nthreads = 1
 !$    nthreads = omp_get_max_threads()
       batch_size = MAX(1, 4*nthreads)
-      batch_peak_reals = 0_int_8
-      batch_reals = 0_int_8
       !$OMP PARALLEL DEFAULT(NONE) &
-      !$OMP          SHARED(atom_position, basis_set_RI, batch_peak_reals, batch_reals, batch_size, cell, &
+      !$OMP          SHARED(atom_position, basis_set_RI, batch_size, cell, &
       !$OMP                 maxl_ri, metric_table, ri_data, ri_transform_cache, &
       !$OMP                 unique_entries) &
       !$OMP          PRIVATE(batch_first, batch_last, ientry, integral_context)
@@ -2581,48 +2308,25 @@ CONTAINS
          END DO
          !$OMP END DO
          !$OMP SINGLE
-         batch_reals = 0_int_8
          DO ientry = batch_first, batch_last
             IF (ALLOCATED(metric_table%entries(ientry)%values)) THEN
-               batch_reals = batch_reals + INT(SIZE( &
-                                               metric_table%entries(ientry)%values), int_8)
                CALL hfx_lri_metric_lattice_add_entry( &
                   ri_data%lri_kp, metric_table%entries(ientry), &
                   atom_position, cell)
                DEALLOCATE (metric_table%entries(ientry)%values)
             END IF
          END DO
-         batch_peak_reals = MAX(batch_peak_reals, batch_reals)
          !$OMP END SINGLE
       END DO
       CALL coulomb_integral_cleanup(integral_context)
       !$OMP END PARALLEL
 
-      evaluated_entries = 0
-      screened_entries = 0
-      DO ientry = 1, unique_entries
-         IF (metric_table%entries(ientry)%zero) THEN
-            screened_entries = screened_entries + 1
-         ELSE
-            evaluated_entries = evaluated_entries + 1
-         END IF
-      END DO
-      batch_mib = REAL(batch_peak_reals, dp)*8.0_dp/1024.0_dp**2
-
-      stored_blocks = 0
-      stored_reals = 0_int_8
       DO block_index = 1, SIZE(ri_data%lri_kp%lattice_metric)
          IF (.NOT. ALLOCATED(ri_data%lri_kp%lattice_metric(block_index)%values)) CYCLE
-         ri_data%lri_kp%lattice_metric(block_index)%norm2 = &
-            SUM(ri_data%lri_kp%lattice_metric(block_index)%values**2)
-         IF (ri_data%lri_kp%lattice_metric(block_index)%norm2 < filter_eps*filter_eps) THEN
+         block_norm2 = SUM(ri_data%lri_kp%lattice_metric(block_index)%values**2)
+         IF (block_norm2 < filter_eps*filter_eps) THEN
             DEALLOCATE (ri_data%lri_kp%lattice_metric(block_index)%values)
-            ri_data%lri_kp%lattice_metric(block_index)%norm2 = 0.0_dp
-            CYCLE
          END IF
-         stored_blocks = stored_blocks + 1
-         stored_reals = stored_reals + &
-                        INT(SIZE(ri_data%lri_kp%lattice_metric(block_index)%values), int_8)
       END DO
       DEALLOCATE (atom_position)
 
@@ -2633,35 +2337,24 @@ CONTAINS
 !> \param lri_kp ...
 !> \param density_cache ...
 !> \param density_blocks ...
-!> \param alias_residual ...
-!> \param hermitian_residual ...
-!> \param completed_partners number of quotient blocks reconstructed from Hermiticity
-!> \param stored_reals ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_loop3_density_create(lri_kp, density_cache, density_blocks, &
-                                           alias_residual, hermitian_residual, completed_partners, &
-                                           stored_reals)
+   SUBROUTINE hfx_lri_loop3_density_create(lri_kp, density_cache, density_blocks)
 
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
       TYPE(lri_density_cache_type), INTENT(IN)           :: density_cache
       TYPE(lri_loop3_density_block_type), ALLOCATABLE, &
          DIMENSION(:), INTENT(OUT)                       :: density_blocks
-      REAL(dp), INTENT(OUT)                              :: alias_residual, hermitian_residual
-      INTEGER, INTENT(OUT)                               :: completed_partners
-      INTEGER(int_8), INTENT(OUT)                        :: stored_reals
 
       INTEGER                                            :: block_index, cell_index, iatom, iblock, &
                                                             jatom, reverse_cell_index, &
                                                             reverse_index
       INTEGER, DIMENSION(3)                              :: reduced, reverse_cell
-      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: seen
-      REAL(dp)                                           :: block_scale, difference, factor, &
+      REAL(dp)                                           :: alias_residual, block_scale, difference, &
+                                                            factor, hermitian_residual, &
                                                             hermitian_scale, reverse_factor
 
       ALLOCATE (density_blocks(lri_kp%lattice_natom**2*lri_kp%lattice_ncell))
-      ALLOCATE (seen(SIZE(density_blocks)), SOURCE=.FALSE.)
       alias_residual = 0.0_dp
-      stored_reals = 0_int_8
       DO iblock = 1, density_cache%nblocks
          IF (.NOT. ALLOCATED(density_cache%blocks(iblock)%values)) CYCLE
          CALL hfx_lri_lattice_reduce( &
@@ -2671,13 +2364,12 @@ CONTAINS
          block_index = hfx_lri_lattice_block_index( &
                        density_cache%blocks(iblock)%iatom, density_cache%blocks(iblock)%jatom, &
                        cell_index, lri_kp%lattice_natom, lri_kp%lattice_ncell)
-         IF (.NOT. seen(block_index)) THEN
+         IF (.NOT. ALLOCATED(density_blocks(block_index)%values)) THEN
             ALLOCATE (density_blocks(block_index)%values( &
                       SIZE(density_cache%blocks(iblock)%values, 1), &
                       SIZE(density_cache%blocks(iblock)%values, 2)))
             density_blocks(block_index)%values(:, :) = &
                factor*density_cache%blocks(iblock)%values
-            seen(block_index) = .TRUE.
          ELSE
             IF (ANY(SHAPE(density_blocks(block_index)%values) /= &
                     SHAPE(density_cache%blocks(iblock)%values))) THEN
@@ -2691,14 +2383,12 @@ CONTAINS
             alias_residual = MAX(alias_residual, difference/block_scale)
          END IF
       END DO
-      DEALLOCATE (seen)
 
       ! The CP2K symmetric real-space matrix stores one representative of some (i,j,R)/
       ! (j,i,-R) pairs.  In particular, its finite list of physical image cells need not
       ! explicitly contain -R.  Complete the exact twisted k-mesh quotient before checking
       ! Hermiticity; treating the absent storage representative as a zero density block is
       ! incorrect and first becomes visible once a sufficiently large k mesh has unpaired cells.
-      completed_partners = 0
       DO block_index = 1, SIZE(density_blocks)
          IF (.NOT. ALLOCATED(density_blocks(block_index)%values)) CYCLE
          CALL hfx_lri_lattice_block_from_index( &
@@ -2718,15 +2408,12 @@ CONTAINS
                       SIZE(density_blocks(block_index)%values, 1)))
             density_blocks(reverse_index)%values(:, :) = &
                reverse_factor*TRANSPOSE(density_blocks(block_index)%values)
-            completed_partners = completed_partners + 1
          END IF
       END DO
 
       hermitian_residual = 0.0_dp
       DO block_index = 1, SIZE(density_blocks)
          IF (.NOT. ALLOCATED(density_blocks(block_index)%values)) CYCLE
-         density_blocks(block_index)%norm2 = SUM(density_blocks(block_index)%values**2)
-         stored_reals = stored_reals + INT(SIZE(density_blocks(block_index)%values), int_8)
          CALL hfx_lri_lattice_block_from_index( &
             block_index, lri_kp%lattice_natom, lri_kp%lattice_ncell, &
             iatom, jatom, cell_index)
@@ -2816,10 +2503,9 @@ CONTAINS
 !> \param group_index ...
 !> \param s_values ...
 !> \param active ...
-!> \param used_terms ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_loop3_s_quotient_build(lri_kp, density_blocks, group_index, &
-                                             s_values, active, used_terms)
+                                             s_values, active)
 
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
       TYPE(lri_loop3_density_block_type), DIMENSION(:), &
@@ -2828,7 +2514,6 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), &
          INTENT(INOUT)                                   :: s_values
       LOGICAL, INTENT(OUT)                               :: active
-      INTEGER(int_8), INTENT(OUT)                        :: used_terms
 
       INTEGER                                            :: c_cell_index, c_center, c_index, &
                                                             c_remote, density_cell_index, &
@@ -2838,7 +2523,6 @@ CONTAINS
       LOGICAL                                            :: first_s
       REAL(dp)                                           :: density_factor
 
-      used_terms = 0_int_8
       CALL hfx_lri_lattice_block_from_index( &
          group_index, lri_kp%lattice_natom, lri_kp%lattice_ncell, &
          iatom, jatom, group_cell_index)
@@ -2868,7 +2552,6 @@ CONTAINS
             s_values, density_factor, first_s, .TRUE., &
             lri_kp%centered_blocks(c_index)%remote_flat)
          first_s = .FALSE.
-         used_terms = used_terms + 1_int_8
       END DO
       active = .NOT. first_s
 
@@ -2881,12 +2564,9 @@ CONTAINS
 !> \param group_index ...
 !> \param k_accum ...
 !> \param workspace ...
-!> \param outer_outer ...
-!> \param outer_inner ...
-!> \param inner_outer ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_loop3_s_quotient_contract(lri_kp, s_values, group_index, k_accum, &
-                                                workspace, outer_outer, outer_inner, inner_outer)
+                                                workspace)
 
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
       REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: s_values
@@ -2894,7 +2574,6 @@ CONTAINS
       REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: k_accum
       TYPE(hfx_lri_contract_workspace_type), &
          INTENT(INOUT)                                   :: workspace
-      INTEGER(int_8), INTENT(OUT)                        :: outer_outer, outer_inner, inner_outer
 
       INTEGER                                            :: c_cell_index, c_center, c_index, &
                                                             c_remote, group_cell_index, iatom, &
@@ -2902,9 +2581,6 @@ CONTAINS
                                                             metric_index
       INTEGER, DIMENSION(3)                              :: c_cell, group_cell, output_cell, reduced
 
-      inner_outer = 0_int_8
-      outer_outer = 0_int_8
-      outer_inner = 0_int_8
       CALL hfx_lri_lattice_block_from_index( &
          group_index, lri_kp%lattice_natom, lri_kp%lattice_ncell, &
          iatom, jatom, group_cell_index)
@@ -2946,8 +2622,6 @@ CONTAINS
             CALL hfx_lri_loop3_k_add( &
                lri_kp, k_accum, jatom, c_remote, -output_cell, &
                workspace%loop3_block, transposed=.TRUE.)
-            inner_outer = inner_outer + 1_int_8
-            outer_inner = outer_inner + 1_int_8
          END DO
       END IF
 
@@ -2975,7 +2649,6 @@ CONTAINS
          CALL hfx_lri_loop3_k_add( &
             lri_kp, k_accum, c_center, jatom, output_cell, &
             workspace%loop3_block)
-         outer_outer = outer_outer + 1_int_8
       END DO
 
    END SUBROUTINE hfx_lri_loop3_s_quotient_contract
@@ -2987,11 +2660,9 @@ CONTAINS
 !> \param group_index ...
 !> \param k_accum ...
 !> \param workspace ...
-!> \param t_terms ...
-!> \param inner_inner ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_loop3_t_quotient_contract(lri_kp, density_blocks, group_index, k_accum, &
-                                                workspace, t_terms, inner_inner)
+                                                workspace)
 
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
       TYPE(lri_loop3_density_block_type), DIMENSION(:), &
@@ -3000,17 +2671,16 @@ CONTAINS
       REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: k_accum
       TYPE(hfx_lri_contract_workspace_type), &
          INTENT(INOUT)                                   :: workspace
-      INTEGER(int_8), INTENT(OUT)                        :: t_terms, inner_inner
 
-      INTEGER :: c_cell_index, c_center, c_index, c_remote, density_cell_index, density_index, &
-         group_cell_index, iatom, iref, jatom, metric_index
+      INTEGER                                            :: c_cell_index, c_center, c_index, &
+                                                            c_remote, density_cell_index, &
+                                                            density_index, group_cell_index, &
+                                                            iatom, iref, jatom
       INTEGER, DIMENSION(3)                              :: c_cell, density_cell, group_cell, &
                                                             output_cell, reduced
       LOGICAL                                            :: first_t
       REAL(dp)                                           :: density_factor
 
-      t_terms = 0_int_8
-      inner_inner = 0_int_8
       CALL hfx_lri_lattice_block_from_index( &
          group_index, lri_kp%lattice_natom, lri_kp%lattice_ncell, &
          iatom, jatom, group_cell_index)
@@ -3035,11 +2705,8 @@ CONTAINS
          density_index = hfx_lri_lattice_block_index( &
                          iatom, c_center, density_cell_index, &
                          lri_kp%lattice_natom, lri_kp%lattice_ncell)
-         metric_index = hfx_lri_lattice_block_index( &
-                        iatom, c_center, density_cell_index, &
-                        lri_kp%lattice_natom, lri_kp%lattice_ncell)
          IF (.NOT. ALLOCATED(density_blocks(density_index)%values) .OR. &
-             .NOT. ALLOCATED(lri_kp%lattice_metric(metric_index)%values)) CYCLE
+             .NOT. ALLOCATED(lri_kp%lattice_metric(density_index)%values)) CYCLE
          IF (ALLOCATED(lri_kp%centered_blocks(c_index)%inner_values)) THEN
             CALL hfx_lri_loop3_density_c_add( &
                lri_kp%centered_blocks(c_index)%inner_values, &
@@ -3053,10 +2720,9 @@ CONTAINS
          END IF
          CALL hfx_lri_loop3_aux_transform( &
             workspace%loop3_w, &
-            lri_kp%lattice_metric(metric_index)%values, &
+            lri_kp%lattice_metric(density_index)%values, &
             workspace%loop3_t, 1.0_dp, first_t)
          first_t = .FALSE.
-         t_terms = t_terms + 1_int_8
       END DO
       IF (first_t) RETURN
       CALL hfx_lri_loop3_pack_aux( &
@@ -3085,7 +2751,6 @@ CONTAINS
          CALL hfx_lri_loop3_k_add( &
             lri_kp, k_accum, c_remote, jatom, output_cell, &
             workspace%loop3_block)
-         inner_inner = inner_inner + 1_int_8
       END DO
 
    END SUBROUTINE hfx_lri_loop3_t_quotient_contract
@@ -3094,19 +2759,18 @@ CONTAINS
 !> \brief Checks and removes roundoff-level Hermiticity noise from quotient K blocks.
 !> \param lri_kp ...
 !> \param k_accum ...
-!> \param hermitian_residual ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_loop3_hermitize(lri_kp, k_accum, hermitian_residual)
+   SUBROUTINE hfx_lri_loop3_hermitize(lri_kp, k_accum)
 
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
       REAL(dp), DIMENSION(:, :, :), INTENT(INOUT)        :: k_accum
-      REAL(dp), INTENT(OUT)                              :: hermitian_residual
 
       INTEGER                                            :: block_index, cell_index, first_i, &
                                                             first_j, iatom, jatom, last_i, last_j, &
                                                             reverse_cell_index, reverse_index
       INTEGER, DIMENSION(3)                              :: cell, reverse_cell
-      REAL(dp)                                           :: difference, factor, scale
+      REAL(dp)                                           :: difference, factor, hermitian_residual, &
+                                                            scale
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: symmetric_block
 
       scale = MAX(1.0E-14_dp, MAXVAL(ABS(k_accum)))
@@ -3178,23 +2842,17 @@ CONTAINS
 !> \param target_pairs ...
 !> \param k_accum ...
 !> \param filter_eps ...
-!> \param stored_blocks ...
-!> \param target_slots ...
-!> \param filtered_blocks ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_loop3_store_k(lri_kp, target_pairs, k_accum, filter_eps, &
-                                    stored_blocks, target_slots, filtered_blocks)
+   SUBROUTINE hfx_lri_loop3_store_k(lri_kp, target_pairs, k_accum, filter_eps)
 
       TYPE(hfx_lri_kp_type), INTENT(INOUT)               :: lri_kp
       TYPE(hfx_lri_pair_block_type), DIMENSION(:), &
          INTENT(IN)                                      :: target_pairs
       REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: k_accum
       REAL(dp), INTENT(IN)                               :: filter_eps
-      INTEGER, INTENT(OUT)                               :: stored_blocks, target_slots, &
-                                                            filtered_blocks
 
       INTEGER :: block_iatom, block_index, block_jatom, cell_index, first_i, first_j, ipair, &
-         last_i, last_j, reverse_cell_index, reverse_index
+         last_i, last_j, reverse_cell_index, reverse_index, stored_blocks
       INTEGER, DIMENSION(3)                              :: reduced, reverse_cell
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: selected
       REAL(dp)                                           :: factor, k_norm
@@ -3211,8 +2869,6 @@ CONTAINS
       ALLOCATE (lri_kp%k_blocks(lri_kp%lattice_natom**2*lri_kp%lattice_ncell))
       ALLOCATE (selected(SIZE(lri_kp%k_blocks)), SOURCE=.FALSE.)
       stored_blocks = 0
-      target_slots = 0
-      filtered_blocks = 0
 
       DO ipair = 1, SIZE(target_pairs)
          CALL hfx_lri_lattice_reduce( &
@@ -3236,8 +2892,6 @@ CONTAINS
          IF (target_pairs(ipair)%iatom /= target_pairs(ipair)%jatom) THEN
             selected(reverse_index) = .TRUE.
          END IF
-         target_slots = target_slots + 1
-
          first_i = lri_kp%atom_ao_offset(target_pairs(ipair)%iatom)
          last_i = lri_kp%atom_ao_offset(target_pairs(ipair)%iatom + 1) - 1
          first_j = lri_kp%atom_ao_offset(target_pairs(ipair)%jatom)
@@ -3247,7 +2901,6 @@ CONTAINS
          k_norm = SQRT(SUM(k_block*k_block))
          IF (k_norm < filter_eps) THEN
             DEALLOCATE (k_block)
-            filtered_blocks = filtered_blocks + 1
             CYCLE
          END IF
          stored_blocks = stored_blocks + 1
@@ -3298,8 +2951,7 @@ CONTAINS
 
       storage_trace = 0.0_dp
       IF (.NOT. ALLOCATED(lri_kp%k_blocks)) RETURN
-      DO ipair = 1, SIZE(lri_kp%k_blocks)
-         IF (.NOT. ALLOCATED(lri_kp%k_blocks(ipair)%k_block)) CYCLE
+      DO ipair = 1, lri_kp%nk_blocks
          CALL hfx_lri_lattice_reduce( &
             lri_kp%k_blocks(ipair)%cell, lri_kp%lattice_grid, &
             lri_kp%lattice_twist, reduced, factor)
@@ -3331,90 +2983,46 @@ CONTAINS
 !> \param ri_data ...
 !> \param density_cache ...
 !> \param target_pairs ...
-!> \param density_alias_residual ...
-!> \param density_hermitian_residual ...
-!> \param density_completed_partners ...
-!> \param k_hermitian_residual ...
-!> \param density_mib ...
-!> \param working_mib ...
-!> \param s_terms ...
-!> \param t_terms ...
-!> \param inner_outer ...
-!> \param outer_inner ...
-!> \param outer_outer ...
-!> \param inner_inner ...
-!> \param stored_blocks ...
-!> \param target_slots ...
-!> \param filtered_blocks ...
-!> \param k_norm ...
-!> \param storage_trace ...
-!> \param storage_trace_residual ...
+!> \param exchange_trace ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_loop3_quotient_contract( &
-      ri_data, density_cache, target_pairs, density_alias_residual, density_hermitian_residual, &
-      density_completed_partners, k_hermitian_residual, density_mib, working_mib, s_terms, &
-      t_terms, inner_outer, outer_inner, outer_outer, inner_inner, stored_blocks, target_slots, &
-      filtered_blocks, k_norm, storage_trace, storage_trace_residual)
+   SUBROUTINE hfx_lri_loop3_quotient_contract(ri_data, density_cache, target_pairs, exchange_trace)
 
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(lri_density_cache_type), INTENT(IN)           :: density_cache
       TYPE(hfx_lri_pair_block_type), DIMENSION(:), &
          INTENT(IN)                                      :: target_pairs
-      REAL(dp), INTENT(OUT)                              :: density_alias_residual, &
-                                                            density_hermitian_residual
-      INTEGER, INTENT(OUT)                               :: density_completed_partners
-      REAL(dp), INTENT(OUT)                              :: k_hermitian_residual, density_mib, &
-                                                            working_mib
-      INTEGER(int_8), INTENT(OUT)                        :: s_terms, t_terms, inner_outer, &
-                                                            outer_inner, outer_outer, inner_inner
-      INTEGER, INTENT(OUT)                               :: stored_blocks, target_slots, &
-                                                            filtered_blocks
-      REAL(dp), INTENT(OUT)                              :: k_norm, storage_trace, &
-                                                            storage_trace_residual
+      REAL(dp), INTENT(OUT)                              :: exchange_trace
 
       INTEGER                                            :: density_cell_index, density_iatom, &
                                                             density_jatom, igroup, ithread, &
                                                             nblocks, nthreads
-      INTEGER(int_8) :: density_reals, inner_inner_local, inner_outer_local, outer_inner_local, &
-         outer_outer_local, s_terms_local, t_terms_local, validation_work, working_reals
-      LOGICAL                                            :: lri_validate, reciprocal_validate, &
-                                                            s_active
-      REAL(dp) :: density_eig_max, density_eig_min, density_k_hermitian, exchange_trace, &
-         kernel_eig_max, kernel_eig_min, kernel_k_hermitian, reciprocal_trace, trace_residual
+      INTEGER(int_8)                                     :: validation_work
+      LOGICAL                                            :: reciprocal_validate, s_active
+      REAL(dp) :: density_eig_max, density_eig_min, density_k_hermitian, kernel_eig_max, &
+         kernel_eig_min, kernel_k_hermitian, reciprocal_trace, storage_trace, &
+         storage_trace_residual, trace_residual
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: density_accum, k_accum
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :, :)       :: k_thread
       TYPE(hfx_lri_contract_workspace_type)              :: workspace
       TYPE(lri_loop3_density_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: density_blocks
 
-      CALL hfx_lri_loop3_density_create( &
-         ri_data%lri_kp, density_cache, density_blocks, density_alias_residual, &
-         density_hermitian_residual, density_completed_partners, density_reals)
-      lri_validate = .FALSE.
+      CALL hfx_lri_loop3_density_create(ri_data%lri_kp, density_cache, density_blocks)
+      reciprocal_validate = .FALSE.
       IF (ASSOCIATED(ri_data%ri_section)) THEN
          CALL section_vals_val_get( &
-            ri_data%ri_section, "KP_LRI_VALIDATE", l_val=lri_validate)
+            ri_data%ri_section, "KP_LRI_VALIDATE", l_val=reciprocal_validate)
       END IF
-      density_mib = REAL(density_reals, dp)*8.0_dp/1024.0_dp**2
       nblocks = ri_data%lri_kp%lattice_natom**2*ri_data%lri_kp%lattice_ncell
 
       nthreads = SIZE(ri_data%lri_kp%thread_workspaces)
       ALLOCATE (k_thread(ri_data%lri_kp%lattice_total_nao, &
                          ri_data%lri_kp%lattice_total_nao, &
                          ri_data%lri_kp%lattice_ncell, nthreads), SOURCE=0.0_dp)
-      s_terms = 0_int_8
-      t_terms = 0_int_8
-      inner_outer = 0_int_8
-      outer_inner = 0_int_8
-      outer_outer = 0_int_8
-      inner_inner = 0_int_8
 
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          SHARED(density_blocks, k_thread, nblocks, ri_data) &
-      !$OMP          PRIVATE(workspace, igroup, inner_inner_local, inner_outer_local, &
-      !$OMP                  ithread, outer_inner_local, outer_outer_local, s_active, &
-      !$OMP                  s_terms_local, t_terms_local) &
-      !$OMP          REDUCTION(+:inner_inner, inner_outer, outer_inner, outer_outer, s_terms, t_terms)
+      !$OMP          PRIVATE(workspace, igroup, ithread, s_active)
       ithread = 1
 !$    ithread = omp_get_thread_num() + 1
       CALL hfx_lri_contract_workspace_move( &
@@ -3424,20 +3032,12 @@ CONTAINS
       DO igroup = 1, nblocks
          CALL hfx_lri_loop3_s_quotient_build( &
             ri_data%lri_kp, density_blocks, igroup, &
-            workspace%loop3_s, s_active, s_terms_local)
-         s_terms = s_terms + s_terms_local
-         inner_outer_local = 0_int_8
-         outer_inner_local = 0_int_8
-         outer_outer_local = 0_int_8
+            workspace%loop3_s, s_active)
          IF (s_active) THEN
             CALL hfx_lri_loop3_s_quotient_contract( &
                ri_data%lri_kp, workspace%loop3_s, igroup, &
-               k_thread(:, :, :, ithread), workspace, &
-               outer_outer_local, outer_inner_local, inner_outer_local)
+               k_thread(:, :, :, ithread), workspace)
          END IF
-         inner_outer = inner_outer + inner_outer_local
-         outer_inner = outer_inner + outer_inner_local
-         outer_outer = outer_outer + outer_outer_local
       END DO
       !$OMP END DO
 
@@ -3445,9 +3045,7 @@ CONTAINS
       DO igroup = 1, nblocks
          CALL hfx_lri_loop3_t_quotient_contract( &
             ri_data%lri_kp, density_blocks, igroup, k_thread(:, :, :, ithread), &
-            workspace, t_terms_local, inner_inner_local)
-         t_terms = t_terms + t_terms_local
-         inner_inner = inner_inner + inner_inner_local
+            workspace)
       END DO
       !$OMP END DO
 
@@ -3455,44 +3053,6 @@ CONTAINS
          workspace, ri_data%lri_kp%thread_workspaces(ithread))
       !$OMP END PARALLEL
 
-      working_reals = INT(SIZE(k_thread), int_8) + &
-                      INT(ri_data%lri_kp%lattice_total_nao, int_8)**2* &
-                      INT(ri_data%lri_kp%lattice_ncell, int_8)
-      DO ithread = 1, nthreads
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_s_flat)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_s_flat), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_t_flat)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_t_flat), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_u_flat)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_u_flat), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_block)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_block), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_s)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_s), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_t)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_t), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_u)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_u), int_8)
-         END IF
-         IF (ALLOCATED(ri_data%lri_kp%thread_workspaces(ithread)%loop3_w)) THEN
-            working_reals = working_reals + INT(SIZE( &
-                                                ri_data%lri_kp%thread_workspaces(ithread)%loop3_w), int_8)
-         END IF
-      END DO
-      working_mib = REAL(working_reals, dp)*8.0_dp/1024.0_dp**2
       ALLOCATE (k_accum(ri_data%lri_kp%lattice_total_nao, &
                         ri_data%lri_kp%lattice_total_nao, &
                         ri_data%lri_kp%lattice_ncell), SOURCE=0.0_dp)
@@ -3500,8 +3060,7 @@ CONTAINS
          k_accum(:, :, :) = k_accum + k_thread(:, :, :, ithread)
       END DO
       DEALLOCATE (k_thread)
-      CALL hfx_lri_loop3_hermitize(ri_data%lri_kp, k_accum, k_hermitian_residual)
-      k_norm = SQRT(SUM(k_accum*k_accum))
+      CALL hfx_lri_loop3_hermitize(ri_data%lri_kp, k_accum)
 
       exchange_trace = 0.0_dp
       DO igroup = 1, SIZE(density_blocks)
@@ -3518,10 +3077,7 @@ CONTAINS
                           ri_data%lri_kp%atom_ao_offset(density_jatom + 1) - 1, &
                           density_cell_index))
       END DO
-      ri_data%lri_kp%exchange_trace_raw = exchange_trace
 
-      reciprocal_validate = lri_validate
-      validation_work = 0_int_8
       IF (reciprocal_validate) THEN
          validation_work = INT(ri_data%lri_kp%lattice_total_nao, int_8)**2* &
                            INT(ri_data%lri_kp%lattice_ncell, int_8)**2
@@ -3577,8 +3133,7 @@ CONTAINS
          DEALLOCATE (density_accum)
       END IF
       CALL hfx_lri_loop3_store_k( &
-         ri_data%lri_kp, target_pairs, k_accum, ri_data%filter_eps, &
-         stored_blocks, target_slots, filtered_blocks)
+         ri_data%lri_kp, target_pairs, k_accum, ri_data%filter_eps)
       CALL hfx_lri_storage_trace(ri_data%lri_kp, density_blocks, storage_trace)
       storage_trace_residual = ABS(storage_trace - exchange_trace)/ &
                                MAX(TINY(1.0_dp), ABS(storage_trace), ABS(exchange_trace))
@@ -3593,29 +3148,25 @@ CONTAINS
 !> \param qs_env ...
 !> \param ri_data ...
 !> \param rho_ao ...
+!> \param exchange_trace ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao)
+   SUBROUTINE hfx_lri_build_rank_local_k_blocks(qs_env, ri_data, rho_ao, exchange_trace)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+      REAL(dp), INTENT(OUT)                              :: exchange_trace
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_build_rank_local_k_blocks'
 
-      INTEGER :: c_blocks_loop3, density_completed_loop3, filtered_k_blocks, handle, ikind, ipair, &
-         max_k_blocks, maxl_ri, maxl_ri_kind, metric_evaluated, metric_screened, metric_unique, &
-         natom, nk_blocks_built, nkind, nthreads, v_blocks_loop3
-      INTEGER(int_8) :: c_reals_loop3, inner_inner_loop3, inner_outer_loop3, outer_inner_loop3, &
-         outer_outer_loop3, s_terms_loop3, t_terms_loop3, v_reals_loop3
+      INTEGER                                            :: handle, ikind, ipair, maxl_ri, &
+                                                            maxl_ri_kind, natom, nkind, nthreads
       INTEGER, DIMENSION(3)                              :: grid, twist
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: kpoint_symmetry, need_geometry
-      REAL(dp) :: density_alias_loop3, density_hermitian_loop3, density_mib_loop3, &
-         exchange_trace_raw, k_blocks_norm, k_hermitian_loop3, metric_batch_mib, result_mib_loop3, &
-         storage_trace_loop3, storage_trace_residual_loop3
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
+      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_RI
       TYPE(gto_basis_set_type), POINTER                  :: ri_basis
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: target_pairs
@@ -3629,7 +3180,7 @@ CONTAINS
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (basis_set_AO, basis_set_RI, cell, cell_to_index, dft_control, kpoints, particle_set, &
+      NULLIFY (basis_set_RI, cell, cell_to_index, dft_control, kpoints, particle_set, &
                qs_kind_set, ri_basis, sab_nl)
       kpoint_symmetry = .FALSE.
 
@@ -3637,7 +3188,7 @@ CONTAINS
       IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) THEN
          CPABORT("LRI-HFXk fitting-pair blocks are not allocated")
       END IF
-      IF (ri_data%lri_kp%npair_blocks <= 0) CPABORT("LRI-HFXk has no fitting-pair blocks")
+      IF (SIZE(ri_data%lri_kp%pair_blocks) == 0) CPABORT("LRI-HFXk has no fitting-pair blocks")
       IF (.NOT. ASSOCIATED(rho_ao)) CPABORT("LRI-HFXk density matrix is not associated")
 
       CALL timeset(routineN, handle)
@@ -3650,12 +3201,11 @@ CONTAINS
       END IF
       IF (.NOT. ASSOCIATED(sab_nl)) CPABORT("LRI-HFXk could not obtain its matrix neighbor list")
 
-      need_geometry = .NOT. ri_data%lri_kp%loop3_ready
-      ALLOCATE (basis_set_AO(nkind))
-      CALL basis_set_list_setup(basis_set_AO, ri_data%orb_basis_type, qs_kind_set)
+      need_geometry = .NOT. ALLOCATED(ri_data%lri_kp%centered_blocks) .OR. &
+                      .NOT. ALLOCATED(ri_data%lri_kp%lattice_metric)
       CALL hfx_lri_density_cache_create(rho_ao, cell_to_index, sab_nl, ri_data%filter_eps, density_cache)
       CALL hfx_lri_target_pairs_create(sab_nl, cell_to_index, SIZE(rho_ao, 2), &
-                                       basis_set_AO, target_pairs)
+                                       nkind, target_pairs)
       IF (SIZE(target_pairs) == 0) THEN
          CPABORT("LRI-HFXk found no writable target blocks in the k-point neighbor list")
       END IF
@@ -3682,8 +3232,7 @@ CONTAINS
                CALL init_interaction_radii_orb_basis(ri_basis, ri_data%eps_pgf_orb)
             END IF
          END DO
-         CALL hfx_lri_pair_lookup_create(pair_lookup, ri_data%lri_kp%pair_blocks, &
-                                         ri_data%lri_kp%npair_blocks, natom)
+         CALL hfx_lri_pair_lookup_create(pair_lookup, ri_data%lri_kp%pair_blocks, natom)
          CALL hfx_lri_build_ri_transform_cache(basis_set_RI, ri_transform_cache)
          maxl_ri = 0
          DO ikind = 1, nkind
@@ -3696,83 +3245,30 @@ CONTAINS
 
          CALL hfx_lri_lattice_grid(kpoints, grid, twist)
          CALL hfx_lri_centered_build( &
-            ri_data%lri_kp, natom, grid, twist, ri_data%filter_eps, &
-            c_blocks_loop3, c_reals_loop3)
-
-         IF (ri_data%unit_nr > 0) THEN
-            WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk streamed metric setup"
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "target blocks", SIZE(target_pairs)
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "density blocks", density_cache%nblocks
-            FLUSH (ri_data%unit_nr)
-         END IF
+            ri_data%lri_kp, natom, grid, twist, ri_data%filter_eps)
          CALL hfx_lri_metric_lattice_build( &
             ri_data, pair_lookup, density_cache, target_pairs, basis_set_RI, &
-            ri_transform_cache, particle_set, cell, kpoint_symmetry, maxl_ri, ri_data%filter_eps_2c, &
-            metric_unique, metric_evaluated, metric_screened, metric_batch_mib, &
-            v_blocks_loop3, v_reals_loop3)
-         ri_data%lri_kp%loop3_ready = .TRUE.
+            ri_transform_cache, particle_set, cell, kpoint_symmetry, maxl_ri, ri_data%filter_eps_2c)
 
          ! The quotient contains all information needed by subsequent SCF iterations.
          ! Release physical coefficient blocks and the small construction caches now.
-         DO ipair = 1, ri_data%lri_kp%npair_blocks
+         DO ipair = 1, SIZE(ri_data%lri_kp%pair_blocks)
             IF (ALLOCATED(ri_data%lri_kp%pair_blocks(ipair)%c_fit)) THEN
                DEALLOCATE (ri_data%lri_kp%pair_blocks(ipair)%c_fit)
             END IF
          END DO
          IF (ri_data%unit_nr > 0) THEN
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") &
-               "unique metric keys", metric_unique
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "evaluated metric keys", metric_evaluated
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "distance-screened", metric_screened
-            WRITE (ri_data%unit_nr, "(T4,A,T28,F10.2)") "peak metric batch/MiB", metric_batch_mib
-            WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk finite-k loop3 plan"
+            WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk finite-k setup"
             WRITE (ri_data%unit_nr, "(T4,A,T28,3I6)") &
                "quotient grid", ri_data%lri_kp%lattice_grid
             WRITE (ri_data%unit_nr, "(T4,A,T28,3I6)") &
                "boundary twist", ri_data%lri_kp%lattice_twist
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") &
-               "quotient groups", ri_data%lri_kp%lattice_natom**2*ri_data%lri_kp%lattice_ncell
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "centered C blocks", c_blocks_loop3
-            WRITE (ri_data%unit_nr, "(T4,A,T28,F14.2)") &
-               "C plus packing/MiB", REAL(c_reals_loop3, dp)*8.0_dp/1024.0_dp**2
-            WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "quotient V blocks", v_blocks_loop3
-            WRITE (ri_data%unit_nr, "(T4,A,T28,F14.2)") &
-               "quotient V/MiB", REAL(v_reals_loop3, dp)*8.0_dp/1024.0_dp**2
             FLUSH (ri_data%unit_nr)
          END IF
       END IF
 
       CALL hfx_lri_loop3_quotient_contract( &
-         ri_data, density_cache, target_pairs, density_alias_loop3, density_hermitian_loop3, &
-         density_completed_loop3, k_hermitian_loop3, density_mib_loop3, result_mib_loop3, &
-         s_terms_loop3, t_terms_loop3, inner_outer_loop3, outer_inner_loop3, outer_outer_loop3, &
-         inner_inner_loop3, nk_blocks_built, max_k_blocks, filtered_k_blocks, k_blocks_norm, &
-         storage_trace_loop3, storage_trace_residual_loop3)
-      exchange_trace_raw = ri_data%lri_kp%exchange_trace_raw
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk loop3 contraction"
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "S density-C terms", s_terms_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "T density-C-V terms", t_terms_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "outer-outer", outer_outer_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "outer-inner", outer_inner_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "inner-outer", inner_outer_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I14)") "inner-inner", inner_inner_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10,T41,I10)") &
-            "stored/target slots", nk_blocks_built, max_k_blocks
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "filtered K blocks", filtered_k_blocks
-         WRITE (ri_data%unit_nr, "(T4,A,T28,F10.3,T41,F10.3)") &
-            "density/working MiB", density_mib_loop3, result_mib_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3,T41,ES10.3)") &
-            "density alias/Herm", density_alias_loop3, density_hermitian_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") &
-            "completed D partners", density_completed_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3)") "K Herm residual", k_hermitian_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3,T41,ES14.6)") &
-            "K norm/Tr[D K]", k_blocks_norm, exchange_trace_raw
-         WRITE (ri_data%unit_nr, "(T4,A,T28,ES14.6,T48,ES10.3)") &
-            "storage trace/residual", storage_trace_loop3, storage_trace_residual_loop3
-         FLUSH (ri_data%unit_nr)
-      END IF
+         ri_data, density_cache, target_pairs, exchange_trace)
 
       IF (ALLOCATED(target_pairs)) DEALLOCATE (target_pairs)
       IF (need_geometry .AND. ASSOCIATED(dft_control)) THEN
@@ -3784,7 +3280,6 @@ CONTAINS
             END IF
          END DO
       END IF
-      IF (ASSOCIATED(basis_set_AO)) DEALLOCATE (basis_set_AO)
       IF (ASSOCIATED(basis_set_RI)) DEALLOCATE (basis_set_RI)
       CALL timestop(handle)
 
@@ -3804,8 +3299,7 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      INTEGER                                            :: added_blocks, icol, img, ipair, irow, &
-                                                            transposed_blocks
+      INTEGER                                            :: icol, img, ipair, irow
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found, use_transpose
       REAL(dp)                                           :: scale
@@ -3829,104 +3323,51 @@ CONTAINS
       ! The input density is spin-summed RKS, so its same-spin density is rho/2.
       scale = -0.5_dp*hf_fraction
 
-      added_blocks = 0
-      transposed_blocks = 0
-      IF (ALLOCATED(ri_data%lri_kp%k_blocks)) THEN
-         DO ipair = 1, SIZE(ri_data%lri_kp%k_blocks)
-            IF (.NOT. ALLOCATED(ri_data%lri_kp%k_blocks(ipair)%k_block)) CYCLE
-
-            IF (ANY(ri_data%lri_kp%k_blocks(ipair)%cell < LBOUND(cell_to_index)) .OR. &
-                ANY(ri_data%lri_kp%k_blocks(ipair)%cell > UBOUND(cell_to_index))) THEN
-               CPABORT("LRI-HFXk target cell is outside the k-point image map")
-            END IF
-            img = cell_to_index(ri_data%lri_kp%k_blocks(ipair)%cell(1), &
-                                ri_data%lri_kp%k_blocks(ipair)%cell(2), &
-                                ri_data%lri_kp%k_blocks(ipair)%cell(3))
-            IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) THEN
-               CPABORT("LRI-HFXk target has no corresponding KS image")
-            END IF
-
-            irow = MIN(ri_data%lri_kp%k_blocks(ipair)%iatom, &
-                       ri_data%lri_kp%k_blocks(ipair)%jatom)
-            icol = MAX(ri_data%lri_kp%k_blocks(ipair)%iatom, &
-                       ri_data%lri_kp%k_blocks(ipair)%jatom)
-            use_transpose = ri_data%lri_kp%k_blocks(ipair)%iatom > &
-                            ri_data%lri_kp%k_blocks(ipair)%jatom
-            NULLIFY (ks_block)
-            CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, row=irow, col=icol, &
-                                   block=ks_block, found=found)
-            IF (.NOT. found) CPABORT("LRI-HFXk target block is absent from the KS matrix")
-
-            IF (use_transpose) THEN
-               IF (ANY(SHAPE(ks_block) /= &
-                       [ri_data%lri_kp%k_blocks(ipair)%nao_j, &
-                        ri_data%lri_kp%k_blocks(ipair)%nao_i])) THEN
-                  CPABORT("Inconsistent transposed LRI-HFXk KS block dimensions")
-               END IF
-               ks_block(:, :) = ks_block(:, :) + scale*TRANSPOSE(ri_data%lri_kp%k_blocks(ipair)%k_block(:, :))
-               transposed_blocks = transposed_blocks + 1
-            ELSE
-               IF (ANY(SHAPE(ks_block) /= SHAPE(ri_data%lri_kp%k_blocks(ipair)%k_block))) THEN
-                  CPABORT("Inconsistent LRI-HFXk KS block dimensions")
-               END IF
-               ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%k_blocks(ipair)%k_block(:, :)
-            END IF
-            added_blocks = added_blocks + 1
-         END DO
+      IF (.NOT. ALLOCATED(ri_data%lri_kp%k_blocks)) THEN
+         CPABORT("LRI-HFXk K blocks are not allocated during KS writeback")
       END IF
+      DO ipair = 1, ri_data%lri_kp%nk_blocks
+         IF (.NOT. ALLOCATED(ri_data%lri_kp%k_blocks(ipair)%k_block)) THEN
+            CPABORT("LRI-HFXk active K block is not allocated during KS writeback")
+         END IF
 
-      IF (added_blocks /= ri_data%lri_kp%nk_blocks) THEN
-         CPABORT("Not all LRI-HFXk K blocks were written to the KS matrix")
-      END IF
+         IF (ANY(ri_data%lri_kp%k_blocks(ipair)%cell < LBOUND(cell_to_index)) .OR. &
+             ANY(ri_data%lri_kp%k_blocks(ipair)%cell > UBOUND(cell_to_index))) THEN
+            CPABORT("LRI-HFXk target cell is outside the k-point image map")
+         END IF
+         img = cell_to_index(ri_data%lri_kp%k_blocks(ipair)%cell(1), &
+                             ri_data%lri_kp%k_blocks(ipair)%cell(2), &
+                             ri_data%lri_kp%k_blocks(ipair)%cell(3))
+         IF (img < 1 .OR. img > SIZE(ks_matrix, 2)) THEN
+            CPABORT("LRI-HFXk target has no corresponding KS image")
+         END IF
 
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk rank-local KS writeback"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10,T41,I10)") &
-            "added/stored", added_blocks, ri_data%lri_kp%nk_blocks
-         WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
-            "transposed", transposed_blocks
-      END IF
+         irow = MIN(ri_data%lri_kp%k_blocks(ipair)%iatom, &
+                    ri_data%lri_kp%k_blocks(ipair)%jatom)
+         icol = MAX(ri_data%lri_kp%k_blocks(ipair)%iatom, &
+                    ri_data%lri_kp%k_blocks(ipair)%jatom)
+         use_transpose = ri_data%lri_kp%k_blocks(ipair)%iatom > &
+                         ri_data%lri_kp%k_blocks(ipair)%jatom
+         NULLIFY (ks_block)
+         CALL dbcsr_get_block_p(matrix=ks_matrix(1, img)%matrix, row=irow, col=icol, &
+                                block=ks_block, found=found)
+         IF (.NOT. found) CPABORT("LRI-HFXk target block is absent from the KS matrix")
+
+         IF (use_transpose) THEN
+            IF (ANY(SHAPE(ks_block) /= &
+                    [SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 2), &
+                     SIZE(ri_data%lri_kp%k_blocks(ipair)%k_block, 1)])) THEN
+               CPABORT("Inconsistent transposed LRI-HFXk KS block dimensions")
+            END IF
+            ks_block(:, :) = ks_block(:, :) + scale*TRANSPOSE(ri_data%lri_kp%k_blocks(ipair)%k_block(:, :))
+         ELSE
+            IF (ANY(SHAPE(ks_block) /= SHAPE(ri_data%lri_kp%k_blocks(ipair)%k_block))) THEN
+               CPABORT("Inconsistent LRI-HFXk KS block dimensions")
+            END IF
+            ks_block(:, :) = ks_block(:, :) + scale*ri_data%lri_kp%k_blocks(ipair)%k_block(:, :)
+         END IF
+      END DO
    END SUBROUTINE hfx_lri_write_rank_local_k_blocks
-
-! **************************************************************************************************
-!> \brief Computes the RKS HFX energy from the completed pair-local exchange trace.
-!> \param qs_env ...
-!> \param ri_data ...
-!> \param hf_fraction ...
-!> \param ehfx ...
-!> \note For a spin-summed RKS density, E_x = -hf_fraction*Tr[D K_raw]/4.
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_compute_rank_local_energy(qs_env, ri_data, hf_fraction, ehfx)
-
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
-      REAL(dp), INTENT(IN)                               :: hf_fraction
-      REAL(dp), INTENT(OUT)                              :: ehfx
-
-      REAL(dp)                                           :: exchange_trace
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-
-      NULLIFY (para_env)
-
-      ehfx = 0.0_dp
-      IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
-      CALL get_qs_env(qs_env=qs_env, para_env=para_env)
-      exchange_trace = ri_data%lri_kp%exchange_trace_raw
-      IF (ASSOCIATED(para_env)) CALL para_env%sum(exchange_trace)
-      ! For an RKS spin-summed density, F_x = -hf_fraction*K_raw/2 and
-      ! E_x = Tr[D F_x]/2 = -hf_fraction*Tr[D K_raw]/4.
-      ehfx = -0.25_dp*hf_fraction*exchange_trace
-
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T4,A)") "LRI-HFXk exchange energy"
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
-            "Tr[D K_raw]", exchange_trace
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
-            "HF fraction", hf_fraction
-         WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
-            "E scaled", ehfx
-      END IF
-   END SUBROUTINE hfx_lri_compute_rank_local_energy
 
 ! **************************************************************************************************
 !> \brief Returns a cached spherical two-center auxiliary block.
