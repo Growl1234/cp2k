@@ -12,7 +12,6 @@
 MODULE hfx_lri_kp
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, &
 !$                    omp_get_thread_num
-   USE admm_types, ONLY: get_admm_env
    USE basis_set_types, ONLY: get_gto_basis_set, &
                               gto_basis_set_p_type, &
                               gto_basis_set_type
@@ -248,7 +247,7 @@ CONTAINS
       INTEGER :: handle, iatom, ibasis, ikind, ipair_block, ithread, jatom, jkind, maxl_ao, &
          maxl_ao_kind, maxl_ri, maxl_ri_kind, mepos, mmax, nao_i, nao_j, naux_i, naux_j, &
          naux_pair, nkind, npair_blocks_local, npair_blocks_max, npair_blocks_sum, &
-         npair_candidates, npairs_local, npairs_max, npairs_sum, nthreads, pair_fit_handle
+         npair_candidates, npairs_local, npairs_max, npairs_sum, nthreads
       INTEGER(int_8) :: c_nreal_local, c_nreal_max, c_nreal_stored_local, c_nreal_stored_max, &
          c_nreal_stored_sum, c_nreal_sum, eigenvalues_discarded_global, &
          eigenvalues_discarded_local, sum_nao_pair_local, sum_nao_pair_max, sum_nao_pair_sum, &
@@ -415,7 +414,6 @@ CONTAINS
 
       ! The neighbor-list iterator is serial, but every fitted pair is independent. Reuse the
       ! immutable basis transforms and give every worker its own Libint engines.
-      CALL timeset(routineN//"_pair_fit", pair_fit_handle)
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          SHARED(ao_transform_cache, basis_set_AO, basis_set_RI, maxl_ao, maxl_ri, &
       !$OMP                 metric_caches, pair_diagnostics, ri_data, ri_transform_cache) &
@@ -435,7 +433,6 @@ CONTAINS
       !$OMP END DO
       CALL coulomb_integral_cleanup(integral_context)
       !$OMP END PARALLEL
-      CALL timestop(pair_fit_handle)
       DEALLOCATE (metric_caches)
 
       c_norm_max_local = 0.0_dp
@@ -3337,8 +3334,6 @@ CONTAINS
 !> \param density_alias_residual ...
 !> \param density_hermitian_residual ...
 !> \param density_completed_partners ...
-!> \param density_norm ...
-!> \param density_abs_max ...
 !> \param k_hermitian_residual ...
 !> \param density_mib ...
 !> \param working_mib ...
@@ -3357,10 +3352,9 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_loop3_quotient_contract( &
       ri_data, density_cache, target_pairs, density_alias_residual, density_hermitian_residual, &
-      density_completed_partners, density_norm, density_abs_max, k_hermitian_residual, &
-      density_mib, working_mib, s_terms, t_terms, inner_outer, outer_inner, outer_outer, &
-      inner_inner, stored_blocks, target_slots, filtered_blocks, k_norm, storage_trace, &
-      storage_trace_residual)
+      density_completed_partners, k_hermitian_residual, density_mib, working_mib, s_terms, &
+      t_terms, inner_outer, outer_inner, outer_outer, inner_inner, stored_blocks, target_slots, &
+      filtered_blocks, k_norm, storage_trace, storage_trace_residual)
 
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
       TYPE(lri_density_cache_type), INTENT(IN)           :: density_cache
@@ -3369,8 +3363,7 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: density_alias_residual, &
                                                             density_hermitian_residual
       INTEGER, INTENT(OUT)                               :: density_completed_partners
-      REAL(dp), INTENT(OUT)                              :: density_norm, density_abs_max, &
-                                                            k_hermitian_residual, density_mib, &
+      REAL(dp), INTENT(OUT)                              :: k_hermitian_residual, density_mib, &
                                                             working_mib
       INTEGER(int_8), INTENT(OUT)                        :: s_terms, t_terms, inner_outer, &
                                                             outer_inner, outer_outer, inner_inner
@@ -3379,13 +3372,11 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: k_norm, storage_trace, &
                                                             storage_trace_residual
 
-      INTEGER                                            :: active_density_blocks, &
-                                                            density_cell_index, density_iatom, &
+      INTEGER                                            :: density_cell_index, density_iatom, &
                                                             density_jatom, igroup, ithread, &
                                                             nblocks, nthreads
-      INTEGER(int_8) :: candidate_joins, density_reals, inner_inner_local, inner_outer_local, &
-         outer_inner_local, outer_outer_local, s_terms_local, t_terms_local, validation_work, &
-         working_reals
+      INTEGER(int_8) :: density_reals, inner_inner_local, inner_outer_local, outer_inner_local, &
+         outer_outer_local, s_terms_local, t_terms_local, validation_work, working_reals
       LOGICAL                                            :: lri_validate, reciprocal_validate, &
                                                             s_active
       REAL(dp) :: density_eig_max, density_eig_min, density_k_hermitian, exchange_trace, &
@@ -3405,31 +3396,9 @@ CONTAINS
             ri_data%ri_section, "KP_LRI_VALIDATE", l_val=lri_validate)
       END IF
       density_mib = REAL(density_reals, dp)*8.0_dp/1024.0_dp**2
-      density_norm = 0.0_dp
-      density_abs_max = 0.0_dp
-      active_density_blocks = 0
-      DO igroup = 1, SIZE(density_blocks)
-         IF (.NOT. ALLOCATED(density_blocks(igroup)%values)) CYCLE
-         active_density_blocks = active_density_blocks + 1
-         density_norm = density_norm + density_blocks(igroup)%norm2
-         density_abs_max = MAX(density_abs_max, MAXVAL(ABS(density_blocks(igroup)%values)))
-      END DO
-      density_norm = SQRT(density_norm)
       nblocks = ri_data%lri_kp%lattice_natom**2*ri_data%lri_kp%lattice_ncell
 
       nthreads = SIZE(ri_data%lri_kp%thread_workspaces)
-      candidate_joins = 2_int_8*INT(ri_data%lri_kp%lattice_natom, int_8)* &
-                        INT(ri_data%lri_kp%lattice_ncell, int_8)* &
-                        INT(SUM(ri_data%lri_kp%centered_atom_count), int_8)
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk loop3 contraction begin"
-         WRITE (ri_data%unit_nr, "(T4,A,T34,I18)") &
-            "active quotient D blocks", active_density_blocks
-         WRITE (ri_data%unit_nr, "(T4,A,T34,I18)") &
-            "density-C candidate joins", candidate_joins
-         WRITE (ri_data%unit_nr, "(T4,A,T34,I18)") "OpenMP threads", nthreads
-         FLUSH (ri_data%unit_nr)
-      END IF
       ALLOCATE (k_thread(ri_data%lri_kp%lattice_total_nao, &
                          ri_data%lri_kp%lattice_total_nao, &
                          ri_data%lri_kp%lattice_ncell, nthreads), SOURCE=0.0_dp)
@@ -3472,13 +3441,6 @@ CONTAINS
       END DO
       !$OMP END DO
 
-      !$OMP MASTER
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(T4,A)") "S/outer contraction complete; entering T/inner-inner"
-         FLUSH (ri_data%unit_nr)
-      END IF
-      !$OMP END MASTER
-
       !$OMP DO SCHEDULE(DYNAMIC, 1)
       DO igroup = 1, nblocks
          CALL hfx_lri_loop3_t_quotient_contract( &
@@ -3488,13 +3450,6 @@ CONTAINS
          inner_inner = inner_inner + inner_inner_local
       END DO
       !$OMP END DO
-
-      !$OMP MASTER
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(T4,A)") "T/inner-inner contraction complete; reducing thread-local K"
-         FLUSH (ri_data%unit_nr)
-      END IF
-      !$OMP END MASTER
 
       CALL hfx_lri_contract_workspace_move( &
          workspace, ri_data%lri_kp%thread_workspaces(ithread))
@@ -3647,20 +3602,17 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_build_rank_local_k_blocks'
 
-      CHARACTER(LEN=7)                                   :: matrix_pair_list
-      INTEGER :: c_blocks_loop3, contraction_handle, density_completed_loop3, density_handle, &
-         filtered_k_blocks, geometry_handle, handle, ikind, ipair, max_k_blocks, maxl_ri, &
-         maxl_ri_kind, metric_evaluated, metric_screened, metric_unique, natom, nk_blocks_built, &
-         nkind, nthreads, v_blocks_loop3
+      INTEGER :: c_blocks_loop3, density_completed_loop3, filtered_k_blocks, handle, ikind, ipair, &
+         max_k_blocks, maxl_ri, maxl_ri_kind, metric_evaluated, metric_screened, metric_unique, &
+         natom, nk_blocks_built, nkind, nthreads, v_blocks_loop3
       INTEGER(int_8) :: c_reals_loop3, inner_inner_loop3, inner_outer_loop3, outer_inner_loop3, &
          outer_outer_loop3, s_terms_loop3, t_terms_loop3, v_reals_loop3
       INTEGER, DIMENSION(3)                              :: grid, twist
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: kpoint_symmetry, need_geometry
-      REAL(dp) :: density_abs_max_loop3, density_alias_loop3, density_hermitian_loop3, &
-         density_mib_loop3, density_norm_loop3, exchange_trace_raw, k_blocks_norm, &
-         k_hermitian_loop3, metric_batch_mib, result_mib_loop3, storage_trace_loop3, &
-         storage_trace_residual_loop3
+      REAL(dp) :: density_alias_loop3, density_hermitian_loop3, density_mib_loop3, &
+         exchange_trace_raw, k_blocks_norm, k_hermitian_loop3, metric_batch_mib, result_mib_loop3, &
+         storage_trace_loop3, storage_trace_residual_loop3
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_AO, basis_set_RI
@@ -3680,7 +3632,6 @@ CONTAINS
       NULLIFY (basis_set_AO, basis_set_RI, cell, cell_to_index, dft_control, kpoints, particle_set, &
                qs_kind_set, ri_basis, sab_nl)
       kpoint_symmetry = .FALSE.
-      matrix_pair_list = "ORB"
 
       IF (.NOT. ASSOCIATED(ri_data%lri_kp)) CPABORT("LRI-HFXk state is not associated")
       IF (.NOT. ALLOCATED(ri_data%lri_kp%pair_blocks)) THEN
@@ -3691,36 +3642,20 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      IF (ri_data%unit_nr > 0) THEN
-         WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk electronic update begin"
-         FLUSH (ri_data%unit_nr)
-      END IF
-
       CALL get_qs_env(qs_env=qs_env, cell=cell, dft_control=dft_control, kpoints=kpoints, &
                       particle_set=particle_set, qs_kind_set=qs_kind_set, nkind=nkind, natom=natom)
       IF (ASSOCIATED(kpoints)) THEN
          CALL get_kpoint_info(kpoints, symmetry=kpoint_symmetry, &
                               cell_to_index=cell_to_index, sab_nl=sab_nl)
       END IF
-      ! The density and KS matrices passed by the k-point HFX driver live on the AUX_FIT
-      ! sparsity pattern in an ADMM calculation.  Using the orbital neighbor list here can
-      ! silently associate an auxiliary block with the wrong atom/image entry.
-      IF (ASSOCIATED(dft_control)) THEN
-         IF (dft_control%do_admm) THEN
-            CALL get_admm_env(qs_env%admm_env, sab_aux_fit=sab_nl)
-            matrix_pair_list = "AUX_FIT"
-         END IF
-      END IF
       IF (.NOT. ASSOCIATED(sab_nl)) CPABORT("LRI-HFXk could not obtain its matrix neighbor list")
 
       need_geometry = .NOT. ri_data%lri_kp%loop3_ready
       ALLOCATE (basis_set_AO(nkind))
       CALL basis_set_list_setup(basis_set_AO, ri_data%orb_basis_type, qs_kind_set)
-      CALL timeset(routineN//"_density", density_handle)
       CALL hfx_lri_density_cache_create(rho_ao, cell_to_index, sab_nl, ri_data%filter_eps, density_cache)
       CALL hfx_lri_target_pairs_create(sab_nl, cell_to_index, SIZE(rho_ao, 2), &
                                        basis_set_AO, target_pairs)
-      CALL timestop(density_handle)
       IF (SIZE(target_pairs) == 0) THEN
          CPABORT("LRI-HFXk found no writable target blocks in the k-point neighbor list")
       END IF
@@ -3737,7 +3672,6 @@ CONTAINS
       END IF
 
       IF (need_geometry) THEN
-         CALL timeset(routineN//"_geometry", geometry_handle)
          ALLOCATE (basis_set_RI(nkind))
          CALL basis_set_list_setup(basis_set_RI, ri_data%ri_basis_type, qs_kind_set)
          ! The basis radii are mutable shared metadata. Use the LRI threshold while evaluating
@@ -3767,7 +3701,6 @@ CONTAINS
 
          IF (ri_data%unit_nr > 0) THEN
             WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk streamed metric setup"
-            WRITE (ri_data%unit_nr, "(T4,A,T28,A)") "matrix pair list", TRIM(matrix_pair_list)
             WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "target blocks", SIZE(target_pairs)
             WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") "density blocks", density_cache%nblocks
             FLUSH (ri_data%unit_nr)
@@ -3807,19 +3740,14 @@ CONTAINS
                "quotient V/MiB", REAL(v_reals_loop3, dp)*8.0_dp/1024.0_dp**2
             FLUSH (ri_data%unit_nr)
          END IF
-         CALL timestop(geometry_handle)
       END IF
 
-      CALL timeset(routineN//"_contract", contraction_handle)
       CALL hfx_lri_loop3_quotient_contract( &
          ri_data, density_cache, target_pairs, density_alias_loop3, density_hermitian_loop3, &
-         density_completed_loop3, density_norm_loop3, density_abs_max_loop3, &
-         k_hermitian_loop3, density_mib_loop3, result_mib_loop3, s_terms_loop3, t_terms_loop3, &
-         inner_outer_loop3, outer_inner_loop3, outer_outer_loop3, inner_inner_loop3, &
-         nk_blocks_built, &
-         max_k_blocks, filtered_k_blocks, k_blocks_norm, storage_trace_loop3, &
-         storage_trace_residual_loop3)
-      CALL timestop(contraction_handle)
+         density_completed_loop3, k_hermitian_loop3, density_mib_loop3, result_mib_loop3, &
+         s_terms_loop3, t_terms_loop3, inner_outer_loop3, outer_inner_loop3, outer_outer_loop3, &
+         inner_inner_loop3, nk_blocks_built, max_k_blocks, filtered_k_blocks, k_blocks_norm, &
+         storage_trace_loop3, storage_trace_residual_loop3)
       exchange_trace_raw = ri_data%lri_kp%exchange_trace_raw
       IF (ri_data%unit_nr > 0) THEN
          WRITE (ri_data%unit_nr, "(/,T2,A)") "LRI-HFXk loop3 contraction"
@@ -3838,15 +3766,11 @@ CONTAINS
             "density alias/Herm", density_alias_loop3, density_hermitian_loop3
          WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") &
             "completed D partners", density_completed_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3,T41,ES10.3)") &
-            "D norm/max", density_norm_loop3, density_abs_max_loop3
          WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3)") "K Herm residual", k_hermitian_loop3
          WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3,T41,ES14.6)") &
             "K norm/Tr[D K]", k_blocks_norm, exchange_trace_raw
          WRITE (ri_data%unit_nr, "(T4,A,T28,ES14.6,T48,ES10.3)") &
             "storage trace/residual", storage_trace_loop3, storage_trace_residual_loop3
-         WRITE (ri_data%unit_nr, "(T4,A,T28,ES10.3)") &
-            "K/D norm gain", k_blocks_norm/MAX(density_norm_loop3, TINY(1.0_dp))
          FLUSH (ri_data%unit_nr)
       END IF
 
@@ -3880,10 +3804,8 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_write_rank_local_k_blocks'
-
-      INTEGER                                            :: added_blocks, handle, icol, img, ipair, &
-                                                            irow, transposed_blocks
+      INTEGER                                            :: added_blocks, icol, img, ipair, irow, &
+                                                            transposed_blocks
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found, use_transpose
       REAL(dp)                                           :: scale
@@ -3899,7 +3821,6 @@ CONTAINS
          CPABORT("LRI-HFXk KS matrix is not associated")
       END IF
 
-      CALL timeset(routineN, handle)
       CALL get_qs_env(qs_env=qs_env, kpoints=kpoints)
       IF (.NOT. ASSOCIATED(kpoints)) CPABORT("LRI-HFXk could not obtain k-point metadata")
       CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index)
@@ -3965,8 +3886,6 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T6,A,T28,I10)") &
             "transposed", transposed_blocks
       END IF
-      CALL timestop(handle)
-
    END SUBROUTINE hfx_lri_write_rank_local_k_blocks
 
 ! **************************************************************************************************
@@ -3984,9 +3903,6 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: hf_fraction
       REAL(dp), INTENT(OUT)                              :: ehfx
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_lri_compute_rank_local_energy'
-
-      INTEGER                                            :: handle
       REAL(dp)                                           :: exchange_trace
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
@@ -3994,7 +3910,6 @@ CONTAINS
 
       ehfx = 0.0_dp
       IF (.NOT. ASSOCIATED(ri_data%lri_kp)) RETURN
-      CALL timeset(routineN, handle)
       CALL get_qs_env(qs_env=qs_env, para_env=para_env)
       exchange_trace = ri_data%lri_kp%exchange_trace_raw
       IF (ASSOCIATED(para_env)) CALL para_env%sum(exchange_trace)
@@ -4011,8 +3926,6 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T6,A,T28,ES14.6)") &
             "E scaled", ehfx
       END IF
-      CALL timestop(handle)
-
    END SUBROUTINE hfx_lri_compute_rank_local_energy
 
 ! **************************************************************************************************
