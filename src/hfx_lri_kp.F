@@ -26,6 +26,8 @@ MODULE hfx_lri_kp
                                          coulomb_integral_context_type, &
                                          coulomb_integral_init
    USE cp_control_types, ONLY: dft_control_type
+   USE cp_files, ONLY: close_file, &
+                       open_file
    USE cp_dbcsr_api, ONLY: dbcsr_get_block_p, &
                            dbcsr_p_type
    USE gamma, ONLY: init_md_ftable
@@ -49,7 +51,8 @@ MODULE hfx_lri_kp
                             hfx_lri_kp_type, &
                             hfx_lri_pair_block_type
    USE hfx_types, ONLY: hfx_ri_type
-   USE input_constants, ONLY: do_potential_short
+   USE input_constants, ONLY: do_potential_short, &
+                              do_potential_truncated
    USE input_section_types, ONLY: section_vals_val_get
    USE integral_library_types, ONLY: active_integral_library, &
                                      library_libint
@@ -74,6 +77,8 @@ MODULE hfx_lri_kp
                                      neighbor_list_set_p_type, &
                                      release_neighbor_list_sets
    USE qs_neighbor_lists, ONLY: setup_neighbor_list
+   USE t_c_g0, ONLY: get_lmax_init, &
+                     init
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -215,8 +220,9 @@ CONTAINS
          CPABORT("LRI-HFXk does not implement incremental-density exchange; set KP_USE_DELTA_P F")
       END IF
 
-      IF (ri_data%hfx_pot%potential_type /= do_potential_short) THEN
-         CPABORT("LRI-HFXk is currently restricted to short-range/HSE exchange")
+      IF (ri_data%hfx_pot%potential_type /= do_potential_short .AND. &
+          ri_data%hfx_pot%potential_type /= do_potential_truncated) THEN
+         CPABORT("LRI-HFXk supports only short-range/HSE or truncated-Coulomb exchange")
       END IF
       IF (active_integral_library%coulomb2_library /= library_libint .OR. &
           active_integral_library%coulomb3_library /= library_libint) THEN
@@ -260,7 +266,7 @@ CONTAINS
 
       INTEGER :: handle, iatom, ibasis, ikind, ipair_block, ithread, jatom, jkind, maxl_ao, &
          maxl_ao_kind, maxl_ri, maxl_ri_kind, mepos, mmax, nao_i, nao_j, naux_i, naux_j, &
-         naux_pair, nkind, npair_candidates, nthreads
+         naux_pair, nkind, npair_candidates, nthreads, tc_mmax, unit_id
       INTEGER, DIMENSION(3)                              :: cell_j
       LOGICAL                                            :: kpoint_symmetry
       REAL(dp), DIMENSION(3)                             :: rab
@@ -273,20 +279,21 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(lri_basis_transform_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: ao_transform_cache, ri_transform_cache
+      TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: soo_list
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
 
-      NULLIFY (qs_kind_set, soo_list, nl_iterator, dft_control, kpoints)
+      NULLIFY (qs_kind_set, soo_list, nl_iterator, dft_control, kpoints, para_env)
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
       NULLIFY (basis_set_AO, basis_set_RI)
 
       CALL timeset(routineN, handle)
 
       CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set, nkind=nkind, &
-                      dft_control=dft_control, kpoints=kpoints)
+                      dft_control=dft_control, kpoints=kpoints, para_env=para_env)
       kpoint_symmetry = .FALSE.
       IF (ASSOCIATED(kpoints)) CALL get_kpoint_info(kpoints, symmetry=kpoint_symmetry)
 
@@ -330,6 +337,32 @@ CONTAINS
          END IF
       END DO
       mmax = MAX(2*maxl_ri, 2*maxl_ao + maxl_ri)
+
+      ! The truncated-Coulomb 2c/3c kernels use a process-global interpolation table.
+      ! Initialize it collectively, before any pair-fit OpenMP region.  The ordinary
+      ! HFX path performs the same setup, but RI-HFXk bypasses that path entirely.
+      tc_mmax = 0
+      IF (ri_data%ri_metric%potential_type == do_potential_truncated) tc_mmax = mmax
+      IF (ri_data%hfx_pot%potential_type == do_potential_truncated) THEN
+         tc_mmax = MAX(tc_mmax, 2*maxl_ri)
+      END IF
+      IF (tc_mmax > 0) THEN
+         IF (.NOT. ASSOCIATED(para_env)) THEN
+            CPABORT("LRI-HFXk could not obtain the MPI environment for truncated Coulomb")
+         END IF
+         IF (tc_mmax > get_lmax_init()) THEN
+            unit_id = -1
+            IF (para_env%mepos == 0) THEN
+               IF (ri_data%ri_metric%potential_type == do_potential_truncated) THEN
+                  CALL open_file(unit_number=unit_id, file_name=ri_data%ri_metric%filename)
+               ELSE
+                  CALL open_file(unit_number=unit_id, file_name=ri_data%hfx_pot%filename)
+               END IF
+            END IF
+            CALL init(tc_mmax, unit_id, para_env%mepos, para_env)
+            IF (para_env%mepos == 0) CALL close_file(unit_id)
+         END IF
+      END IF
       CALL init_md_ftable(nmax=mmax)
 
       ! Build the symmetric AO-pair neighbor list with the LRI screening radii.
@@ -3774,26 +3807,34 @@ CONTAINS
    END SUBROUTINE hfx_lri_loop3_hermitize
 
 ! **************************************************************************************************
-!> \brief Stores one physical representative for every symmetric real-space K slot.
+!> \brief Stores one physical representative for every supported real-space K slot.
 !>
 !>        An off-diagonal atom block and its Hermitian partner share one symmetric DBCSR slot.
 !>        For a diagonal atom block, however, R and -R belong to different image matrices and
 !>        must both be populated unless they reduce to the same quotient cell.
+!>        The complete quotient K can have entries outside the sparse KS matrix structure. Those
+!>        entries are projected out here; the subsequent storage-trace check verifies that this
+!>        projection removes no component supported by the density matrix.
 !> \param lri_kp ...
 !> \param target_pairs ...
+!> \param density_blocks ...
 !> \param k_accum ...
 !> \param filter_eps ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_loop3_store_k(lri_kp, target_pairs, k_accum, filter_eps)
+   SUBROUTINE hfx_lri_loop3_store_k(lri_kp, target_pairs, density_blocks, k_accum, filter_eps)
 
       TYPE(hfx_lri_kp_type), INTENT(INOUT)               :: lri_kp
       TYPE(hfx_lri_pair_block_type), DIMENSION(:), &
          INTENT(IN)                                      :: target_pairs
+      TYPE(lri_loop3_density_block_type), DIMENSION(:), &
+         INTENT(IN)                                      :: density_blocks
       REAL(dp), DIMENSION(:, :, :), INTENT(IN)           :: k_accum
       REAL(dp), INTENT(IN)                               :: filter_eps
 
-      INTEGER :: block_iatom, block_index, block_jatom, cell_index, first_i, first_j, ipair, &
-         last_i, last_j, reverse_cell_index, reverse_index, stored_blocks
+      INTEGER                                            :: block_index, cell_index, first_i, &
+                                                            first_j, ipair, last_i, last_j, &
+                                                            reverse_cell_index, reverse_index, &
+                                                            stored_blocks
       INTEGER, DIMENSION(3)                              :: reduced, reverse_cell
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: selected
       REAL(dp)                                           :: factor, k_norm
@@ -3809,6 +3850,7 @@ CONTAINS
       END IF
       ALLOCATE (lri_kp%k_blocks(lri_kp%lattice_natom**2*lri_kp%lattice_ncell))
       ALLOCATE (selected(SIZE(lri_kp%k_blocks)), SOURCE=.FALSE.)
+      CPASSERT(SIZE(density_blocks) == SIZE(selected))
       stored_blocks = 0
 
       DO ipair = 1, SIZE(target_pairs)
@@ -3851,15 +3893,8 @@ CONTAINS
 
       DO block_index = 1, SIZE(selected)
          IF (selected(block_index)) CYCLE
-         CALL hfx_lri_lattice_block_from_index( &
-            block_index, lri_kp%lattice_natom, lri_kp%lattice_ncell, &
-            block_iatom, block_jatom, cell_index)
-         first_i = lri_kp%atom_ao_offset(block_iatom)
-         last_i = lri_kp%atom_ao_offset(block_iatom + 1) - 1
-         first_j = lri_kp%atom_ao_offset(block_jatom)
-         last_j = lri_kp%atom_ao_offset(block_jatom + 1) - 1
-         IF (SQRT(SUM(k_accum(first_i:last_i, first_j:last_j, cell_index)**2)) >= filter_eps) THEN
-            CPABORT("A nonzero LRI loop3 quotient block has no KS target representative")
+         IF (ALLOCATED(density_blocks(block_index)%values)) THEN
+            CPABORT("A density-supported LRI quotient block has no KS target representative")
          END IF
       END DO
       DEALLOCATE (selected)
@@ -4256,7 +4291,7 @@ CONTAINS
          END IF
       END IF
       CALL hfx_lri_loop3_store_k( &
-         ri_data%lri_kp, target_pairs, k_accum, ri_data%filter_eps)
+         ri_data%lri_kp, target_pairs, density_blocks, k_accum, ri_data%filter_eps)
       CALL hfx_lri_storage_trace(ri_data%lri_kp, density_blocks, storage_trace)
       storage_trace_residual = ABS(storage_trace - exchange_trace)/ &
                                MAX(TINY(1.0_dp), ABS(storage_trace), ABS(exchange_trace))
