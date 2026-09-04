@@ -247,6 +247,7 @@ list(
   hfx_helpers.F
   hfx_libint_interface.F
   hfx_lri_contract.F
+  hfx_lri_lattice.F
   hfx_lri_kp.F
   hfx_lri_types.F
   hfx_load_balance_methods.F
