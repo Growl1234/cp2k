@@ -628,6 +628,17 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE", &
+                          description="Enable expensive pair-local RI-HFXk correctness checks. "// &
+                          "For small systems this reconstructs D and the raw exchange kernel on "// &
+                          "the complete reciprocal mesh, checks their spectra and Hermiticity, "// &
+                          "and compares the real-space and reciprocal-space exchange traces.", &
+                          usage="KP_LRI_VALIDATE {logical}", &
+                          repeats=.FALSE., &
+                          default_l_val=.FALSE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="KP_STACK_SIZE", &
                           description="When doing contraction over periodic cells of the type: "// &
                           "T_mu^a,nu^b,P^c = (mu^a nu^b | Q^d) * (Q^d | P^c), with "// &
