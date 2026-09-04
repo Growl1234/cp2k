@@ -1521,11 +1521,12 @@ CONTAINS
 !> \param symmetric ...
 !> \param molecular ...
 !> \param operator_type ...
+!> \param stable_images use the deterministic k-point periodic-image convention
 !> \date    14.03.2016
 !> \author  JGH
 ! **************************************************************************************************
    SUBROUTINE setup_neighbor_list(ab_list, basis_set_a, basis_set_b, qs_env, &
-                                  mic, symmetric, molecular, operator_type)
+                                  mic, symmetric, molecular, operator_type, stable_images)
 
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: ab_list
@@ -1535,10 +1536,12 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN), OPTIONAL                      :: mic, symmetric, molecular
       CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: operator_type
+      LOGICAL, INTENT(IN), OPTIONAL                      :: stable_images
 
       CHARACTER(LEN=4)                                   :: otype
       INTEGER                                            :: ikind, nkind
-      LOGICAL                                            :: my_mic, my_molecular, my_symmetric
+      LOGICAL                                            :: my_mic, my_molecular, my_stable_images, &
+                                                            my_symmetric
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: a_present, b_present
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: a_radius, b_radius
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: pair_radius
@@ -1573,6 +1576,9 @@ CONTAINS
       ELSE
          my_molecular = .FALSE.
       END IF
+
+      my_stable_images = .FALSE.
+      IF (PRESENT(stable_images)) my_stable_images = stable_images
 
       IF (PRESENT(operator_type)) THEN
          otype = operator_type
@@ -1618,7 +1624,7 @@ CONTAINS
                         molecule_set, my_molecular, particle_set=particle_set)
       CALL build_neighbor_lists(ab_list, particle_set, atom2d, cell, pair_radius, &
                                 mic=my_mic, symmetric=my_symmetric, molecular=my_molecular, &
-                                subcells=2.0_dp, nlname="AUX_NL")
+                                subcells=2.0_dp, nlname="AUX_NL", stable_images=my_stable_images)
 
       CALL atom2d_cleanup(atom2d)
 
