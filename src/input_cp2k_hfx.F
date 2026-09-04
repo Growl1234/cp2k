@@ -630,13 +630,15 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE", &
                           description="Enable expensive pair-local RI-HFXk correctness checks. "// &
-                          "For small systems this independently enumerates all four C-D-V-C "// &
-                          "topologies on the actual quotient blocks. It compares every output "// &
-                          "block and exchange trace when the full reference fits its budget, or "// &
-                          "uses deterministic atom/cell samples otherwise, then reconstructs D "// &
-                          "and K on the complete reciprocal mesh. Hard cell, AO, work, join, and "// &
-                          "extra-memory limits automatically skip diagnostics that are unsuitable "// &
-                          "for a workstation; production then continues.", &
+                          "This first validates every pair metric and fit, including the retained "// &
+                          "spectrum, rank truncation, Hermiticity, and the C*M=J residual. For small "// &
+                          "systems it then independently enumerates all four C-D-V-C topologies on "// &
+                          "the actual quotient blocks. It compares every output block and exchange "// &
+                          "trace when the full reference fits its budget, or uses deterministic "// &
+                          "atom/cell samples otherwise, then reconstructs D and K on the complete "// &
+                          "reciprocal mesh. Hard cell, AO, work, join, and extra-memory limits "// &
+                          "automatically skip diagnostics that are unsuitable for a workstation; "// &
+                          "production then continues.", &
                           usage="KP_LRI_VALIDATE {logical}", &
                           repeats=.FALSE., &
                           default_l_val=.FALSE.)

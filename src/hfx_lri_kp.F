@@ -51,6 +51,7 @@ MODULE hfx_lri_kp
                             hfx_lri_kp_type, &
                             hfx_lri_pair_block_type
    USE hfx_types, ONLY: hfx_ri_type
+   USE ieee_arithmetic, ONLY: ieee_is_finite
    USE input_constants, ONLY: do_potential_short, &
                               do_potential_truncated
    USE input_section_types, ONLY: section_vals_val_get
@@ -102,6 +103,7 @@ MODULE hfx_lri_kp
    INTEGER(int_8), PARAMETER :: lri_reference_max_work = 100000000_int_8
    INTEGER(int_8), PARAMETER :: lri_reference_sample_max_work = 250000000_int_8
    REAL(dp), PARAMETER :: lri_metric_cache_position_tol = 1.0E-12_dp
+   REAL(dp), PARAMETER :: lri_pair_fit_tolerance = 1.0E-10_dp
    REAL(dp), PARAMETER :: lri_reference_tolerance = 1.0E-10_dp
 
    TYPE hfx_lri_metric_entry_type
@@ -116,6 +118,18 @@ MODULE hfx_lri_kp
       INTEGER(int_8)                                     :: clock = 0_int_8
       TYPE(hfx_lri_metric_entry_type), ALLOCATABLE, DIMENSION(:) :: entries
    END TYPE hfx_lri_metric_cache_type
+
+   TYPE hfx_lri_pair_diagnostic_type
+      INTEGER                                            :: discarded_modes = 0, &
+                                                            metric_dimension = 0, &
+                                                            retained_modes = 0
+      REAL(dp)                                           :: c_norm = 0.0_dp, &
+                                                            condition_number = 0.0_dp, &
+                                                            eig_max = 0.0_dp, &
+                                                            eig_min = 0.0_dp, &
+                                                            fit_residual = 0.0_dp, &
+                                                            metric_hermiticity = 0.0_dp
+   END TYPE hfx_lri_pair_diagnostic_type
 
    TYPE hfx_lri_metric_table_type
       INTEGER                                            :: capacity = 0, nentries = 0
@@ -268,7 +282,7 @@ CONTAINS
          maxl_ao_kind, maxl_ri, maxl_ri_kind, mepos, mmax, nao_i, nao_j, naux_i, naux_j, &
          naux_pair, nkind, npair_candidates, nthreads, tc_mmax, unit_id
       INTEGER, DIMENSION(3)                              :: cell_j
-      LOGICAL                                            :: kpoint_symmetry
+      LOGICAL                                            :: kpoint_symmetry, validate_pair_fit
       REAL(dp), DIMENSION(3)                             :: rab
       TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -276,6 +290,8 @@ CONTAINS
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
       TYPE(hfx_lri_metric_cache_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: metric_caches
+      TYPE(hfx_lri_pair_diagnostic_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: pair_diagnostics
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(lri_basis_transform_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: ao_transform_cache, ri_transform_cache
@@ -296,6 +312,11 @@ CONTAINS
                       dft_control=dft_control, kpoints=kpoints, para_env=para_env)
       kpoint_symmetry = .FALSE.
       IF (ASSOCIATED(kpoints)) CALL get_kpoint_info(kpoints, symmetry=kpoint_symmetry)
+      validate_pair_fit = .FALSE.
+      IF (ASSOCIATED(ri_data%ri_section)) THEN
+         CALL section_vals_val_get( &
+            ri_data%ri_section, "KP_LRI_VALIDATE", l_val=validate_pair_fit)
+      END IF
 
       CALL hfx_lri_kp_release(ri_data%lri_kp)
       ALLOCATE (ri_data%lri_kp)
@@ -392,6 +413,7 @@ CONTAINS
       CALL neighbor_list_iterator_release(nl_iterator)
 
       ALLOCATE (ri_data%lri_kp%pair_blocks(npair_candidates))
+      IF (validate_pair_fit) ALLOCATE (pair_diagnostics(npair_candidates))
       CALL neighbor_list_iterator_create(nl_iterator, soo_list)
 
       ipair_block = 0
@@ -440,7 +462,8 @@ CONTAINS
       ! immutable basis transforms and give every worker its own Libint engines.
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          SHARED(ao_transform_cache, basis_set_AO, basis_set_RI, maxl_ao, maxl_ri, &
-      !$OMP                 metric_caches, ri_data, ri_transform_cache) &
+      !$OMP                 metric_caches, pair_diagnostics, ri_data, ri_transform_cache, &
+      !$OMP                 validate_pair_fit) &
       !$OMP          PRIVATE(integral_context, ipair_block, ithread)
       ithread = 1
 !$    ithread = omp_get_thread_num() + 1
@@ -449,9 +472,16 @@ CONTAINS
                                  max_am_3c=MAX(maxl_ao, maxl_ri))
       !$OMP DO SCHEDULE(DYNAMIC, 1)
       DO ipair_block = 1, SIZE(ri_data%lri_kp%pair_blocks)
-         CALL hfx_lri_build_pair_coefficients( &
-            basis_set_AO, basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_block), ri_data, &
-            integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread))
+         IF (validate_pair_fit) THEN
+            CALL hfx_lri_build_pair_coefficients( &
+               basis_set_AO, basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_block), ri_data, &
+               integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread), &
+               pair_diagnostics(ipair_block))
+         ELSE
+            CALL hfx_lri_build_pair_coefficients( &
+               basis_set_AO, basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_block), ri_data, &
+               integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread))
+         END IF
       END DO
       !$OMP END DO
       CALL coulomb_integral_cleanup(integral_context)
@@ -482,10 +512,137 @@ CONTAINS
          WRITE (ri_data%unit_nr, "(T4,A,T28,I10)") &
             "pair blocks", SIZE(ri_data%lri_kp%pair_blocks)
       END IF
+      IF (validate_pair_fit) THEN
+         CALL hfx_lri_validate_pair_fits(pair_diagnostics, ri_data%unit_nr)
+         DEALLOCATE (pair_diagnostics)
+      END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE hfx_lri_pre_scf_kp
+
+! **************************************************************************************************
+!> \brief Summarizes pair fitting diagnostics and rejects algebraically inconsistent full-rank fits.
+!>        A nonzero residual is expected when EPS_EIGVAL removes metric modes, so rank-truncated
+!>        pairs are reported but are not judged by the full-rank solve criterion.
+!> \param diagnostics pair-local metric and fitting diagnostics
+!> \param unit_nr output unit
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_validate_pair_fits(diagnostics, unit_nr)
+
+      TYPE(hfx_lri_pair_diagnostic_type), DIMENSION(:), &
+         INTENT(IN)                                      :: diagnostics
+      INTEGER, INTENT(IN)                                :: unit_nr
+
+      INTEGER                                            :: asymmetric_pairs, &
+                                                            failed_full_rank_pairs, idiag, &
+                                                            invalid_pairs, rank_truncated_pairs, &
+                                                            zero_rank_pairs
+      INTEGER(int_8)                                     :: discarded_modes, retained_modes
+      LOGICAL                                            :: finite_diagnostic
+      REAL(dp) :: c_norm_max, condition_max, eig_max, eig_min, fit_residual_max, &
+         full_rank_residual_max, full_rank_tolerance, metric_hermiticity_max, residual_ratio_max
+
+      asymmetric_pairs = 0
+      c_norm_max = 0.0_dp
+      condition_max = 0.0_dp
+      discarded_modes = 0_int_8
+      eig_max = 0.0_dp
+      eig_min = HUGE(1.0_dp)
+      failed_full_rank_pairs = 0
+      fit_residual_max = 0.0_dp
+      full_rank_residual_max = 0.0_dp
+      invalid_pairs = 0
+      metric_hermiticity_max = 0.0_dp
+      rank_truncated_pairs = 0
+      residual_ratio_max = 0.0_dp
+      retained_modes = 0_int_8
+      zero_rank_pairs = 0
+
+      DO idiag = 1, SIZE(diagnostics)
+         retained_modes = retained_modes + INT(diagnostics(idiag)%retained_modes, int_8)
+         discarded_modes = discarded_modes + INT(diagnostics(idiag)%discarded_modes, int_8)
+         IF (diagnostics(idiag)%discarded_modes > 0) rank_truncated_pairs = rank_truncated_pairs + 1
+         IF (diagnostics(idiag)%retained_modes == 0) zero_rank_pairs = zero_rank_pairs + 1
+
+         finite_diagnostic = &
+            ieee_is_finite(diagnostics(idiag)%c_norm) .AND. &
+            ieee_is_finite(diagnostics(idiag)%condition_number) .AND. &
+            ieee_is_finite(diagnostics(idiag)%eig_max) .AND. &
+            ieee_is_finite(diagnostics(idiag)%eig_min) .AND. &
+            ieee_is_finite(diagnostics(idiag)%fit_residual) .AND. &
+            ieee_is_finite(diagnostics(idiag)%metric_hermiticity)
+         IF (.NOT. finite_diagnostic) THEN
+            invalid_pairs = invalid_pairs + 1
+            CYCLE
+         END IF
+
+         c_norm_max = MAX(c_norm_max, diagnostics(idiag)%c_norm)
+         condition_max = MAX(condition_max, diagnostics(idiag)%condition_number)
+         eig_max = MAX(eig_max, diagnostics(idiag)%eig_max)
+         IF (diagnostics(idiag)%retained_modes > 0) THEN
+            eig_min = MIN(eig_min, diagnostics(idiag)%eig_min)
+         END IF
+         fit_residual_max = MAX(fit_residual_max, diagnostics(idiag)%fit_residual)
+         metric_hermiticity_max = MAX( &
+                                  metric_hermiticity_max, &
+                                  diagnostics(idiag)%metric_hermiticity)
+         IF (diagnostics(idiag)%metric_hermiticity > lri_pair_fit_tolerance) THEN
+            asymmetric_pairs = asymmetric_pairs + 1
+         END IF
+
+         IF (diagnostics(idiag)%discarded_modes == 0) THEN
+            full_rank_residual_max = MAX( &
+                                     full_rank_residual_max, &
+                                     diagnostics(idiag)%fit_residual)
+            ! The residual of an untruncated spectral inverse is bounded by roundoff amplified by
+            ! the retained condition number and metric dimension. Keep an absolute floor so the
+            ! check remains meaningful for the well-conditioned pairs of small reference systems.
+            full_rank_tolerance = MAX( &
+                                  lri_pair_fit_tolerance, &
+                                  64.0_dp*REAL(MAX(1, diagnostics(idiag)%metric_dimension), KIND=dp)* &
+                                  EPSILON(1.0_dp)*MAX(1.0_dp, diagnostics(idiag)%condition_number))
+            residual_ratio_max = MAX( &
+                                 residual_ratio_max, &
+                                 diagnostics(idiag)%fit_residual/full_rank_tolerance)
+            IF (diagnostics(idiag)%fit_residual > full_rank_tolerance) THEN
+               failed_full_rank_pairs = failed_full_rank_pairs + 1
+            END IF
+         END IF
+      END DO
+      IF (eig_min == HUGE(1.0_dp)) eig_min = 0.0_dp
+
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, "(/,T2,A)") "LRI-HFXk pair-fit validation"
+         WRITE (unit_nr, "(T4,A,T34,I12)") "fitted pairs", SIZE(diagnostics)
+         WRITE (unit_nr, "(T4,A,T34,I12,T49,I12)") &
+            "retained/discarded modes", retained_modes, discarded_modes
+         WRITE (unit_nr, "(T4,A,T34,I12,T49,I12)") &
+            "truncated/zero-rank pairs", rank_truncated_pairs, zero_rank_pairs
+         WRITE (unit_nr, "(T4,A,T34,ES14.6,T52,ES14.6)") &
+            "retained eig min/max", eig_min, eig_max
+         WRITE (unit_nr, "(T4,A,T34,ES14.6)") "max retained condition", condition_max
+         WRITE (unit_nr, "(T4,A,T34,ES14.6)") "max C Frobenius norm", c_norm_max
+         WRITE (unit_nr, "(T4,A,T34,ES14.6)") "max metric Herm residual", metric_hermiticity_max
+         WRITE (unit_nr, "(T4,A,T34,ES14.6)") "max fit residual, all", fit_residual_max
+         WRITE (unit_nr, "(T4,A,T34,ES14.6)") &
+            "max fit residual, full rank", full_rank_residual_max
+         WRITE (unit_nr, "(T4,A,T34,ES14.6)") "max full-rank limit ratio", residual_ratio_max
+         WRITE (unit_nr, "(T4,A,T40,I12,T55,I12,T70,I12)") &
+            "invalid/asymmetric/solve failures", invalid_pairs, asymmetric_pairs, &
+            failed_full_rank_pairs
+         IF (invalid_pairs + asymmetric_pairs + failed_full_rank_pairs > 0) THEN
+            WRITE (unit_nr, "(T4,A,T40,A)") "status", "FAILED"
+         ELSE
+            WRITE (unit_nr, "(T4,A,T40,A)") "status", "passed"
+         END IF
+      END IF
+
+      IF (invalid_pairs + asymmetric_pairs + failed_full_rank_pairs > 0) THEN
+         CPABORT("KP_LRI_VALIDATE detected an inconsistent LRI-HFXk pair fit; inspect diagnostics")
+      END IF
+
+   END SUBROUTINE hfx_lri_validate_pair_fits
 
 ! **************************************************************************************************
 !> \brief Counts raw Cartesian primitive-function slots in one basis.
@@ -755,10 +912,11 @@ CONTAINS
 !> \param ao_transform_cache ...
 !> \param ri_transform_cache ...
 !> \param metric_cache ...
+!> \param diagnostic pair-metric and fitting diagnostics
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_build_pair_coefficients(basis_set_AO, basis_set_RI, pair_block, ri_data, &
                                               integral_context, ao_transform_cache, &
-                                              ri_transform_cache, metric_cache)
+                                              ri_transform_cache, metric_cache, diagnostic)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
@@ -768,18 +926,21 @@ CONTAINS
       TYPE(lri_basis_transform_type), DIMENSION(:), &
          INTENT(IN)                                      :: ao_transform_cache, ri_transform_cache
       TYPE(hfx_lri_metric_cache_type), INTENT(INOUT)     :: metric_cache
+      TYPE(hfx_lri_pair_diagnostic_type), INTENT(OUT), &
+         OPTIONAL                                        :: diagnostic
 
-      INTEGER                                            :: cache_slot, ikind, jkind, metric_dim, &
-                                                            ncart_ai, ncart_aj, ncart_ri, &
-                                                            ncart_rj, offset_j
+      INTEGER :: cache_slot, discarded_modes, ikind, jkind, metric_dim, ncart_ai, ncart_aj, &
+         ncart_ri, ncart_rj, offset_j, retained_modes
       LOGICAL                                            :: cache_transpose, metric_zero
-      REAL(dp)                                           :: c_norm
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, j_aux_cart, j_cart, j_sph, &
-                                                            metric_sph, sphi_aux
+      REAL(dp)                                           :: c_norm, condition_number, eig_max, &
+                                                            eig_min, j_norm, metric_norm
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, fit_difference, j_aux_cart, &
+                                                            j_cart, j_sph, metric_sph, sphi_aux
       REAL(dp), DIMENSION(3)                             :: r0
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
 
       NULLIFY (obas_i, obas_j, rbas_i, rbas_j)
+      IF (PRESENT(diagnostic)) diagnostic = hfx_lri_pair_diagnostic_type()
       ikind = pair_block%ikind
       jkind = pair_block%jkind
       IF (ikind < 1 .OR. ikind > SIZE(basis_set_AO) .OR. &
@@ -905,9 +1066,34 @@ CONTAINS
                                      ao_transform_cache(jkind)%sphi, j_sph)
       DEALLOCATE (j_aux_cart)
 
-      CALL hfx_lri_metric_inverse(metric_sph, j_sph, ri_data%eps_eigval, c_norm, c_sph)
+      CALL hfx_lri_metric_inverse( &
+         metric_sph, j_sph, ri_data%eps_eigval, eig_min, eig_max, condition_number, &
+         retained_modes, discarded_modes, c_norm, c_sph)
       IF (.NOT. ALLOCATED(c_sph)) THEN
          CPABORT("Failed to build LRI-HFXk pair fitting coefficients")
+      END IF
+      IF (PRESENT(diagnostic)) THEN
+         diagnostic%c_norm = c_norm
+         diagnostic%condition_number = condition_number
+         diagnostic%discarded_modes = discarded_modes
+         diagnostic%eig_max = eig_max
+         diagnostic%eig_min = eig_min
+         diagnostic%metric_dimension = SIZE(metric_sph, 1)
+         diagnostic%retained_modes = retained_modes
+
+         metric_norm = SQRT(SUM(metric_sph*metric_sph))
+         diagnostic%metric_hermiticity = &
+            SQRT(SUM((metric_sph - TRANSPOSE(metric_sph))**2))/ &
+            MAX(metric_norm, TINY(1.0_dp))
+
+         ALLOCATE (fit_difference(SIZE(j_sph, 1), SIZE(j_sph, 2)))
+         fit_difference = MATMUL( &
+                          c_sph, 0.5_dp*(metric_sph + TRANSPOSE(metric_sph))) - &
+                          j_sph
+         j_norm = SQRT(SUM(j_sph*j_sph))
+         diagnostic%fit_residual = SQRT(SUM(fit_difference*fit_difference))/ &
+                                   MAX(j_norm, TINY(1.0_dp))
+         DEALLOCATE (fit_difference)
       END IF
       CALL hfx_lri_pack_pair_coefficients(pair_block, c_sph, pair_block%nao_i, &
                                           pair_block%nao_j, pair_block%naux_pair)
@@ -923,13 +1109,21 @@ CONTAINS
 !> \param metric_block ...
 !> \param j_block ...
 !> \param eig_threshold ...
+!> \param eig_min smallest retained metric eigenvalue
+!> \param eig_max largest retained metric eigenvalue
+!> \param condition_number condition number in the retained metric subspace
+!> \param retained_modes number of retained metric eigenvectors
+!> \param discarded_modes number of discarded metric eigenvectors
 !> \param c_norm ...
 !> \param c_out ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_metric_inverse(metric_block, j_block, eig_threshold, c_norm, c_out)
+   SUBROUTINE hfx_lri_metric_inverse(metric_block, j_block, eig_threshold, eig_min, eig_max, &
+                                     condition_number, retained_modes, discarded_modes, c_norm, c_out)
 
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: metric_block, j_block
       REAL(dp), INTENT(IN)                               :: eig_threshold
+      REAL(dp), INTENT(OUT)                              :: eig_min, eig_max, condition_number
+      INTEGER, INTENT(OUT)                               :: retained_modes, discarded_modes
       REAL(dp), INTENT(OUT)                              :: c_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
          INTENT(OUT)                                     :: c_out
@@ -939,11 +1133,19 @@ CONTAINS
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: eigvec, tmp
 
       c_norm = 0.0_dp
+      condition_number = 0.0_dp
+      discarded_modes = 0
+      eig_max = 0.0_dp
+      eig_min = 0.0_dp
+      retained_modes = 0
       CPASSERT(eig_threshold >= 0.0_dp)
 
       ncol = SIZE(metric_block, 1)
       nrow = SIZE(j_block, 1)
       IF (ncol == 0 .OR. nrow == 0) RETURN
+      IF (SIZE(metric_block, 2) /= ncol .OR. SIZE(j_block, 2) /= ncol) THEN
+         CPABORT("Inconsistent matrix dimensions in LRI-HFXk pair metric inverse")
+      END IF
 
       ALLOCATE (eigvec(ncol, ncol), eigenvalues(ncol))
       eigvec(:, :) = 0.5_dp*(metric_block + TRANSPOSE(metric_block))
@@ -962,6 +1164,22 @@ CONTAINS
       DEALLOCATE (work)
       IF (info /= 0) THEN
          CPABORT("DSYEV failed in LRI-HFXk pair metric")
+      END IF
+
+      eig_min = HUGE(1.0_dp)
+      DO i = 1, ncol
+         IF (eigenvalues(i) >= eig_threshold) THEN
+            retained_modes = retained_modes + 1
+            eig_min = MIN(eig_min, eigenvalues(i))
+            eig_max = MAX(eig_max, eigenvalues(i))
+         ELSE
+            discarded_modes = discarded_modes + 1
+         END IF
+      END DO
+      IF (retained_modes > 0) THEN
+         condition_number = eig_max/MAX(eig_min, TINY(1.0_dp))
+      ELSE
+         eig_min = 0.0_dp
       END IF
 
       ALLOCATE (tmp(nrow, ncol), c_out(nrow, ncol))
