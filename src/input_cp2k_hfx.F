@@ -593,7 +593,7 @@ CONTAINS
                           description="Selects the RI-HFX backend used for k-point calculations. "// &
                           "EXTENDED is the current image/extended-RI implementation. "// &
                           "LRI selects the new pair-local LRI backend. The LRI backend is initially "// &
-                          "a development path for short-range HSE exchange only.", &
+                          "a development path for short-range HSE and truncated-Coulomb exchange.", &
                           usage="KP_RI_METHOD {EXTENDED|LRI}", &
                           repeats=.FALSE., &
                           default_i_val=hfx_ri_kp_extended, &
