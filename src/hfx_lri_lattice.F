@@ -18,11 +18,96 @@ MODULE hfx_lri_lattice
 
    PUBLIC :: hfx_lri_lattice_block_from_index, hfx_lri_lattice_block_index, &
              hfx_lri_lattice_cell_from_index, hfx_lri_lattice_cell_index, &
+             hfx_lri_lattice_density_tolerance, &
              hfx_lri_lattice_displacement_cell, hfx_lri_lattice_pair_representative, &
+             hfx_lri_lattice_project_pair, hfx_lri_lattice_project_sample, &
+             hfx_lri_lattice_project_self, &
              hfx_lri_lattice_reduce, &
              hfx_lri_reciprocal_diagnostics
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Returns a mixed absolute/relative tolerance for density-quotient input diagnostics.
+!> \param scale largest magnitude in the compared density blocks
+!> \param filter_eps density block filtering threshold
+!> \return comparison tolerance in absolute density-matrix units
+!>
+!> EPS_FILTER bounds information deliberately removed before the quotient is formed.  The
+!> square-root-epsilon term provides a scale-aware allowance for long k-point transforms, while
+!> the final term prevents denormal-sized blocks from turning harmless roundoff into a large
+!> relative residual.
+! **************************************************************************************************
+   PURE REAL(dp) FUNCTION hfx_lri_lattice_density_tolerance(scale, filter_eps) RESULT(tolerance)
+
+      REAL(dp), INTENT(IN)                               :: scale, filter_eps
+
+      tolerance = MAX(8.0_dp*MAX(0.0_dp, filter_eps), &
+                      SQRT(EPSILON(1.0_dp))*MAX(0.0_dp, scale), &
+                      64.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, scale))
+
+   END FUNCTION hfx_lri_lattice_density_tolerance
+
+! **************************************************************************************************
+!> \brief Adds one phase-aligned physical density sample to its quotient-block mean.
+!> \param average running quotient-block mean
+!> \param sample_count number of samples already accumulated; incremented on return
+!> \param sample physical density block
+!> \param factor real twisted-boundary phase mapping the sample into the quotient
+! **************************************************************************************************
+   PURE SUBROUTINE hfx_lri_lattice_project_sample(average, sample_count, sample, factor)
+
+      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: average
+      INTEGER, INTENT(INOUT)                             :: sample_count
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: sample
+      REAL(dp), INTENT(IN)                               :: factor
+
+      sample_count = sample_count + 1
+      average(:, :) = average + &
+                      (factor*sample - average)/REAL(sample_count, KIND=dp)
+
+   END SUBROUTINE hfx_lri_lattice_project_sample
+
+! **************************************************************************************************
+!> \brief Projects two quotient blocks onto their weighted real-Hermitian relation.
+!> \param left first oriented quotient block
+!> \param left_weight number of physical samples represented by left
+!> \param right reverse-oriented quotient block
+!> \param right_weight number of physical samples represented by right
+!> \param factor twisted-boundary phase in left=factor*transpose(right)
+! **************************************************************************************************
+   PURE SUBROUTINE hfx_lri_lattice_project_pair(left, left_weight, right, right_weight, factor)
+
+      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: left
+      INTEGER, INTENT(IN)                                :: left_weight
+      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: right
+      INTEGER, INTENT(IN)                                :: right_weight
+      REAL(dp), INTENT(IN)                               :: factor
+
+      REAL(dp)                                           :: total_weight
+      REAL(dp), DIMENSION(SIZE(left, 1), SIZE(left, 2))  :: projected
+
+      total_weight = REAL(left_weight + right_weight, KIND=dp)
+      projected(:, :) = (REAL(left_weight, KIND=dp)*left + &
+                         REAL(right_weight, KIND=dp)*factor*TRANSPOSE(right))/total_weight
+      left(:, :) = projected
+      right(:, :) = factor*TRANSPOSE(projected)
+
+   END SUBROUTINE hfx_lri_lattice_project_pair
+
+! **************************************************************************************************
+!> \brief Projects a self-reverse quotient block onto its real-Hermitian relation.
+!> \param block self-reverse quotient block
+!> \param factor twisted-boundary phase in block=factor*transpose(block)
+! **************************************************************************************************
+   PURE SUBROUTINE hfx_lri_lattice_project_self(block, factor)
+
+      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: block
+      REAL(dp), INTENT(IN)                               :: factor
+
+      block(:, :) = 0.5_dp*(block + factor*TRANSPOSE(block))
+
+   END SUBROUTINE hfx_lri_lattice_project_self
 
 ! **************************************************************************************************
 !> \brief Resolves a physical displacement into the lattice cell of two canonical atom images.

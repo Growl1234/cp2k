@@ -628,17 +628,39 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE_MAX_WORK", &
+                          description="Budget for the full or sampled literal reference in millions "// &
+                          "of estimated multiply-accumulate operations. Zero disables the literal "// &
+                          "reference. This is a resource budget, not an error tolerance.", &
+                          usage="KP_LRI_VALIDATE_MAX_WORK 6000", default_i_val=6000)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE_MAX_MEMORY", &
+                          description="Maximum estimated extra memory [MiB] for literal validation, "// &
+                          "including all OpenMP topology buffers. Zero disables this reference.", &
+                          usage="KP_LRI_VALIDATE_MAX_MEMORY 384", default_i_val=384)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE_RECIPROCAL_WORK", &
+                          description="Budget for reciprocal validation in millions of estimated "// &
+                          "terms. Zero disables this diagnostic. Independent of the literal budget.", &
+                          usage="KP_LRI_VALIDATE_RECIPROCAL_WORK 1000", default_i_val=1000)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE", &
                           description="Enable expensive pair-local RI-HFXk correctness checks. "// &
                           "This first validates every pair metric and fit, including the retained "// &
-                          "spectrum, rank truncation, Hermiticity, and the C*M=J residual. For small "// &
-                          "systems it then independently enumerates all four C-D-V-C topologies on "// &
-                          "the actual quotient blocks. It compares every output block and exchange "// &
-                          "trace when the full reference fits its budget, or uses deterministic "// &
-                          "atom/cell samples otherwise, then reconstructs D and K on the complete "// &
-                          "reciprocal mesh. Hard cell, AO, work, join, and extra-memory limits "// &
-                          "automatically skip diagnostics that are unsuitable for a workstation; "// &
-                          "production then continues.", &
+                          "spectrum, rank truncation, Hermiticity, the C*M=J residual, and an "// &
+                          "independently evaluated (mu nu|P)=(nu mu|P) exchange relation. It then "// &
+                          "enumerates all four C-D-V-C topologies on the actual quotient blocks. "// &
+                          "It compares every output block and exchange trace when the full reference "// &
+                          "fits its budget, or uses deterministic atom/cell samples otherwise, then "// &
+                          "reconstructs D and K on the complete reciprocal mesh when affordable. "// &
+                          "AO and join guards and configurable work and extra-memory budgets skip diagnostics "// &
+                          "that are unsuitable for a workstation; production then continues.", &
                           usage="KP_LRI_VALIDATE {logical}", &
                           repeats=.FALSE., &
                           default_l_val=.FALSE.)
