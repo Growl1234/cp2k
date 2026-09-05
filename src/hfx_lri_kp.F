@@ -166,10 +166,6 @@ MODULE hfx_lri_kp
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sphi
    END TYPE lri_basis_transform_type
 
-   INTERFACE hfx_lri_loop3_k_add
-      MODULE PROCEDURE hfx_lri_loop3_k_add_sparse
-   END INTERFACE
-
 CONTAINS
 
 ! **************************************************************************************************
@@ -5177,8 +5173,9 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
       INTEGER, INTENT(IN)                                :: natom
 
-      INTEGER                                            :: iatom, image, jatom, key, nblocks, &
-                                                            ngroups, reverse_image, reverse_key
+      INTEGER                                            :: group_id, iatom, image, jatom, key, &
+                                                            nblocks, ngroups, reverse_image, &
+                                                            reverse_key
       INTEGER(int_8)                                     :: block_count
       INTEGER, DIMENSION(3)                              :: cell, reverse_cell
 
@@ -5192,9 +5189,9 @@ CONTAINS
       ri_data%lri_kp%parallel%para_env => para_env
       ri_data%lri_kp%parallel%ngroups = ngroups
       ri_data%lri_kp%parallel%group_size = para_env%num_pe/ngroups
-      ri_data%lri_kp%parallel%group_id = para_env%mepos/ri_data%lri_kp%parallel%group_size
+      group_id = para_env%mepos/ri_data%lri_kp%parallel%group_size
       ALLOCATE (ri_data%lri_kp%parallel%subgroup)
-      CALL ri_data%lri_kp%parallel%subgroup%from_split(para_env, ri_data%lri_kp%parallel%group_id)
+      CALL ri_data%lri_kp%parallel%subgroup%from_split(para_env, group_id)
       ALLOCATE (ri_data%lri_kp%parallel%owner(nblocks))
       DO key = 1, nblocks
          CALL hfx_lri_lattice_block_from_index(key, natom, ri_data%lri_kp%lattice_ncell, iatom, jatom, image)
@@ -5365,7 +5362,7 @@ CONTAINS
 !> \param block ...
 !> \param transposed ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_loop3_k_add_sparse(lri_kp, k_accum, iatom, jatom, cell, block, transposed)
+   SUBROUTINE hfx_lri_loop3_k_add(lri_kp, k_accum, iatom, jatom, cell, block, transposed)
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
       TYPE(hfx_lri_buffer_type), INTENT(INOUT)           :: k_accum
       INTEGER, INTENT(IN)                                :: iatom, jatom
@@ -5384,7 +5381,7 @@ CONTAINS
       image = hfx_lri_lattice_cell_index(reduced, lri_kp%lattice_grid)
       key = hfx_lri_lattice_block_index(iatom, jatom, image, lri_kp%lattice_natom, lri_kp%lattice_ncell)
       CALL hfx_lri_buffer_add(k_accum, key, block, factor, use_transpose)
-   END SUBROUTINE hfx_lri_loop3_k_add_sparse
+   END SUBROUTINE hfx_lri_loop3_k_add
 
 ! **************************************************************************************************
 !> \brief Sum folded coefficient contributions at their owners before applying EPS_FILTER.
@@ -5522,10 +5519,11 @@ CONTAINS
       INTEGER                                            :: cc, ci, cj, ck, counts(4), dk, i, image, &
                                                             j, key, maxima(4), minima(4), naux, &
                                                             nblocks, ni, rank, ref, totals(4), vk
-      INTEGER, ALLOCATABLE                               :: indices(:), panels(:)
+      INTEGER, ALLOCATABLE                               :: indices(:), panels(:), task_owner(:)
       INTEGER, DIMENSION(3)                              :: ccell, cell, reduced
       LOGICAL                                            :: local_task
-      LOGICAL, ALLOCATABLE                               :: active_s(:), active_t(:), support(:)
+      LOGICAL, ALLOCATABLE                               :: active_s(:), active_t(:), need_c(:), &
+                                                            need_v(:), support(:)
       REAL(dp), ALLOCATABLE                              :: cost(:)
 
       nblocks = SIZE(lri_kp%parallel%owner)
@@ -5582,16 +5580,17 @@ CONTAINS
                         REAL(lri_kp%atom_ao_offset(j + 1) - lri_kp%atom_ao_offset(j), dp)
          END DO
       END DO
+      ! Global assignment and integral import masks are needed only while building the plan.
       CALL hfx_lri_assign_tasks(cost, panels, lri_kp%parallel%ngroups, &
-                                lri_kp%parallel%para_env%num_pe, lri_kp%parallel%task_owner)
+                                lri_kp%parallel%para_env%num_pe, task_owner)
       ALLOCATE (lri_kp%parallel%tasks_s, &
-                SOURCE=PACK(indices, active_s .AND. lri_kp%parallel%task_owner == rank))
+                SOURCE=PACK(indices, active_s .AND. task_owner == rank))
       ALLOCATE (lri_kp%parallel%tasks_t, &
-                SOURCE=PACK(indices, active_t .AND. lri_kp%parallel%task_owner == rank))
-      ALLOCATE (lri_kp%parallel%need_c(nblocks), lri_kp%parallel%need_v(nblocks), &
+                SOURCE=PACK(indices, active_t .AND. task_owner == rank))
+      ALLOCATE (need_c(nblocks), need_v(nblocks), &
                 lri_kp%parallel%need_d(nblocks), SOURCE=.FALSE.)
       DO key = 1, nblocks
-         local_task = lri_kp%parallel%task_owner(key) == rank
+         local_task = task_owner(key) == rank
          IF (.NOT. local_task) CYCLE
          CALL hfx_lri_lattice_block_from_index(key, lri_kp%lattice_natom, lri_kp%lattice_ncell, i, j, image)
          CALL hfx_lri_lattice_cell_from_index(image, lri_kp%lattice_grid, cell)
@@ -5604,14 +5603,14 @@ CONTAINS
                dk = hfx_lri_lattice_block_index(i, cj, hfx_lri_lattice_cell_index(reduced, lri_kp%lattice_grid), &
                                                 lri_kp%lattice_natom, lri_kp%lattice_ncell)
                IF (.NOT. support(dk)) CYCLE
-               lri_kp%parallel%need_c(ck) = .TRUE.
+               need_c(ck) = .TRUE.
                lri_kp%parallel%need_d(dk) = .TRUE.
             END DO
             IF (lri_kp%parallel%metric_present(key)) THEN
-               lri_kp%parallel%need_v(key) = .TRUE.
+               need_v(key) = .TRUE.
                DO ref = lri_kp%centered_atom_offset(i), lri_kp%centered_atom_offset(i + 1) - 1
                   ck = lri_kp%centered_atom_refs(ref)
-                  IF (lri_kp%centered_blocks(ck)%inner_active) lri_kp%parallel%need_c(ck) = .TRUE.
+                  IF (lri_kp%centered_blocks(ck)%inner_active) need_c(ck) = .TRUE.
                END DO
             END IF
             DO ref = lri_kp%centered_remote_offset(i), lri_kp%centered_remote_offset(i + 1) - 1
@@ -5622,8 +5621,8 @@ CONTAINS
                vk = hfx_lri_lattice_block_index(ci, j, hfx_lri_lattice_cell_index(reduced, lri_kp%lattice_grid), &
                                                 lri_kp%lattice_natom, lri_kp%lattice_ncell)
                IF (.NOT. lri_kp%parallel%metric_present(vk)) CYCLE
-               lri_kp%parallel%need_c(ck) = .TRUE.
-               lri_kp%parallel%need_v(vk) = .TRUE.
+               need_c(ck) = .TRUE.
+               need_v(vk) = .TRUE.
             END DO
          END IF
          IF (active_t(key)) THEN
@@ -5636,17 +5635,17 @@ CONTAINS
                dk = hfx_lri_lattice_block_index(i, ci, hfx_lri_lattice_cell_index(reduced, lri_kp%lattice_grid), &
                                                 lri_kp%lattice_natom, lri_kp%lattice_ncell)
                IF (.NOT. support(dk) .OR. .NOT. lri_kp%parallel%metric_present(dk)) CYCLE
-               lri_kp%parallel%need_c(ck) = .TRUE.
+               need_c(ck) = .TRUE.
                lri_kp%parallel%need_d(dk) = .TRUE.
-               lri_kp%parallel%need_v(dk) = .TRUE.
+               need_v(dk) = .TRUE.
             END DO
             DO ref = lri_kp%centered_atom_offset(i), lri_kp%centered_atom_offset(i + 1) - 1
                ck = lri_kp%centered_atom_refs(ref)
-               IF (lri_kp%centered_blocks(ck)%inner_active) lri_kp%parallel%need_c(ck) = .TRUE.
+               IF (lri_kp%centered_blocks(ck)%inner_active) need_c(ck) = .TRUE.
             END DO
          END IF
       END DO
-      CALL hfx_lri_import_integrals(lri_kp, lri_kp%parallel%need_c, lri_kp%parallel%need_v)
+      CALL hfx_lri_import_integrals(lri_kp, need_c, need_v)
       counts = [SIZE(lri_kp%parallel%tasks_s), SIZE(lri_kp%parallel%tasks_t), 0, 0]
       DO key = 1, nblocks
          IF (ALLOCATED(lri_kp%centered_blocks(key)%values)) counts(3) = counts(3) + 1
