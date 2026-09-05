@@ -1517,7 +1517,9 @@ CONTAINS
 
       ASSOCIATE (unit_nr => ri_data%unit_nr, dbcsr_nflop => ri_data%dbcsr_nflop, &
                  dbcsr_time => ri_data%dbcsr_time, num_pe => ri_data%num_pe)
-         my_flop_rate = REAL(dbcsr_nflop, dp)/(1.0E09_dp*ri_data%dbcsr_time)
+         ! The pair-local backend does not execute DBT contractions.
+         my_flop_rate = 0.0_dp
+         IF (dbcsr_time > 0.0_dp) my_flop_rate = REAL(dbcsr_nflop, dp)/(1.0E09_dp*dbcsr_time)
          IF (unit_nr > 0) WRITE (UNIT=unit_nr, FMT="(/T2,A,T73,ES8.2)") &
             "RI-HFX PERFORMANCE| DBT total number of flops:", REAL(dbcsr_nflop*num_pe, dp)
          IF (unit_nr > 0) WRITE (UNIT=unit_nr, FMT="(T2,A,T66,F15.2)") &
