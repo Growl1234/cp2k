@@ -11,6 +11,9 @@
 MODULE hfx_lri_parallel
    USE kinds,                           ONLY: dp,&
                                               int_8
+   USE matrix_communication,            ONLY: allocate_matrix_buffers,&
+                                              exchange_matrix_buffers,&
+                                              matrix_buffer_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE omp_lib,                         ONLY: omp_destroy_lock,&
                                               omp_init_lock,&
@@ -24,7 +27,7 @@ MODULE hfx_lri_parallel
 
    PUBLIC :: hfx_lri_block_type, hfx_lri_buffer_type, hfx_lri_parallel_type, &
              hfx_lri_buffer_init, hfx_lri_buffer_clear, hfx_lri_buffer_release, &
-             hfx_lri_buffer_add, hfx_lri_exchange_blocks, hfx_lri_fetch_blocks, &
+             hfx_lri_buffer_add, hfx_lri_buffer_merge, hfx_lri_exchange_blocks, hfx_lri_fetch_blocks, &
              hfx_lri_gather_metadata, hfx_lri_assign_tasks
 
    ! Limit each sender's numerical payload per collective. A single larger block is indivisible.
@@ -37,13 +40,17 @@ MODULE hfx_lri_parallel
    TYPE hfx_lri_buffer_type
       TYPE(hfx_lri_block_type), ALLOCATABLE, DIMENSION(:) :: blocks
       INTEGER(omp_lock_kind), ALLOCATABLE, DIMENSION(:) :: locks
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: keys
+      INTEGER :: nkeys = 0
    END TYPE hfx_lri_buffer_type
 
    TYPE hfx_lri_parallel_type
       ! The QS environment owns para_env; this object owns only the split communicator.
       TYPE(mp_para_env_type), POINTER :: para_env => NULL(), subgroup => NULL()
       INTEGER :: ngroups = 1, group_size = 1
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, tasks_s, tasks_t
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, tasks
+      ! Canonical key of the untwisted V(i,j,R) = TRANSPOSE(V(j,i,-R)) orbit.
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: metric_key
       INTEGER, ALLOCATABLE, DIMENSION(:, :) :: density_keys
       LOGICAL, ALLOCATABLE, DIMENSION(:) :: need_d, metric_present
    END TYPE hfx_lri_parallel_type
@@ -58,14 +65,20 @@ CONTAINS
 !> \brief Allocate one sparse rank buffer, with a lock for each possible output block.
 !> \param buffer ...
 !> \param nblocks ...
+!> \param thread_private omit locks when the buffer belongs to one thread
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_buffer_init(buffer, nblocks)
+   SUBROUTINE hfx_lri_buffer_init(buffer, nblocks, thread_private)
       TYPE(hfx_lri_buffer_type), INTENT(OUT)             :: buffer
       INTEGER, INTENT(IN)                                :: nblocks
+      LOGICAL, INTENT(IN), OPTIONAL                      :: thread_private
 
       INTEGER                                            :: i
 
-      ALLOCATE (buffer%blocks(nblocks), buffer%locks(nblocks))
+      ALLOCATE (buffer%blocks(nblocks), buffer%keys(nblocks))
+      IF (PRESENT(thread_private)) THEN
+         IF (thread_private) RETURN
+      END IF
+      ALLOCATE (buffer%locks(nblocks))
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer, nblocks) PRIVATE(i)
       DO i = 1, nblocks
          CALL omp_init_lock(buffer%locks(i))
@@ -83,10 +96,11 @@ CONTAINS
       INTEGER                                            :: i
 
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer) PRIVATE(i)
-      DO i = 1, SIZE(buffer%blocks)
-         IF (ALLOCATED(buffer%blocks(i)%values)) DEALLOCATE (buffer%blocks(i)%values)
+      DO i = 1, buffer%nkeys
+         DEALLOCATE (buffer%blocks(buffer%keys(i))%values)
       END DO
       !$OMP END PARALLEL DO
+      buffer%nkeys = 0
    END SUBROUTINE hfx_lri_buffer_clear
 
 ! **************************************************************************************************
@@ -98,13 +112,16 @@ CONTAINS
 
       INTEGER                                            :: i
 
-      IF (.NOT. ALLOCATED(buffer%locks)) RETURN
-      !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer) PRIVATE(i)
-      DO i = 1, SIZE(buffer%locks)
-         CALL omp_destroy_lock(buffer%locks(i))
-      END DO
-      !$OMP END PARALLEL DO
-      DEALLOCATE (buffer%locks, buffer%blocks)
+      IF (ALLOCATED(buffer%locks)) THEN
+         !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer) PRIVATE(i)
+         DO i = 1, SIZE(buffer%locks)
+            CALL omp_destroy_lock(buffer%locks(i))
+         END DO
+         !$OMP END PARALLEL DO
+         DEALLOCATE (buffer%locks)
+      END IF
+      IF (ALLOCATED(buffer%blocks)) DEALLOCATE (buffer%blocks, buffer%keys)
+      buffer%nkeys = 0
    END SUBROUTINE hfx_lri_buffer_release
 
 ! **************************************************************************************************
@@ -122,7 +139,7 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: factor
       LOGICAL, INTENT(IN)                                :: transposed
 
-      INTEGER                                            :: ncol, nrow
+      INTEGER                                            :: ncol, nrow, slot
 
       CPASSERT(key >= 1 .AND. key <= SIZE(buffer%blocks))
       nrow = SIZE(values, 1)
@@ -131,18 +148,57 @@ CONTAINS
          nrow = SIZE(values, 2)
          ncol = SIZE(values, 1)
       END IF
-      CALL omp_set_lock(buffer%locks(key))
+      IF (ALLOCATED(buffer%locks)) CALL omp_set_lock(buffer%locks(key))
       IF (.NOT. ALLOCATED(buffer%blocks(key)%values)) THEN
-         ALLOCATE (buffer%blocks(key)%values(nrow, ncol), SOURCE=0.0_dp)
-      END IF
-      CPASSERT(ALL(SHAPE(buffer%blocks(key)%values) == [nrow, ncol]))
-      IF (transposed) THEN
-         buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*TRANSPOSE(values)
+         ALLOCATE (buffer%blocks(key)%values(nrow, ncol))
+         IF (transposed) THEN
+            buffer%blocks(key)%values(:, :) = factor*TRANSPOSE(values)
+         ELSE
+            buffer%blocks(key)%values(:, :) = factor*values
+         END IF
+         ! The block lock registers each key once; workers reserve distinct list slots.
+         !$OMP ATOMIC CAPTURE
+         slot = buffer%nkeys
+         buffer%nkeys = buffer%nkeys + 1
+         !$OMP END ATOMIC
+         buffer%keys(slot + 1) = key
       ELSE
-         buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*values
+         CPASSERT(ALL(SHAPE(buffer%blocks(key)%values) == [nrow, ncol]))
+         IF (transposed) THEN
+            buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*TRANSPOSE(values)
+         ELSE
+            buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*values
+         END IF
       END IF
-      CALL omp_unset_lock(buffer%locks(key))
+      IF (ALLOCATED(buffer%locks)) CALL omp_unset_lock(buffer%locks(key))
    END SUBROUTINE hfx_lri_buffer_add
+
+! **************************************************************************************************
+!> \brief Merge a completed private buffer. The caller must exclude other destination writers.
+!> \param destination ...
+!> \param source ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_buffer_merge(destination, source)
+      TYPE(hfx_lri_buffer_type), INTENT(INOUT)           :: destination, source
+
+      INTEGER                                            :: i, key
+
+      DO i = 1, source%nkeys
+         key = source%keys(i)
+         IF (ALLOCATED(destination%blocks(key)%values)) THEN
+            IF (ANY(SHAPE(destination%blocks(key)%values) /= SHAPE(source%blocks(key)%values))) THEN
+               CPABORT("Inconsistent block dimensions in the LRI thread-buffer merge")
+            END IF
+            destination%blocks(key)%values(:, :) = destination%blocks(key)%values + source%blocks(key)%values
+            DEALLOCATE (source%blocks(key)%values)
+         ELSE
+            CALL MOVE_ALLOC(source%blocks(key)%values, destination%blocks(key)%values)
+            destination%nkeys = destination%nkeys + 1
+            destination%keys(destination%nkeys) = key
+         END IF
+      END DO
+      source%nkeys = 0
+   END SUBROUTINE hfx_lri_buffer_merge
 
 ! **************************************************************************************************
 !> \brief Gather small integer metadata; numerical tensors use selective block communication.
@@ -253,18 +309,24 @@ CONTAINS
 !> \param owner ...
 !> \param destination already allocated index space; existing values are accumulated
 !> \param para_env ...
+!> \param active_keys optional list of unique occupied blocks
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_exchange_blocks(source, owner, destination, para_env)
+   SUBROUTINE hfx_lri_exchange_blocks(source, owner, destination, para_env, active_keys)
       TYPE(hfx_lri_block_type), DIMENSION(:), INTENT(IN) :: source
       INTEGER, DIMENSION(:), INTENT(IN)                  :: owner
       TYPE(hfx_lri_block_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: destination
       TYPE(mp_para_env_type), INTENT(IN)                 :: para_env
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: active_keys
 
       INTEGER                                            :: i, n
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: keys, ranks
 
       CPASSERT(SIZE(source) == SIZE(owner) .AND. SIZE(source) == SIZE(destination))
+      IF (PRESENT(active_keys)) THEN
+         CALL send_blocks(source, active_keys, owner(active_keys), destination, para_env, .TRUE.)
+         RETURN
+      END IF
       n = 0
       DO i = 1, SIZE(source)
          IF (ALLOCATED(source(i)%values)) n = n + 1
@@ -349,20 +411,36 @@ CONTAINS
       INTEGER                                            :: first, h, i, key, last, more, n, nc, nr, &
                                                             p, v
       INTEGER(int_8)                                     :: total
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: hc, headers, incoming, rh, rho, rv, rvo, &
-                                                            sh, sho, sv, svo, vc
-      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: received, values
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: cursor, recv_count, send_count
+      TYPE(matrix_buffer_type)                           :: buffer_rec, buffer_send
+
+! Row 1 counts numerical elements; row 2 counts three-integer block headers.
 
       CPASSERT(SIZE(keys) == SIZE(ranks))
       n = para_env%num_pe
-      ALLOCATE (sh(n), rh(n), sv(n), rv(n), sho(n), rho(n), svo(n), rvo(n), hc(n), vc(n))
+      IF (n == 1) THEN
+         ! Local copies need neither packed payloads nor collective bookkeeping.
+         DO i = 1, SIZE(keys)
+            key = keys(i)
+            CPASSERT(ranks(i) == 0 .AND. key >= 1 .AND. key <= SIZE(source))
+            CPASSERT(ALLOCATED(source(key)%values))
+            IF (ALLOCATED(destination(key)%values)) THEN
+               CPASSERT(add)
+               CPASSERT(ALL(SHAPE(destination(key)%values) == SHAPE(source(key)%values)))
+               destination(key)%values(:, :) = destination(key)%values + source(key)%values
+            ELSE
+               ALLOCATE (destination(key)%values, SOURCE=source(key)%values)
+            END IF
+         END DO
+         RETURN
+      END IF
+      ALLOCATE (send_count(2, 0:n - 1), recv_count(2, 0:n - 1), cursor(2, 0:n - 1))
       first = 1
       DO
          more = MERGE(1, 0, first <= SIZE(keys))
          CALL para_env%max(more)
          IF (more == 0) EXIT
-         sh = 0
-         sv = 0
+         send_count = 0
          total = 0_int_8
          last = first - 1
          DO i = first, SIZE(keys)
@@ -373,59 +451,56 @@ CONTAINS
             CPASSERT(n > 0)
             IF (i > first .AND. total + INT(n, int_8) > transfer_elements) EXIT
             CPASSERT(total + INT(n, int_8) <= HUGE(0))
-            p = ranks(i) + 1
-            CPASSERT(p >= 1 .AND. p <= para_env%num_pe)
-            sh(p) = sh(p) + 3
-            sv(p) = sv(p) + n
+            p = ranks(i)
+            CPASSERT(p >= 0 .AND. p < para_env%num_pe)
+            send_count(:, p) = send_count(:, p) + [n, 1]
             total = total + INT(n, int_8)
             last = i
          END DO
-         CALL para_env%alltoall(sh, rh, 1)
-         CALL para_env%alltoall(sv, rv, 1)
-         CALL block_offsets(sh, sho)
-         CALL block_offsets(rh, rho)
-         CALL block_offsets(sv, svo)
-         CALL block_offsets(rv, rvo)
-         ALLOCATE (headers(SUM(sh)), incoming(SUM(rh)), values(SUM(sv)), received(SUM(rv)))
-         hc(:) = sho
-         vc(:) = svo
+         CALL para_env%alltoall(send_count, recv_count, 2)
+         ! Check both channels before the shared allocator forms default-integer offsets.
+         IF (MAX(SUM(INT(send_count(1, :), int_8)), SUM(INT(recv_count(1, :), int_8)), &
+                 3_int_8*SUM(INT(send_count(2, :), int_8)), 3_int_8*SUM(INT(recv_count(2, :), int_8))) > &
+             INT(HUGE(0), int_8)) CPABORT("LRI-HFXk MPI buffer exceeds the integer count range")
+         CALL allocate_matrix_buffers(send_count(1, :), recv_count(1, :), 3, buffer_send, buffer_rec, &
+                                      send_count(2, :), recv_count(2, :))
+         cursor(1, :) = buffer_send%msg_offset(:para_env%num_pe - 1)
+         cursor(2, :) = buffer_send%indx_offset(:para_env%num_pe - 1)
          DO i = first, last
             key = keys(i)
-            p = ranks(i) + 1
+            p = ranks(i)
             nr = SIZE(source(key)%values, 1)
             nc = SIZE(source(key)%values, 2)
-            headers(hc(p) + 1:hc(p) + 3) = [key, nr, nc]
-            values(vc(p) + 1:vc(p) + nr*nc) = RESHAPE(source(key)%values, [nr*nc])
-            hc(p) = hc(p) + 3
-            vc(p) = vc(p) + nr*nc
+            buffer_send%indx(:, cursor(2, p) + 1) = [key, nr, nc]
+            buffer_send%msg(cursor(1, p) + 1:cursor(1, p) + nr*nc) = RESHAPE(source(key)%values, [nr*nc])
+            cursor(:, p) = cursor(:, p) + [nr*nc, 1]
          END DO
-         CALL para_env%alltoall(headers, sh, sho, incoming, rh, rho)
-         CALL para_env%alltoall(values, sv, svo, received, rv, rvo)
+         CALL exchange_matrix_buffers(para_env, buffer_rec, buffer_send)
          ! Different source ranks may contribute to the same key. Merge in source-rank order.
-         DO p = 1, para_env%num_pe
-            v = rvo(p)
-            DO h = rho(p) + 1, rho(p) + rh(p), 3
-               key = incoming(h)
-               nr = incoming(h + 1)
-               nc = incoming(h + 2)
+         DO p = 0, para_env%num_pe - 1
+            v = buffer_rec%msg_offset(p)
+            DO h = buffer_rec%indx_offset(p) + 1, buffer_rec%indx_offset(p + 1)
+               key = buffer_rec%indx(1, h)
+               nr = buffer_rec%indx(2, h)
+               nc = buffer_rec%indx(3, h)
                CPASSERT(key >= 1 .AND. key <= SIZE(destination))
                CPASSERT(nr > 0 .AND. nc > 0)
-               CPASSERT(INT(nr, int_8)*INT(nc, int_8) <= INT(rv(p), int_8))
+               CPASSERT(INT(nr, int_8)*INT(nc, int_8) <= INT(recv_count(1, p), int_8))
                n = nr*nc
-               CPASSERT(v + n <= rvo(p) + rv(p))
+               CPASSERT(n <= buffer_rec%msg_offset(p + 1) - v)
                IF (ALLOCATED(destination(key)%values)) THEN
                   CPASSERT(add)
                   CPASSERT(ALL(SHAPE(destination(key)%values) == [nr, nc]))
-                  destination(key)%values(:, :) = destination(key)%values + RESHAPE(received(v + 1:v + n), [nr, nc])
+                  destination(key)%values(:, :) = destination(key)%values + &
+                                                  RESHAPE(buffer_rec%msg(v + 1:v + n), [nr, nc])
                ELSE
                   ALLOCATE (destination(key)%values(nr, nc))
-                  destination(key)%values(:, :) = RESHAPE(received(v + 1:v + n), [nr, nc])
+                  destination(key)%values(:, :) = RESHAPE(buffer_rec%msg(v + 1:v + n), [nr, nc])
                END IF
                v = v + n
             END DO
-            CPASSERT(v == rvo(p) + rv(p))
+            CPASSERT(v == buffer_rec%msg_offset(p + 1))
          END DO
-         DEALLOCATE (headers, incoming, values, received)
          first = last + 1
       END DO
    END SUBROUTINE send_blocks
