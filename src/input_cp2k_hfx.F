@@ -607,7 +607,12 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="KP_NGROUPS", &
                           description="The number of MPI subgroup that work in parallel during the SCF. "// &
                           "The default value is 1. Using N subgroups should speed up the "// &
-                          "calculation by a factor ~N, at the cost of N times more memory usage.", &
+                          "extended-RI calculation by a factor ~N, at the cost of N times more memory usage. "// &
+                          "For KP_RI_METHOD LRI, atom/image task panels are assigned to subgroups, "// &
+                          "which combine partial exchange blocks before the global owner reduction. "// &
+                          "LRI imports C, V and density blocks according to task dependencies; "// &
+                          "its memory and speed depend on those dependencies and the panel balance. "// &
+                          "The value must be positive and divide the number of MPI ranks.", &
                           variants=["NGROUPS"], &
                           usage="KP_NGROUPS {int}", &
                           repeats=.FALSE., &
