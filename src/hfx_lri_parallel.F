@@ -37,6 +37,8 @@ MODULE hfx_lri_parallel
    TYPE hfx_lri_buffer_type
       TYPE(hfx_lri_block_type), ALLOCATABLE, DIMENSION(:) :: blocks
       INTEGER(omp_lock_kind), ALLOCATABLE, DIMENSION(:) :: locks
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: keys
+      INTEGER :: nkeys = 0
    END TYPE hfx_lri_buffer_type
 
    TYPE hfx_lri_parallel_type
@@ -65,7 +67,7 @@ CONTAINS
 
       INTEGER                                            :: i
 
-      ALLOCATE (buffer%blocks(nblocks), buffer%locks(nblocks))
+      ALLOCATE (buffer%blocks(nblocks), buffer%locks(nblocks), buffer%keys(nblocks))
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer, nblocks) PRIVATE(i)
       DO i = 1, nblocks
          CALL omp_init_lock(buffer%locks(i))
@@ -83,10 +85,11 @@ CONTAINS
       INTEGER                                            :: i
 
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer) PRIVATE(i)
-      DO i = 1, SIZE(buffer%blocks)
-         IF (ALLOCATED(buffer%blocks(i)%values)) DEALLOCATE (buffer%blocks(i)%values)
+      DO i = 1, buffer%nkeys
+         DEALLOCATE (buffer%blocks(buffer%keys(i))%values)
       END DO
       !$OMP END PARALLEL DO
+      buffer%nkeys = 0
    END SUBROUTINE hfx_lri_buffer_clear
 
 ! **************************************************************************************************
@@ -104,7 +107,8 @@ CONTAINS
          CALL omp_destroy_lock(buffer%locks(i))
       END DO
       !$OMP END PARALLEL DO
-      DEALLOCATE (buffer%locks, buffer%blocks)
+      DEALLOCATE (buffer%locks, buffer%blocks, buffer%keys)
+      buffer%nkeys = 0
    END SUBROUTINE hfx_lri_buffer_release
 
 ! **************************************************************************************************
@@ -122,7 +126,7 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: factor
       LOGICAL, INTENT(IN)                                :: transposed
 
-      INTEGER                                            :: ncol, nrow
+      INTEGER                                            :: ncol, nrow, slot
 
       CPASSERT(key >= 1 .AND. key <= SIZE(buffer%blocks))
       nrow = SIZE(values, 1)
@@ -133,13 +137,25 @@ CONTAINS
       END IF
       CALL omp_set_lock(buffer%locks(key))
       IF (.NOT. ALLOCATED(buffer%blocks(key)%values)) THEN
-         ALLOCATE (buffer%blocks(key)%values(nrow, ncol), SOURCE=0.0_dp)
-      END IF
-      CPASSERT(ALL(SHAPE(buffer%blocks(key)%values) == [nrow, ncol]))
-      IF (transposed) THEN
-         buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*TRANSPOSE(values)
+         ALLOCATE (buffer%blocks(key)%values(nrow, ncol))
+         IF (transposed) THEN
+            buffer%blocks(key)%values(:, :) = factor*TRANSPOSE(values)
+         ELSE
+            buffer%blocks(key)%values(:, :) = factor*values
+         END IF
+         ! The block lock registers each key once; workers reserve distinct list slots.
+         !$OMP ATOMIC CAPTURE
+         slot = buffer%nkeys
+         buffer%nkeys = buffer%nkeys + 1
+         !$OMP END ATOMIC
+         buffer%keys(slot + 1) = key
       ELSE
-         buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*values
+         CPASSERT(ALL(SHAPE(buffer%blocks(key)%values) == [nrow, ncol]))
+         IF (transposed) THEN
+            buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*TRANSPOSE(values)
+         ELSE
+            buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*values
+         END IF
       END IF
       CALL omp_unset_lock(buffer%locks(key))
    END SUBROUTINE hfx_lri_buffer_add
@@ -253,18 +269,24 @@ CONTAINS
 !> \param owner ...
 !> \param destination already allocated index space; existing values are accumulated
 !> \param para_env ...
+!> \param active_keys optional list of unique occupied blocks
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_exchange_blocks(source, owner, destination, para_env)
+   SUBROUTINE hfx_lri_exchange_blocks(source, owner, destination, para_env, active_keys)
       TYPE(hfx_lri_block_type), DIMENSION(:), INTENT(IN) :: source
       INTEGER, DIMENSION(:), INTENT(IN)                  :: owner
       TYPE(hfx_lri_block_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: destination
       TYPE(mp_para_env_type), INTENT(IN)                 :: para_env
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: active_keys
 
       INTEGER                                            :: i, n
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: keys, ranks
 
       CPASSERT(SIZE(source) == SIZE(owner) .AND. SIZE(source) == SIZE(destination))
+      IF (PRESENT(active_keys)) THEN
+         CALL send_blocks(source, active_keys, owner(active_keys), destination, para_env, .TRUE.)
+         RETURN
+      END IF
       n = 0
       DO i = 1, SIZE(source)
          IF (ALLOCATED(source(i)%values)) n = n + 1
@@ -355,6 +377,22 @@ CONTAINS
 
       CPASSERT(SIZE(keys) == SIZE(ranks))
       n = para_env%num_pe
+      IF (n == 1) THEN
+         ! Local copies need neither packed payloads nor collective bookkeeping.
+         DO i = 1, SIZE(keys)
+            key = keys(i)
+            CPASSERT(ranks(i) == 0 .AND. key >= 1 .AND. key <= SIZE(source))
+            CPASSERT(ALLOCATED(source(key)%values))
+            IF (ALLOCATED(destination(key)%values)) THEN
+               CPASSERT(add)
+               CPASSERT(ALL(SHAPE(destination(key)%values) == SHAPE(source(key)%values)))
+               destination(key)%values(:, :) = destination(key)%values + source(key)%values
+            ELSE
+               ALLOCATE (destination(key)%values, SOURCE=source(key)%values)
+            END IF
+         END DO
+         RETURN
+      END IF
       ALLOCATE (sh(n), rh(n), sv(n), rv(n), sho(n), rho(n), svo(n), rvo(n), hc(n), vc(n))
       first = 1
       DO
