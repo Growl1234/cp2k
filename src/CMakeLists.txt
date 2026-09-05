@@ -1598,8 +1598,6 @@ set(CP2K_PROGS_F
     topology_snapshot_unittest.F
     topology_phasons.F
     kpsym_unittest.F
-    hfx_lri_contract_unittest.F
-    hfx_lri_parallel_unittest.F
     qs_ot_minimizer_unittest.F
     optbas_frontier_orbitals_utils_unittest.F
     low_rank_preconditioner_unittest.F
@@ -2021,8 +2019,6 @@ list(
   "topology_snapshot_unittest"
   "topology_phasons"
   "kpsym_unittest"
-  "hfx_lri_contract_unittest"
-  "hfx_lri_parallel_unittest"
   "qs_ot_minimizer_unittest"
   "optbas_frontier_orbitals_utils_unittest"
   "low_rank_preconditioner_unittest"
@@ -2061,8 +2057,6 @@ add_executable(topology_curvature_unittest topology_curvature_unittest.F)
 add_executable(topology_snapshot_unittest topology_snapshot_unittest.F)
 add_executable(topology_phasons topology_phasons.F)
 add_executable(kpsym_unittest kpsym_unittest.F)
-add_executable(hfx_lri_contract_unittest hfx_lri_contract_unittest.F)
-add_executable(hfx_lri_parallel_unittest hfx_lri_parallel_unittest.F)
 add_executable(qs_ot_minimizer_unittest qs_ot_minimizer_unittest.F)
 add_executable(optbas_frontier_orbitals_utils_unittest
                optbas_frontier_orbitals_utils_unittest.F)
