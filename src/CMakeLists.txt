@@ -453,6 +453,7 @@ list(
   "topology_phasons"
   "kpsym_unittest"
   "hfx_lri_contract_unittest"
+  "hfx_lri_parallel_unittest"
   "qs_ot_minimizer_unittest"
   "optbas_frontier_orbitals_utils_unittest"
   "low_rank_preconditioner_unittest"
@@ -508,6 +509,7 @@ add_executable(topology_snapshot_unittest topology_snapshot_unittest.F)
 add_executable(topology_phasons topology_phasons.F)
 add_executable(kpsym_unittest kpsym_unittest.F)
 add_executable(hfx_lri_contract_unittest hfx_lri_contract_unittest.F)
+add_executable(hfx_lri_parallel_unittest hfx_lri_parallel_unittest.F)
 add_executable(qs_ot_minimizer_unittest qs_ot_minimizer_unittest.F)
 add_executable(optbas_frontier_orbitals_utils_unittest
                optbas_frontier_orbitals_utils_unittest.F)
