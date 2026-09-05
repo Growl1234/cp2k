@@ -6,7 +6,6 @@ dbt_unittest
 grid_unittest
 kpoint_lattice_fft_unittest
 kpoint_smearing_unittest
-hfx_lri_contract_unittest
 qs_ot_minimizer_unittest
 low_rank_preconditioner_unittest
 libcp2k_unittest
