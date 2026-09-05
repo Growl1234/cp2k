@@ -2755,7 +2755,8 @@ CONTAINS
          END DO
          !$OMP END PARALLEL DO
          CALL hfx_lri_exchange_blocks(buffer%blocks, ri_data%lri_kp%parallel%owner, &
-                                      ri_data%lri_kp%lattice_metric, ri_data%lri_kp%parallel%para_env)
+                                      ri_data%lri_kp%lattice_metric, ri_data%lri_kp%parallel%para_env, &
+                                      buffer%keys(:buffer%nkeys))
          CALL hfx_lri_buffer_clear(buffer)
       END DO
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(integral_contexts, nthreads) PRIVATE(ithread)
@@ -4606,11 +4607,11 @@ CONTAINS
          CALL hfx_lri_contract_workspace_move(workspace, ri_data%lri_kp%thread_workspaces(ithread))
          !$OMP END PARALLEL
          ! All ranks, including those with no local tasks, execute the same collective sequence.
-         CALL hfx_lri_reduce_k(ri_data%lri_kp, k_batch%blocks, k_owned)
+         CALL hfx_lri_reduce_k(ri_data%lri_kp, k_batch, k_owned)
          CALL hfx_lri_buffer_clear(k_batch)
          IF (literal_validate) THEN
             DO itopology = 1, lri_topology_count
-               CALL hfx_lri_reduce_k(ri_data%lri_kp, topology_batch(itopology)%blocks, &
+               CALL hfx_lri_reduce_k(ri_data%lri_kp, topology_batch(itopology), &
                                      topology_owned(itopology)%blocks)
                CALL hfx_lri_buffer_clear(topology_batch(itopology))
             END DO
@@ -5675,7 +5676,7 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_reduce_k(lri_kp, source, destination)
       TYPE(hfx_lri_kp_type), INTENT(IN)                  :: lri_kp
-      TYPE(hfx_lri_block_type), DIMENSION(:), INTENT(IN) :: source
+      TYPE(hfx_lri_buffer_type), INTENT(IN)              :: source
       TYPE(hfx_lri_block_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: destination
 
@@ -5683,11 +5684,13 @@ CONTAINS
       TYPE(hfx_lri_block_type), ALLOCATABLE              :: partial(:)
 
       IF (lri_kp%parallel%ngroups == 1 .OR. lri_kp%parallel%group_size == 1) THEN
-         CALL hfx_lri_exchange_blocks(source, lri_kp%parallel%owner, destination, lri_kp%parallel%para_env)
+         CALL hfx_lri_exchange_blocks(source%blocks, lri_kp%parallel%owner, destination, lri_kp%parallel%para_env, &
+                                      source%keys(:source%nkeys))
       ELSE
-         ALLOCATE (partial(SIZE(source)))
+         ALLOCATE (partial(SIZE(source%blocks)))
          ALLOCATE (owners, SOURCE=MODULO(lri_kp%parallel%owner, lri_kp%parallel%group_size))
-         CALL hfx_lri_exchange_blocks(source, owners, partial, lri_kp%parallel%subgroup)
+         CALL hfx_lri_exchange_blocks(source%blocks, owners, partial, lri_kp%parallel%subgroup, &
+                                      source%keys(:source%nkeys))
          CALL hfx_lri_exchange_blocks(partial, lri_kp%parallel%owner, destination, lri_kp%parallel%para_env)
       END IF
    END SUBROUTINE hfx_lri_reduce_k
