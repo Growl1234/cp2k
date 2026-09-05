@@ -13,14 +13,13 @@ PROGRAM hfx_lri_contract_unittest
                                               hfx_lri_loop3_pack_aux,&
                                               hfx_lri_loop3_remote_contract,&
                                               hfx_lri_product_index
-   USE hfx_lri_lattice,                 ONLY: hfx_lri_lattice_block_from_index,&
-                                              hfx_lri_lattice_block_index,&
-                                              hfx_lri_lattice_cell_from_index,&
-                                              hfx_lri_lattice_cell_index,&
-                                              hfx_lri_lattice_displacement_cell,&
-                                              hfx_lri_lattice_pair_representative,&
-                                              hfx_lri_lattice_reduce,&
-                                              hfx_lri_reciprocal_diagnostics
+   USE hfx_lri_lattice,                 ONLY: &
+        hfx_lri_lattice_block_from_index, hfx_lri_lattice_block_index, &
+        hfx_lri_lattice_cell_from_index, hfx_lri_lattice_cell_index, &
+        hfx_lri_lattice_density_tolerance, hfx_lri_lattice_displacement_cell, &
+        hfx_lri_lattice_pair_representative, hfx_lri_lattice_project_pair, &
+        hfx_lri_lattice_project_sample, hfx_lri_lattice_project_self, hfx_lri_lattice_reduce, &
+        hfx_lri_reciprocal_diagnostics
    USE kinds,                           ONLY: dp
 
    IMPLICIT NONE
@@ -50,6 +49,7 @@ PROGRAM hfx_lri_contract_unittest
    CALL test_displacement_cell()
    CALL test_pair_representatives()
    CALL test_lattice_quotient()
+   CALL test_density_projection()
    CALL test_storage_trace_alias()
    CALL test_reciprocal_diagnostics()
 
@@ -335,6 +335,58 @@ CONTAINS
       END DO
 
    END SUBROUTINE test_lattice_quotient
+
+! **************************************************************************************************
+!> \brief Checks cross-grid quotient averaging, Hermitian projection, and adaptive tolerances.
+! **************************************************************************************************
+   SUBROUTINE test_density_projection()
+
+      INTEGER                                            :: sample_count
+      REAL(dp)                                           :: factor, tolerance_filtered, &
+                                                            tolerance_scaled
+      REAL(dp), DIMENSION(2, 2)                          :: average, expected, left, right, &
+                                                            sample_a, sample_b, self_block
+
+      sample_a(:, :) = RESHAPE([1.0_dp, 0.2_dp, -0.3_dp, 0.7_dp], [2, 2])
+      sample_b(:, :) = RESHAPE([-0.4_dp, 0.5_dp, 0.1_dp, -0.8_dp], [2, 2])
+      average(:, :) = 0.0_dp
+      sample_count = 0
+      CALL hfx_lri_lattice_project_sample(average, sample_count, sample_a, 1.0_dp)
+      CALL hfx_lri_lattice_project_sample(average, sample_count, sample_b, -1.0_dp)
+      expected(:, :) = 0.5_dp*(sample_a - sample_b)
+      IF (sample_count /= 2 .OR. MAXVAL(ABS(average - expected)) > 1.0E-15_dp) THEN
+         ERROR STOP "cross-grid density samples were not averaged in the twisted quotient"
+      END IF
+
+      left(:, :) = RESHAPE([0.8_dp, -0.1_dp, 0.4_dp, 1.2_dp], [2, 2])
+      right(:, :) = RESHAPE([0.3_dp, 0.7_dp, -0.2_dp, 0.5_dp], [2, 2])
+      factor = -1.0_dp
+      expected(:, :) = (2.0_dp*left + factor*TRANSPOSE(right))/3.0_dp
+      CALL hfx_lri_lattice_project_pair(left, 2, right, 1, factor)
+      IF (MAXVAL(ABS(left - expected)) > 1.0E-15_dp .OR. &
+          MAXVAL(ABS(left - factor*TRANSPOSE(right))) > 1.0E-15_dp) THEN
+         ERROR STOP "weighted density quotient projection is not Hermitian"
+      END IF
+      expected(:, :) = left
+      CALL hfx_lri_lattice_project_pair(left, 2, right, 1, factor)
+      IF (MAXVAL(ABS(left - expected)) > 1.0E-15_dp) THEN
+         ERROR STOP "density quotient projection is not idempotent"
+      END IF
+
+      self_block(:, :) = RESHAPE([0.6_dp, 0.2_dp, -0.4_dp, 0.9_dp], [2, 2])
+      CALL hfx_lri_lattice_project_self(self_block, -1.0_dp)
+      IF (MAXVAL(ABS(self_block + TRANSPOSE(self_block))) > 1.0E-15_dp) THEN
+         ERROR STOP "self-reverse twisted density block was not projected correctly"
+      END IF
+
+      tolerance_scaled = hfx_lri_lattice_density_tolerance(10.0_dp, 0.0_dp)
+      tolerance_filtered = hfx_lri_lattice_density_tolerance(0.0_dp, 1.0E-6_dp)
+      IF (tolerance_scaled < 10.0_dp*SQRT(EPSILON(1.0_dp)) .OR. &
+          tolerance_filtered < 8.0E-6_dp) THEN
+         ERROR STOP "density quotient tolerance does not track scale and EPS_FILTER"
+      END IF
+
+   END SUBROUTINE test_density_projection
 
 ! **************************************************************************************************
 !> \brief Checks trace reconstruction when the KS-storage image is a twisted quotient alias.
