@@ -51,7 +51,7 @@ CONTAINS
 !> \param factor boundary-phase factor
 !> \param first overwrite rather than add to result
 !> \param transpose_centered contract the remote rather than the central C index
-!> \param centered_remote_flat ...
+!> \param centered_remote_flat packed C view, required when transpose_centered is true
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_loop3_density_c_add(centered, density, RESULT, factor, first, &
                                           transpose_centered, centered_remote_flat)
@@ -64,7 +64,7 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: first, transpose_centered
       REAL(dp), DIMENSION(:, :), INTENT(IN), OPTIONAL    :: centered_remote_flat
 
-      INTEGER                                            :: iaux, ncontract, nfirst, nout
+      INTEGER                                            :: ncontract, nfirst, nout
       REAL(dp)                                           :: beta
 
       nfirst = SIZE(density, 1)
@@ -95,7 +95,10 @@ CONTAINS
          CALL dgemm("N", "N", nfirst, nout*SIZE(centered, 3), ncontract, factor, &
                     density(1, 1), nfirst, centered(1, 1, 1), ncontract, beta, &
                     RESULT(1, 1, 1), nfirst)
-      ELSE IF (PRESENT(centered_remote_flat)) THEN
+      ELSE
+         IF (.NOT. PRESENT(centered_remote_flat)) THEN
+            CPABORT("The remote LRI density contraction requires a packed C view")
+         END IF
          IF (ANY(SHAPE(centered_remote_flat) /= &
                  [nout*SIZE(centered, 3), ncontract])) THEN
             CPABORT("Inconsistent packed C dimensions in LRI loop3 density contraction")
@@ -103,12 +106,6 @@ CONTAINS
          CALL dgemm("N", "T", nfirst, nout*SIZE(centered, 3), ncontract, factor, &
                     density(1, 1), nfirst, centered_remote_flat(1, 1), &
                     nout*SIZE(centered, 3), beta, RESULT(1, 1, 1), nfirst)
-      ELSE
-         ! Compatibility path for callers which do not retain the packed C view.
-         DO iaux = 1, SIZE(centered, 3)
-            CALL dgemm("N", "T", nfirst, nout, ncontract, factor, density, nfirst, &
-                       centered(:, :, iaux), nout, beta, RESULT(:, :, iaux), nfirst)
-         END DO
       END IF
 
    END SUBROUTINE hfx_lri_loop3_density_c_add
@@ -183,7 +180,7 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Contracts C(center,remote,aux) with U(center,output,aux), leaving remote/output.
-!> \param centered_remote_flat ...
+!> \param centered_remote_flat packed C(center*aux,remote)
 !> \param intermediate_aux_flat ...
 !> \param block ...
 ! **************************************************************************************************
