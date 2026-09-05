@@ -22,10 +22,35 @@ MODULE hfx_lri_lattice
              hfx_lri_lattice_displacement_cell, hfx_lri_lattice_pair_representative, &
              hfx_lri_lattice_project_pair, hfx_lri_lattice_project_sample, &
              hfx_lri_lattice_project_self, &
-             hfx_lri_lattice_reduce, &
+             hfx_lri_lattice_reduce, hfx_lri_lattice_reverse_block, &
              hfx_lri_reciprocal_diagnostics
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Reverse an oriented quotient block, including its twisted-boundary phase.
+!> \param key ...
+!> \param natom ...
+!> \param grid ...
+!> \param twist ...
+!> \param reverse_key ...
+!> \param factor ...
+! **************************************************************************************************
+   PURE SUBROUTINE hfx_lri_lattice_reverse_block(key, natom, grid, twist, reverse_key, factor)
+      INTEGER, INTENT(IN)                                :: key, natom, grid(3), twist(3)
+      INTEGER, INTENT(OUT)                               :: reverse_key
+      REAL(dp), INTENT(OUT), OPTIONAL                    :: factor
+
+      INTEGER                                            :: cell(3), iatom, image, jatom, ncell, &
+                                                            reduced(3)
+
+      ncell = PRODUCT(grid)
+      CALL hfx_lri_lattice_block_from_index(key, natom, ncell, iatom, jatom, image)
+      CALL hfx_lri_lattice_cell_from_index(image, grid, cell)
+      CALL hfx_lri_lattice_reduce(-cell, grid, twist, reduced, factor)
+      image = hfx_lri_lattice_cell_index(reduced, grid)
+      reverse_key = hfx_lri_lattice_block_index(jatom, iatom, image, natom, ncell)
+   END SUBROUTINE hfx_lri_lattice_reverse_block
 
 ! **************************************************************************************************
 !> \brief Returns a mixed absolute/relative tolerance for density-quotient input diagnostics.

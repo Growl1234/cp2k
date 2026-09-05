@@ -14,7 +14,7 @@ MODULE hfx_lri_types
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_k_block_type, hfx_lri_kp_type, &
+   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_kp_type, &
              hfx_lri_pair_block_type, hfx_lri_kp_release
 
    TYPE hfx_lri_pair_block_type
@@ -30,17 +30,13 @@ MODULE hfx_lri_types
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
    END TYPE hfx_lri_pair_block_type
 
-   TYPE hfx_lri_k_block_type
-      INTEGER                                            :: iatom = 0, jatom = 0
-      INTEGER, DIMENSION(3)                              :: cell = 0
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
-   END TYPE hfx_lri_k_block_type
-
    ! One coefficient slice with its auxiliary functions fixed on the first atom.  Lattice cells
    ! are reduced to the finite k-mesh quotient before these blocks are stored.
    TYPE hfx_lri_centered_block_type
       LOGICAL                                            :: inner_active = .TRUE.
       LOGICAL                                            :: present = .FALSE., inner_override = .FALSE.
+      ! Unpacked tensors are temporary during construction, or retained only for literal validation.
+      ! Production contractions keep remote_flat(center*aux,remote) as the single persistent copy.
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: values
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: remote_flat
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: inner_values
@@ -62,11 +58,10 @@ MODULE hfx_lri_types
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: target_pairs
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: k_target
       TYPE(hfx_lri_contract_workspace_type), ALLOCATABLE, DIMENSION(:) :: thread_workspaces
 
-      INTEGER :: nk_blocks = 0
-      TYPE(hfx_lri_k_block_type), ALLOCATABLE, DIMENSION(:) :: k_blocks
+      ! Physical exchange blocks use the same indices and metadata as target_pairs.
+      TYPE(hfx_lri_block_type), ALLOCATABLE, DIMENSION(:) :: k_blocks
    END TYPE hfx_lri_kp_type
 
 CONTAINS
