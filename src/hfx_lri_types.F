@@ -7,7 +7,7 @@
 
 MODULE hfx_lri_types
    USE hfx_lri_contract,                ONLY: hfx_lri_contract_workspace_type
-   USE hfx_lri_parallel,                ONLY: hfx_lri_metric_lattice_block_type => hfx_lri_block_type,&
+   USE hfx_lri_parallel,                ONLY: hfx_lri_block_type,&
                                               hfx_lri_parallel_type
    USE kinds,                           ONLY: dp
 
@@ -15,7 +15,7 @@ MODULE hfx_lri_types
    PRIVATE
 
    PUBLIC :: hfx_lri_centered_block_type, hfx_lri_k_block_type, hfx_lri_kp_type, &
-             hfx_lri_metric_lattice_block_type, hfx_lri_pair_block_type, hfx_lri_kp_release
+             hfx_lri_pair_block_type, hfx_lri_kp_release
 
    TYPE hfx_lri_pair_block_type
       LOGICAL                                            :: onsite_pair = .FALSE., fit_active = .FALSE.
@@ -57,7 +57,7 @@ MODULE hfx_lri_types
                                                             centered_remote_offset, &
                                                             centered_remote_refs
       TYPE(hfx_lri_centered_block_type), ALLOCATABLE, DIMENSION(:) :: centered_blocks
-      TYPE(hfx_lri_metric_lattice_block_type), ALLOCATABLE, &
+      TYPE(hfx_lri_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: lattice_metric
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
