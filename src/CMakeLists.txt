@@ -255,6 +255,7 @@ list(
   hfx_lri_contract.F
   hfx_lri_lattice.F
   hfx_lri_kp.F
+  hfx_lri_parallel.F
   hfx_lri_types.F
   hfx_load_balance_methods.F
   hfx_pair_list_methods.F
@@ -1591,6 +1592,7 @@ set(CP2K_PROGS_F
     topology_phasons.F
     kpsym_unittest.F
     hfx_lri_contract_unittest.F
+    hfx_lri_parallel_unittest.F
     qs_ot_minimizer_unittest.F
     optbas_frontier_orbitals_utils_unittest.F
     rirs_grid_utils_unittest.F
@@ -2014,6 +2016,7 @@ list(
   "topology_phasons"
   "kpsym_unittest"
   "hfx_lri_contract_unittest"
+  "hfx_lri_parallel_unittest"
   "qs_ot_minimizer_unittest"
   "optbas_frontier_orbitals_utils_unittest"
   "rirs_grid_utils_unittest"
@@ -2054,6 +2057,7 @@ add_executable(topology_snapshot_unittest topology_snapshot_unittest.F)
 add_executable(topology_phasons topology_phasons.F)
 add_executable(kpsym_unittest kpsym_unittest.F)
 add_executable(hfx_lri_contract_unittest hfx_lri_contract_unittest.F)
+add_executable(hfx_lri_parallel_unittest hfx_lri_parallel_unittest.F)
 add_executable(qs_ot_minimizer_unittest qs_ot_minimizer_unittest.F)
 add_executable(optbas_frontier_orbitals_utils_unittest
                optbas_frontier_orbitals_utils_unittest.F)
