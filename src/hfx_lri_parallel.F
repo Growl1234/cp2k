@@ -42,10 +42,10 @@ MODULE hfx_lri_parallel
    TYPE hfx_lri_parallel_type
       ! The QS environment owns para_env; this object owns only the split communicator.
       TYPE(mp_para_env_type), POINTER :: para_env => NULL(), subgroup => NULL()
-      INTEGER :: ngroups = 1, group_size = 1, group_id = 0
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, task_owner, tasks_s, tasks_t
+      INTEGER :: ngroups = 1, group_size = 1
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, tasks_s, tasks_t
       INTEGER, ALLOCATABLE, DIMENSION(:, :) :: density_keys
-      LOGICAL, ALLOCATABLE, DIMENSION(:) :: need_c, need_v, need_d, metric_present
+      LOGICAL, ALLOCATABLE, DIMENSION(:) :: need_d, metric_present
    END TYPE hfx_lri_parallel_type
 
    INTERFACE hfx_lri_gather_metadata
