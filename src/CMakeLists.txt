@@ -246,6 +246,11 @@ list(
   hfx_exx.F
   hfx_helpers.F
   hfx_libint_interface.F
+  hfx_lri_contract.F
+  hfx_lri_lattice.F
+  hfx_lri_kp.F
+  hfx_lri_parallel.F
+  hfx_lri_types.F
   hfx_load_balance_methods.F
   hfx_pair_list_methods.F
   hfx_pw_methods.F

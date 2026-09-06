@@ -42,9 +42,10 @@ MODULE input_cp2k_hfx
    IMPLICIT NONE
    PRIVATE
 
-   LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .FALSE.
-   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'input_cp2k_hfx'
+   LOGICAL, PRIVATE, PARAMETER                :: debug_this_module = .FALSE.
+   CHARACTER(len=*), PARAMETER, PRIVATE       :: moduleN = 'input_cp2k_hfx'
    INTEGER, PARAMETER, PUBLIC                 :: ri_mo = 1, ri_pmat = 2
+   INTEGER, PARAMETER, PUBLIC                 :: hfx_ri_kp_extended = 1, hfx_ri_kp_lri = 2
 
    PUBLIC :: create_hfx_section
 
@@ -588,10 +589,30 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="KP_RI_METHOD", &
+                          description="Selects the RI-HFX backend used for k-point calculations. "// &
+                          "EXTENDED is the current image/extended-RI implementation. "// &
+                          "LRI selects the new pair-local LRI backend. The LRI backend is initially "// &
+                          "a development path for short-range HSE and truncated-Coulomb exchange.", &
+                          usage="KP_RI_METHOD {EXTENDED|LRI}", &
+                          repeats=.FALSE., &
+                          default_i_val=hfx_ri_kp_extended, &
+                          enum_c_vals=s2a("EXTENDED", "LRI"), &
+                          enum_desc=s2a("Current extended-RI k-point HFX backend", &
+                                        "Pair-local LRI k-point HFX backend"), &
+                          enum_i_vals=[hfx_ri_kp_extended, hfx_ri_kp_lri])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="KP_NGROUPS", &
                           description="The number of MPI subgroup that work in parallel during the SCF. "// &
                           "The default value is 1. Using N subgroups should speed up the "// &
-                          "calculation by a factor ~N, at the cost of N times more memory usage.", &
+                          "extended-RI calculation by a factor ~N, at the cost of N times more memory usage. "// &
+                          "For KP_RI_METHOD LRI, atom/image task panels are assigned to subgroups, "// &
+                          "which combine partial exchange blocks before the global owner reduction. "// &
+                          "LRI imports C, V and density blocks according to task dependencies; "// &
+                          "its memory and speed depend on those dependencies and the panel balance. "// &
+                          "The value must be positive and divide the number of MPI ranks.", &
                           variants=["NGROUPS"], &
                           usage="KP_NGROUPS {int}", &
                           repeats=.FALSE., &
@@ -609,6 +630,45 @@ CONTAINS
                           usage="KP_USE_DELTA_P {logical}", &
                           repeats=.FALSE., &
                           default_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE_MAX_WORK", &
+                          description="Budget for the full or sampled literal reference in millions "// &
+                          "of estimated multiply-accumulate operations. Zero disables the literal "// &
+                          "reference. This is a resource budget, not an error tolerance.", &
+                          usage="KP_LRI_VALIDATE_MAX_WORK 6000", default_i_val=6000)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE_MAX_MEMORY", &
+                          description="Maximum estimated extra memory [MiB] for literal validation, "// &
+                          "including all OpenMP topology buffers. Zero disables this reference.", &
+                          usage="KP_LRI_VALIDATE_MAX_MEMORY 384", default_i_val=384)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE_RECIPROCAL_WORK", &
+                          description="Budget for reciprocal validation in millions of estimated "// &
+                          "terms. Zero disables this diagnostic. Independent of the literal budget.", &
+                          usage="KP_LRI_VALIDATE_RECIPROCAL_WORK 1000", default_i_val=1000)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_LRI_VALIDATE", &
+                          description="Enable expensive pair-local RI-HFXk correctness checks. "// &
+                          "This first validates every pair metric and fit, including the retained "// &
+                          "spectrum, rank truncation, Hermiticity, the C*M=J residual, and an "// &
+                          "independently evaluated (mu nu|P)=(nu mu|P) exchange relation. It then "// &
+                          "enumerates all four C-D-V-C topologies on the actual quotient blocks. "// &
+                          "It compares every output block and exchange trace when the full reference "// &
+                          "fits its budget, or uses deterministic atom/cell samples otherwise, then "// &
+                          "reconstructs D and K on the complete reciprocal mesh when affordable. "// &
+                          "AO and join guards and configurable work and extra-memory budgets skip diagnostics "// &
+                          "that are unsuitable for a workstation; production then continues.", &
+                          usage="KP_LRI_VALIDATE {logical}", &
+                          repeats=.FALSE., &
+                          default_l_val=.FALSE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
