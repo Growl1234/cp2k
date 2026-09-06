@@ -179,15 +179,15 @@ CONTAINS
                                                             np, nspin, p, q, r, s
       INTEGER, DIMENSION(1:3)                            :: hi, lo, n
       LOGICAL                                            :: use_virial
-      REAL(KIND=dp)                                      :: b_value, beta, const, Ec_nl, sumnp
+      REAL(KIND=dp)                                      :: b_value, beta, const, Ec_nl, rho_3_4, &
+                                                            sumnp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dq0_dgradrho, dq0_drho, hpot, potential, &
                                                             q0, rho
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: drho, thetas
-      TYPE(pw_c1d_gs_type)                               :: tmp_g, vxc_g
+      TYPE(pw_c1d_gs_type)                               :: div_g, rho_tot_g, tmp_g, vxc_g
       TYPE(pw_c1d_gs_type), ALLOCATABLE, DIMENSION(:)    :: thetas_g
       TYPE(pw_grid_type), POINTER                        :: grid
       TYPE(pw_r3d_rs_type)                               :: tmp_r, vxc_r
-      TYPE(pw_r3d_rs_type), ALLOCATABLE, DIMENSION(:, :) :: drho_r
 
       CALL timeset(routineN, handle)
 
@@ -219,80 +219,51 @@ CONTAINS
       CALL pw_pool%create_pw(tmp_g)
       CALL pw_pool%create_pw(tmp_r)
 
-      ! get density derivatives
-      ALLOCATE (drho_r(3, nspin))
-      DO ispin = 1, nspin
-         DO idir = 1, 3
-            CALL pw_pool%create_pw(drho_r(idir, ispin))
-            CALL pw_transfer(rho_g(ispin), tmp_g)
-            CALL pw_derive(tmp_g, nd(:, idir))
-            CALL pw_transfer(tmp_g, drho_r(idir, ispin))
-         END DO
+      ! Sum the spin densities on the vdW grid before transforming or differentiating.
+      CALL pw_pool%create_pw(rho_tot_g)
+      CALL pw_transfer(rho_g(1), rho_tot_g)
+      DO ispin = 2, nspin
+         CALL pw_transfer(rho_g(ispin), tmp_g)
+         CALL pw_axpy(tmp_g, rho_tot_g, 1._dp)
       END DO
+      CALL pw_transfer(rho_tot_g, tmp_r)
 
       np = SIZE(tmp_r%array)
-      ALLOCATE (rho(np), drho(np, 3)) !in the following loops, rho and drho _will_ have the same bounds
+      ALLOCATE (rho(np), drho(np, 3))
       DO i = 1, 3
          lo(i) = LBOUND(tmp_r%array, i)
          hi(i) = UBOUND(tmp_r%array, i)
          n(i) = hi(i) - lo(i) + 1
       END DO
-!$OMP PARALLEL DO DEFAULT(NONE)              &
-!$OMP             SHARED(n,rho)              &
-!$OMP             COLLAPSE(3)
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(n, lo, rho, tmp_r) PRIVATE(s) COLLAPSE(3)
       DO r = 0, n(3) - 1
          DO q = 0, n(2) - 1
             DO p = 0, n(1) - 1
-               rho(r*n(2)*n(1) + q*n(1) + p + 1) = 0.0_dp
+               s = r*n(2)*n(1) + q*n(1) + p + 1
+               rho(s) = tmp_r%array(p + lo(1), q + lo(2), r + lo(3))
             END DO
          END DO
       END DO
 !$OMP END PARALLEL DO
-      DO i = 1, 3
-!$OMP PARALLEL DO DEFAULT(NONE)              &
-!$OMP             SHARED(n,i,drho)           &
-!$OMP             COLLAPSE(3)
-         DO r = 0, n(3) - 1
-            DO q = 0, n(2) - 1
-               DO p = 0, n(1) - 1
-                  drho(r*n(2)*n(1) + q*n(1) + p + 1, i) = 0.0_dp
-               END DO
-            END DO
-         END DO
-!$OMP END PARALLEL DO
-      END DO
-      DO ispin = 1, nspin
-         CALL pw_transfer(rho_g(ispin), tmp_g)
+      DO idir = 1, 3
+         CALL pw_transfer(rho_tot_g, tmp_g)
+         CALL pw_derive(tmp_g, nd(:, idir))
          CALL pw_transfer(tmp_g, tmp_r)
-!$OMP PARALLEL DO DEFAULT(NONE)            &
-!$OMP             SHARED(n,lo,rho,tmp_r)   &
-!$OMP             PRIVATE(s)               &
-!$OMP             COLLAPSE(3)
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(idir, n, lo, drho, tmp_r) PRIVATE(s) COLLAPSE(3)
          DO r = 0, n(3) - 1
             DO q = 0, n(2) - 1
                DO p = 0, n(1) - 1
                   s = r*n(2)*n(1) + q*n(1) + p + 1
-                  rho(s) = rho(s) + tmp_r%array(p + lo(1), q + lo(2), r + lo(3))
+                  drho(s, idir) = tmp_r%array(p + lo(1), q + lo(2), r + lo(3))
                END DO
             END DO
          END DO
 !$OMP END PARALLEL DO
-         DO i = 1, 3
-!$OMP PARALLEL DO DEFAULT(NONE)                      &
-!$OMP             SHARED(ispin,i,n,lo,drho,drho_r)   &
-!$OMP             PRIVATE(s)                         &
-!$OMP             COLLAPSE(3)
-            DO r = 0, n(3) - 1
-               DO q = 0, n(2) - 1
-                  DO p = 0, n(1) - 1
-                     s = r*n(2)*n(1) + q*n(1) + p + 1
-                     drho(s, i) = drho(s, i) + drho_r(i, ispin)%array(p + lo(1), q + lo(2), r + lo(3))
-                  END DO
-               END DO
-            END DO
-!$OMP END PARALLEL DO
-         END DO
       END DO
+      CALL pw_pool%give_back_pw(rho_tot_g)
+
       !! ---------------------------------------------------------------------------------
       !! Find the value of q0 for all assigned grid points.  q is defined in equations
       !! 11 and 12 of DION and q0 is the saturated version of q defined in equation
@@ -358,12 +329,13 @@ CONTAINS
       CASE (vdw_nl_RVV10)
 !$OMP PARALLEL DO DEFAULT( NONE )                                  &
 !$OMP             SHARED( np, rho, dispersion_env, thetas, const ) &
-!$OMP             PRIVATE( i )                                     &
-!$OMP             SCHEDULE(DYNAMIC)    ! use dynamic to allow for possibility of cases having   (rho(i_grid) <= epsr)
+!$OMP             PRIVATE( i, rho_3_4 )                            &
+!$OMP             SCHEDULE(STATIC)
          DO i_grid = 1, np
             IF (rho(i_grid) > epsr) THEN
+               rho_3_4 = rho(i_grid)**(0.75_dp)
                DO i = 1, dispersion_env%nqs
-                  thetas(i_grid, i) = thetas(i_grid, i)*const*rho(i_grid)**(0.75_dp)
+                  thetas(i_grid, i) = thetas(i_grid, i)*const*rho_3_4
                END DO
             ELSE
                thetas(i_grid, :) = 0.0_dp
@@ -494,38 +466,32 @@ CONTAINS
             hi(i) = UBOUND(tmp_r%array, i)
             n(i) = hi(i) - lo(i) + 1
          END DO
+         ! Sum the derivatives before the inverse FFT. Keep the real-space projection
+         ! before transferring the potential to a possibly different XC grid.
+         CALL pw_pool%create_pw(div_g)
          DO idir = 1, 3
-!$OMP PARALLEL DO DEFAULT(NONE)                     &
-!$OMP             SHARED(n,lo,tmp_r)                &
-!$OMP             COLLAPSE(3)
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(n, lo, tmp_r, hpot, drho, idir) PRIVATE(s) COLLAPSE(3)
             DO r = 0, n(3) - 1
                DO q = 0, n(2) - 1
                   DO p = 0, n(1) - 1
-                     tmp_r%array(p + lo(1), q + lo(2), r + lo(3)) = 0.0_dp
+                     s = r*n(2)*n(1) + q*n(1) + p + 1
+                     tmp_r%array(p + lo(1), q + lo(2), r + lo(3)) = hpot(s)*drho(s, idir)
                   END DO
                END DO
             END DO
 !$OMP END PARALLEL DO
-            DO ispin = 1, nspin
-!$OMP PARALLEL DO DEFAULT(NONE)                              &
-!$OMP             SHARED(n,lo,tmp_r,hpot,drho_r,idir,ispin)  &
-!$OMP             COLLAPSE(3)
-               DO r = 0, n(3) - 1
-                  DO q = 0, n(2) - 1
-                     DO p = 0, n(1) - 1
-                        tmp_r%array(p + lo(1), q + lo(2), r + lo(3)) = tmp_r%array(p + lo(1), q + lo(2), r + lo(3)) &
-                                                                       + hpot(r*n(2)*n(1) + q*n(1) + p + 1) &
-                                                                       *drho_r(idir, ispin)%array(p + lo(1), q + lo(2), r + lo(3))
-                     END DO
-                  END DO
-               END DO
-!$OMP END PARALLEL DO
-            END DO
             CALL pw_transfer(tmp_r, tmp_g)
             CALL pw_derive(tmp_g, nd(:, idir))
-            CALL pw_transfer(tmp_g, tmp_r)
-            CALL pw_axpy(tmp_r, vxc_r, -1._dp)
+            IF (idir == 1) THEN
+               CALL pw_transfer(tmp_g, div_g)
+            ELSE
+               CALL pw_axpy(tmp_g, div_g, 1._dp)
+            END IF
          END DO
+         CALL pw_transfer(div_g, tmp_r)
+         CALL pw_pool%give_back_pw(div_g)
+         CALL pw_axpy(tmp_r, vxc_r, -1._dp)
          CALL pw_transfer(vxc_r, tmp_g)
          CALL pw_pool%give_back_pw(vxc_r)
          CALL xc_pw_pool%create_pw(vxc_r)
@@ -545,15 +511,10 @@ CONTAINS
       DO i = 1, dispersion_env%nqs
          CALL pw_pool%give_back_pw(thetas_g(i))
       END DO
-      DO ispin = 1, nspin
-         DO idir = 1, 3
-            CALL pw_pool%give_back_pw(drho_r(idir, ispin))
-         END DO
-      END DO
       CALL pw_pool%give_back_pw(tmp_r)
       CALL pw_pool%give_back_pw(tmp_g)
 
-      DEALLOCATE (rho, drho, drho_r, thetas_g)
+      DEALLOCATE (rho, drho, thetas_g)
 
       CALL timestop(handle)
 
@@ -583,7 +544,6 @@ CONTAINS
 
       COMPLEX(KIND=dp)                                   :: uu
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: theta
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: u_vdw
       INTEGER                                            :: handle, ig, iq, l, m, nl_type, nqs, &
                                                             q1_i, q2_i
       LOGICAL                                            :: use_virial
@@ -609,15 +569,9 @@ CONTAINS
 
       nl_type = dispersion_env%nl_type
 
-      IF (.NOT. energy_only) THEN
-         ALLOCATE (u_vdW(grid%ngpts_cut_local, nqs))
-         u_vdW(:, :) = z_zero
-      END IF
-
 !$OMP PARALLEL DEFAULT( NONE )                                             &
 !$OMP           SHARED( nqs, energy_only, grid, dispersion_env             &
 !$OMP                 , use_virial, thetas_g, g_multiplier, nl_type        &
-!$OMP                 , u_vdW                                              &
 !$OMP                 )                                                    &
 !$OMP          PRIVATE( g2_last, kernel_of_k, dkernel_of_dk, theta         &
 !$OMP                 , g2, g, iq                                          &
@@ -640,20 +594,22 @@ CONTAINS
             CALL interpolate_kernel(g, kernel_of_k, dispersion_env)
             IF (use_virial) CALL interpolate_dkernel_dk(g, dkernel_of_dk, dispersion_env)
          END IF
+         ! Save every input channel before overwriting any output at this G point.
          DO iq = 1, nqs
             theta(iq) = thetas_g(iq)%array(ig)
          END DO
          DO q2_i = 1, nqs
             uu = z_zero
+            ! The kernel is symmetric; access its contiguous first index.
             DO q1_i = 1, nqs
-               uu = uu + kernel_of_k(q2_i, q1_i)*theta(q1_i)
+               uu = uu + kernel_of_k(q1_i, q2_i)*theta(q1_i)
             END DO
             IF (ig < grid%first_gne0) THEN
                vdW_xc_energy = vdW_xc_energy + REAL(uu*CONJG(theta(q2_i)), KIND=dp)
             ELSE
                vdW_xc_energy = vdW_xc_energy + g_multiplier*REAL(uu*CONJG(theta(q2_i)), KIND=dp)
             END IF
-            IF (.NOT. energy_only) u_vdW(ig, q2_i) = uu
+            IF (.NOT. energy_only) thetas_g(q2_i)%array(ig) = uu
 
             IF (use_virial .AND. ig >= grid%first_gne0) THEN
                DO q1_i = 1, nqs
@@ -676,21 +632,7 @@ CONTAINS
       DEALLOCATE (theta)
       DEALLOCATE (kernel_of_k, dkernel_of_dk)
 
-      IF (.NOT. energy_only) THEN
-!$OMP DO
-         DO ig = 1, grid%ngpts_cut_local
-            DO iq = 1, nqs
-               thetas_g(iq)%array(ig) = u_vdW(ig, iq)
-            END DO
-         END DO
-!$OMP END DO
-      END IF
-
 !$OMP END PARALLEL
-
-      IF (.NOT. energy_only) THEN
-         DEALLOCATE (u_vdW)
-      END IF
 
       vdW_xc_energy = vdW_xc_energy*grid%vol*0.5_dp
 
@@ -750,8 +692,7 @@ CONTAINS
       LOGICAL                                            :: use_virial
       REAL(dp)                                           :: a, b, b_value, c, const, d, dP_dq0, dq, &
                                                             dq_6, e, f, P, prefactor, tmp_1_2, &
-                                                            tmp_1_4, tmp_3_4
-      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: y
+                                                            tmp_1_4, tmp_3_4, y_hi, y_low
       REAL(dp), DIMENSION(3, 3)                          :: virial_thread
       REAL(dp), DIMENSION(:), POINTER                    :: q_mesh
       REAL(dp), DIMENSION(:, :), POINTER                 :: d2y_dx2
@@ -765,8 +706,6 @@ CONTAINS
       virial_thread(:, :) = 0.0_dp ! always initialize to avoid floating point exceptions in OMP REDUCTION
       b_value = dispersion_env%b_value
       const = 1.0_dp/(3.0_dp*b_value**(3.0_dp/2.0_dp)*pi**(5.0_dp/4.0_dp))
-      potential = 0.0_dp
-      h_prefactor = 0.0_dp
 
       d2y_dx2 => dispersion_env%d2y_dx2
       q_mesh => dispersion_env%q_mesh
@@ -779,18 +718,27 @@ CONTAINS
 !$OMP                 , dq0_drho, dq0_dgradrho, total_rho, const       &
 !$OMP                 , use_virial, drho, dvol, virial                 &
 !$OMP                 )                                                &
-!$OMP          PRIVATE( y                                              &
-!$OMP                 , q_low, q_hi, q, dq, dq_6, A, b, c, d, e, f     &
+!$OMP          PRIVATE( q_low, q_hi, q, dq, dq_6, A, b, c, d, e, f      &
+!$OMP                 , y_low, y_hi                                    &
 !$OMP                 , P_i, dP_dq0, P, prefactor, l, m                &
 !$OMP                 , tmp_1_2, tmp_1_4, tmp_3_4                      &
 !$OMP                 )                                                &
 !$OMP        REDUCTION(+: virial_thread                                &
 !$OMP                 )
 
-      ALLOCATE (y(nqs))
+      tmp_1_4 = 1.0_dp
+      tmp_3_4 = 0.0_dp
 
 !$OMP DO
       DO i_grid = 1, SIZE(u_vdW, 1)
+         potential(i_grid) = 0.0_dp
+         h_prefactor(i_grid) = 0.0_dp
+         IF (nl_type == vdw_nl_RVV10) THEN
+            IF (total_rho(i_grid) <= epsr) CYCLE
+            tmp_1_2 = SQRT(total_rho(i_grid))
+            tmp_1_4 = SQRT(tmp_1_2)
+            tmp_3_4 = tmp_1_4*tmp_1_4*tmp_1_4
+         END IF
          q_low = 1
          q_hi = nqs
          ! Figure out which bin our value of q0 is in in the q_mesh
@@ -815,10 +763,10 @@ CONTAINS
          f = (3.0_dp*b**2 - 1.0_dp)*dq_6
 
          DO P_i = 1, nqs
-            y = 0.0_dp
-            y(P_i) = 1.0_dp
-            dP_dq0 = (y(q_hi) - y(q_low))/dq - e*d2y_dx2(P_i, q_low) + f*d2y_dx2(P_i, q_hi)
-            P = a*y(q_low) + b*y(q_hi) + c*d2y_dx2(P_i, q_low) + d*d2y_dx2(P_i, q_hi)
+            y_low = MERGE(1.0_dp, 0.0_dp, P_i == q_low)
+            y_hi = MERGE(1.0_dp, 0.0_dp, P_i == q_hi)
+            dP_dq0 = (y_hi - y_low)/dq - e*d2y_dx2(P_i, q_low) + f*d2y_dx2(P_i, q_hi)
+            P = a*y_low + b*y_hi + c*d2y_dx2(P_i, q_low) + d*d2y_dx2(P_i, q_hi)
             !! The first term in equation 13 of SOLER
             SELECT CASE (nl_type)
             CASE DEFAULT
@@ -827,17 +775,10 @@ CONTAINS
                potential(i_grid) = potential(i_grid) + u_vdW(i_grid, P_i)*(P + dP_dq0*dq0_drho(i_grid))
                prefactor = u_vdW(i_grid, P_i)*dP_dq0*dq0_dgradrho(i_grid)
             CASE (vdw_nl_RVV10)
-               IF (total_rho(i_grid) > epsr) THEN
-                  tmp_1_2 = SQRT(total_rho(i_grid))
-                  tmp_1_4 = SQRT(tmp_1_2) ! == total_rho(i_grid)**(1.0_dp/4.0_dp)
-                  tmp_3_4 = tmp_1_4*tmp_1_4*tmp_1_4 ! == total_rho(i_grid)**(3.0_dp/4.0_dp)
-                  potential(i_grid) = potential(i_grid) &
-                                      + u_vdW(i_grid, P_i)*(const*0.75_dp/tmp_1_4*P &
-                                                            + const*tmp_3_4*dP_dq0*dq0_drho(i_grid))
-                  prefactor = u_vdW(i_grid, P_i)*const*tmp_3_4*dP_dq0*dq0_dgradrho(i_grid)
-               ELSE
-                  prefactor = 0.0_dp
-               END IF
+               potential(i_grid) = potential(i_grid) &
+                                   + u_vdW(i_grid, P_i)*(const*0.75_dp/tmp_1_4*P &
+                                                         + const*tmp_3_4*dP_dq0*dq0_drho(i_grid))
+               prefactor = u_vdW(i_grid, P_i)*const*tmp_3_4*dP_dq0*dq0_dgradrho(i_grid)
             END SELECT
             IF (q0(i_grid) /= q_mesh(nqs)) THEN
                h_prefactor(i_grid) = h_prefactor(i_grid) + prefactor
@@ -862,7 +803,6 @@ CONTAINS
       END DO ! i_grid = 1, SIZE(u_vdW, 1)
 !$OMP END DO
 
-      DEALLOCATE (y)
 !$OMP END PARALLEL
 
       IF (use_virial) THEN
@@ -977,12 +917,14 @@ CONTAINS
          Z_ab = -1.887_dp
       END SELECT
 
-      ! initialize q0-related arrays ...
-      q0(:) = q_cut
-      dq0_drho(:) = 0.0_dp
-      dq0_dgradrho(:) = 0.0_dp
-
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(total_rho, gradient_rho, q0, dq0_drho, dq0_dgradrho, q_cut, q_min, Z_ab) &
+!$OMP             PRIVATE(dq0_dq, exponent, gradient_correction, kF, LDA_1, LDA_2, q, q__q_cut, r_s, sqrt_r_s) &
+!$OMP             SCHEDULE(STATIC)
       DO i_grid = 1, SIZE(total_rho)
+         q0(i_grid) = q_cut
+         dq0_drho(i_grid) = 0.0_dp
+         dq0_dgradrho(i_grid) = 0.0_dp
 
          !! This prevents numerical problems.  If the charge density is negative (an
          !! unphysical situation), we simply treat it as very small.  In that case,
@@ -1043,6 +985,7 @@ CONTAINS
          dq0_dgradrho(i_grid) = total_rho(i_grid)*dq0_dq*2.0_dp*(-Z_ab)/(36.0_dp*kF*total_rho(i_grid)**2)
 
       END DO
+!$OMP END PARALLEL DO
 
    END SUBROUTINE get_q0_on_grid_vdw
 
@@ -1055,7 +998,7 @@ CONTAINS
 !> \param dq0_dgradrho ...
 !> \param dispersion_env ...
 ! **************************************************************************************************
-   PURE SUBROUTINE get_q0_on_grid_rvv10(total_rho, gradient_rho, q0, dq0_drho, dq0_dgradrho, dispersion_env)
+   SUBROUTINE get_q0_on_grid_rvv10(total_rho, gradient_rho, q0, dq0_drho, dq0_dgradrho, dispersion_env)
       !!
       !! more specifically it calculates the following
       !!
@@ -1079,12 +1022,14 @@ CONTAINS
       b_value = dispersion_env%b_value
       C_value = dispersion_env%c_value
 
-      ! initialize q0-related arrays ...
-      q0(:) = q_cut
-      dq0_drho(:) = 0.0_dp
-      dq0_dgradrho(:) = 0.0_dp
-
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(total_rho, gradient_rho, q0, dq0_drho, dq0_dgradrho, q_cut, q_min, b_value, C_value) &
+!$OMP             PRIVATE(dk_dn, dq0_dq, dw0_dn, exponent, gmod2, k, mod_grad, q, q__q_cut, w0, wg2, wp2) &
+!$OMP             SCHEDULE(STATIC)
       DO i_grid = 1, SIZE(total_rho)
+         q0(i_grid) = q_cut
+         dq0_drho(i_grid) = 0.0_dp
+         dq0_dgradrho(i_grid) = 0.0_dp
 
          gmod2 = gradient_rho(i_grid, 1)**2 + gradient_rho(i_grid, 2)**2 + gradient_rho(i_grid, 3)**2
 
@@ -1120,10 +1065,14 @@ CONTAINS
             dk_dn = k/(6.0_dp*total_rho(i_grid))
 
             dq0_drho(i_grid) = dq0_dq*1.0_dp/(k**2.0)*(dw0_dn*k - dk_dn*w0)
-            dq0_dgradrho(i_grid) = dq0_dq*1.0_dp/(2.0_dp*k*w0)*4.0_dp*wg2/gmod2
+            ! wg2 is proportional to |gradient_rho|**4, so this limit is zero.
+            IF (gmod2 > 0.0_dp) THEN
+               dq0_dgradrho(i_grid) = dq0_dq*1.0_dp/(2.0_dp*k*w0)*4.0_dp*wg2/gmod2
+            END IF
          END IF
 
       END DO
+!$OMP END PARALLEL DO
 
    END SUBROUTINE get_q0_on_grid_rvv10
 
@@ -1160,9 +1109,12 @@ CONTAINS
          Z_ab = -1.887_dp
       END SELECT
 
-      ! initialize q0-related arrays ...
-      q0(:) = q_cut
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(total_rho, gradient_rho, q0, q_cut, q_min, Z_ab) &
+!$OMP             PRIVATE(exponent, gradient_correction, kF, LDA_1, LDA_2, q, q__q_cut, r_s, sqrt_r_s) &
+!$OMP             SCHEDULE(STATIC)
       DO i_grid = 1, SIZE(total_rho)
+         q0(i_grid) = q_cut
          !! This prevents numerical problems.  If the charge density is negative (an
          !! unphysical situation), we simply treat it as very small.  In that case,
          !! q0 will be very large and will be saturated.  For a saturated q0 the derivative
@@ -1203,6 +1155,7 @@ CONTAINS
             q0(i_grid) = q_min
          END IF
       END DO
+!$OMP END PARALLEL DO
 
    END SUBROUTINE get_q0_on_grid_eo_vdw
 
@@ -1213,7 +1166,7 @@ CONTAINS
 !> \param q0 ...
 !> \param dispersion_env ...
 ! **************************************************************************************************
-   PURE SUBROUTINE get_q0_on_grid_eo_rvv10(total_rho, gradient_rho, q0, dispersion_env)
+   SUBROUTINE get_q0_on_grid_eo_rvv10(total_rho, gradient_rho, q0, dispersion_env)
 
       REAL(dp), INTENT(IN)                               :: total_rho(:), gradient_rho(:, :)
       REAL(dp), INTENT(OUT)                              :: q0(:)
@@ -1230,10 +1183,12 @@ CONTAINS
       b_value = dispersion_env%b_value
       C_value = dispersion_env%c_value
 
-      ! initialize q0-related arrays ...
-      q0(:) = q_cut
-
+!$OMP PARALLEL DO DEFAULT(NONE) &
+!$OMP             SHARED(total_rho, gradient_rho, q0, q_cut, q_min, b_value, C_value) &
+!$OMP             PRIVATE(exponent, gmod2, k, q, q__q_cut, w0, wg2, wp2) &
+!$OMP             SCHEDULE(STATIC)
       DO i_grid = 1, SIZE(total_rho)
+         q0(i_grid) = q_cut
 
          gmod2 = gradient_rho(i_grid, 1)**2 + gradient_rho(i_grid, 2)**2 + gradient_rho(i_grid, 3)**2
 
@@ -1263,6 +1218,7 @@ CONTAINS
          END IF
 
       END DO
+!$OMP END PARALLEL DO
 
    END SUBROUTINE get_q0_on_grid_eo_rvv10
 
@@ -1284,8 +1240,7 @@ CONTAINS
 
       INTEGER                                            :: i_grid, index, lower_bound, &
                                                             Ngrid_points, Nx, P_i, upper_bound
-      REAL(dp)                                           :: a, b, c, const, d, dx
-      REAL(dp), ALLOCATABLE                              :: y(:)
+      REAL(dp)                                           :: a, b, c, const, d, dx, y_hi, y_low
 
       Nx = SIZE(x)
       Ngrid_points = SIZE(evaluation_points)
@@ -1294,11 +1249,9 @@ CONTAINS
 !$OMP           SHARED( x, d2y_dx2, evaluation_points, values          &
 !$OMP                 , Nx, Ngrid_points                               &
 !$OMP                 )                                                &
-!$OMP          PRIVATE( y, lower_bound, upper_bound, index             &
+!$OMP          PRIVATE( y_low, y_hi, lower_bound, upper_bound, index             &
 !$OMP                 , dx, const, A, b, c, d, P_i                     &
 !$OMP                 )
-
-      ALLOCATE (y(Nx))
 
 !$OMP DO
       DO i_grid = 1, Ngrid_points
@@ -1322,15 +1275,14 @@ CONTAINS
          d = (b**3 - b)*const
 
          DO P_i = 1, Nx
-            y = 0
-            y(P_i) = 1
-            values(i_grid, P_i) = a*y(lower_bound) + b*y(upper_bound) &
+            y_low = MERGE(1.0_dp, 0.0_dp, P_i == lower_bound)
+            y_hi = MERGE(1.0_dp, 0.0_dp, P_i == upper_bound)
+            values(i_grid, P_i) = a*y_low + b*y_hi &
                                   + (c*d2y_dx2(P_i, lower_bound) + d*d2y_dx2(P_i, upper_bound))
          END DO
       END DO
 !$OMP END DO
 
-      DEALLOCATE (y)
 !$OMP END PARALLEL
    END SUBROUTINE spline_interpolation
 
