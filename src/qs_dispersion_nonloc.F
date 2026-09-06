@@ -610,22 +610,24 @@ CONTAINS
                vdW_xc_energy = vdW_xc_energy + g_multiplier*REAL(uu*CONJG(theta(q2_i)), KIND=dp)
             END IF
             IF (.NOT. energy_only) thetas_g(q2_i)%array(ig) = uu
-
-            IF (use_virial .AND. ig >= grid%first_gne0) THEN
-               DO q1_i = 1, nqs
-                  gm = 0.5_dp*g_multiplier*grid%vol*dkernel_of_dk(q1_i, q2_i)*REAL(theta(q1_i)*CONJG(theta(q2_i)), KIND=dp)
-                  IF (nl_type == vdw_nl_RVV10) THEN
-                     gm = 0.5_dp*gm
-                  END IF
-                  DO l = 1, 3
-                     DO m = 1, l
-                        virial_thread(l, m) = virial_thread(l, m) - gm*(grid%g(l, ig)*grid%g(m, ig))/g
-                     END DO
-                  END DO
-               END DO
-            END IF
-
          END DO
+
+         IF (use_virial .AND. ig >= grid%first_gne0) THEN
+            ! Reduce over all channel pairs before assembling the stress tensor.
+            gm = 0.0_dp
+            DO q2_i = 1, nqs
+               DO q1_i = 1, nqs
+                  gm = gm + dkernel_of_dk(q1_i, q2_i)*REAL(theta(q1_i)*CONJG(theta(q2_i)), KIND=dp)
+               END DO
+            END DO
+            gm = 0.5_dp*g_multiplier*grid%vol*gm
+            IF (nl_type == vdw_nl_RVV10) gm = 0.5_dp*gm
+            DO l = 1, 3
+               DO m = 1, l
+                  virial_thread(l, m) = virial_thread(l, m) - gm*(grid%g(l, ig)*grid%g(m, ig))/g
+               END DO
+            END DO
+         END IF
       END DO
 !$OMP END DO
 
@@ -690,9 +692,10 @@ CONTAINS
       INTEGER                                            :: handle, i_grid, l, m, nl_type, nqs, P_i, &
                                                             q, q_hi, q_low
       LOGICAL                                            :: use_virial
-      REAL(dp)                                           :: a, b, b_value, c, const, d, dP_dq0, dq, &
-                                                            dq_6, e, f, P, prefactor, tmp_1_2, &
-                                                            tmp_1_4, tmp_3_4, y_hi, y_low
+      REAL(dp)                                           :: a, b, b_value, c, const, d, dq, dq_6, e, &
+                                                            f, prefactor, sum_hi, sum_low, &
+                                                            tmp_1_2, tmp_1_4, tmp_3_4, u_dp_dq0, &
+                                                            u_p
       REAL(dp), DIMENSION(3, 3)                          :: virial_thread
       REAL(dp), DIMENSION(:), POINTER                    :: q_mesh
       REAL(dp), DIMENSION(:, :), POINTER                 :: d2y_dx2
@@ -719,26 +722,18 @@ CONTAINS
 !$OMP                 , use_virial, drho, dvol, virial                 &
 !$OMP                 )                                                &
 !$OMP          PRIVATE( q_low, q_hi, q, dq, dq_6, A, b, c, d, e, f      &
-!$OMP                 , y_low, y_hi                                    &
-!$OMP                 , P_i, dP_dq0, P, prefactor, l, m                &
+!$OMP                 , sum_low, sum_hi, u_p, u_dp_dq0                 &
+!$OMP                 , P_i, prefactor, l, m                           &
 !$OMP                 , tmp_1_2, tmp_1_4, tmp_3_4                      &
 !$OMP                 )                                                &
 !$OMP        REDUCTION(+: virial_thread                                &
 !$OMP                 )
 
-      tmp_1_4 = 1.0_dp
-      tmp_3_4 = 0.0_dp
-
 !$OMP DO
       DO i_grid = 1, SIZE(u_vdW, 1)
          potential(i_grid) = 0.0_dp
          h_prefactor(i_grid) = 0.0_dp
-         IF (nl_type == vdw_nl_RVV10) THEN
-            IF (total_rho(i_grid) <= epsr) CYCLE
-            tmp_1_2 = SQRT(total_rho(i_grid))
-            tmp_1_4 = SQRT(tmp_1_2)
-            tmp_3_4 = tmp_1_4*tmp_1_4*tmp_1_4
-         END IF
+         IF (nl_type == vdw_nl_RVV10 .AND. total_rho(i_grid) <= epsr) CYCLE
          q_low = 1
          q_hi = nqs
          ! Figure out which bin our value of q0 is in in the q_mesh
@@ -762,44 +757,44 @@ CONTAINS
          e = (3.0_dp*a**2 - 1.0_dp)*dq_6
          f = (3.0_dp*b**2 - 1.0_dp)*dq_6
 
+         ! Contract the spline second derivatives before assembling the potential.
+         sum_low = 0.0_dp
+         sum_hi = 0.0_dp
          DO P_i = 1, nqs
-            y_low = MERGE(1.0_dp, 0.0_dp, P_i == q_low)
-            y_hi = MERGE(1.0_dp, 0.0_dp, P_i == q_hi)
-            dP_dq0 = (y_hi - y_low)/dq - e*d2y_dx2(P_i, q_low) + f*d2y_dx2(P_i, q_hi)
-            P = a*y_low + b*y_hi + c*d2y_dx2(P_i, q_low) + d*d2y_dx2(P_i, q_hi)
-            !! The first term in equation 13 of SOLER
-            SELECT CASE (nl_type)
-            CASE DEFAULT
-               CPABORT("Unknown vdW-DF functional")
-            CASE (vdw_nl_DRSLL, vdw_nl_LMKLL)
-               potential(i_grid) = potential(i_grid) + u_vdW(i_grid, P_i)*(P + dP_dq0*dq0_drho(i_grid))
-               prefactor = u_vdW(i_grid, P_i)*dP_dq0*dq0_dgradrho(i_grid)
-            CASE (vdw_nl_RVV10)
-               potential(i_grid) = potential(i_grid) &
-                                   + u_vdW(i_grid, P_i)*(const*0.75_dp/tmp_1_4*P &
-                                                         + const*tmp_3_4*dP_dq0*dq0_drho(i_grid))
-               prefactor = u_vdW(i_grid, P_i)*const*tmp_3_4*dP_dq0*dq0_dgradrho(i_grid)
-            END SELECT
-            IF (q0(i_grid) /= q_mesh(nqs)) THEN
-               h_prefactor(i_grid) = h_prefactor(i_grid) + prefactor
-            END IF
+            sum_low = sum_low + u_vdW(i_grid, P_i)*d2y_dx2(P_i, q_low)
+            sum_hi = sum_hi + u_vdW(i_grid, P_i)*d2y_dx2(P_i, q_hi)
+         END DO
+         u_p = a*u_vdW(i_grid, q_low) + b*u_vdW(i_grid, q_hi) + c*sum_low + d*sum_hi
+         u_dp_dq0 = (u_vdW(i_grid, q_hi) - u_vdW(i_grid, q_low))/dq - e*sum_low + f*sum_hi
 
-            IF (use_virial .AND. ABS(prefactor) > 0.0_dp) THEN
-               SELECT CASE (nl_type)
-               CASE DEFAULT
-                  ! do nothing
-               CASE (vdw_nl_RVV10)
-                  prefactor = 0.5_dp*prefactor
-               END SELECT
-               prefactor = prefactor*dvol
-               DO l = 1, 3
-                  DO m = 1, l
-                     virial_thread(l, m) = virial_thread(l, m) - prefactor*drho(i_grid, l)*drho(i_grid, m)
-                  END DO
+         !! The first term in equation 13 of SOLER
+         SELECT CASE (nl_type)
+         CASE DEFAULT
+            CPABORT("Unknown vdW-DF functional")
+         CASE (vdw_nl_DRSLL, vdw_nl_LMKLL)
+            potential(i_grid) = u_p + u_dp_dq0*dq0_drho(i_grid)
+            prefactor = u_dp_dq0*dq0_dgradrho(i_grid)
+         CASE (vdw_nl_RVV10)
+            tmp_1_2 = SQRT(total_rho(i_grid))
+            tmp_1_4 = SQRT(tmp_1_2)
+            tmp_3_4 = tmp_1_4*tmp_1_4*tmp_1_4
+            potential(i_grid) = const*0.75_dp/tmp_1_4*u_p + const*tmp_3_4*u_dp_dq0*dq0_drho(i_grid)
+            prefactor = const*tmp_3_4*u_dp_dq0*dq0_dgradrho(i_grid)
+         END SELECT
+         IF (q0(i_grid) /= q_mesh(nqs)) THEN
+            h_prefactor(i_grid) = prefactor
+         END IF
+
+         ! The saturation guard applies only to h_prefactor, not to the virial.
+         IF (use_virial .AND. ABS(prefactor) > 0.0_dp) THEN
+            IF (nl_type == vdw_nl_RVV10) prefactor = 0.5_dp*prefactor
+            prefactor = prefactor*dvol
+            DO l = 1, 3
+               DO m = 1, l
+                  virial_thread(l, m) = virial_thread(l, m) - prefactor*drho(i_grid, l)*drho(i_grid, m)
                END DO
-            END IF
-
-         END DO ! P_i = 1, nqs
+            END DO
+         END IF
       END DO ! i_grid = 1, SIZE(u_vdW, 1)
 !$OMP END DO
 
