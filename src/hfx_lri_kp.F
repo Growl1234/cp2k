@@ -161,11 +161,6 @@ MODULE hfx_lri_kp
       TYPE(lri_density_block_type), ALLOCATABLE, DIMENSION(:) :: blocks
    END TYPE lri_density_cache_type
 
-   TYPE lri_basis_transform_type
-      REAL(dp)                                           :: radius = 0.0_dp
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sphi
-   END TYPE lri_basis_transform_type
-
 CONTAINS
 
 ! **************************************************************************************************
@@ -307,8 +302,6 @@ CONTAINS
       TYPE(hfx_lri_pair_diagnostic_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: pair_diagnostics
       TYPE(kpoint_type), POINTER                         :: kpoints
-      TYPE(lri_basis_transform_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: ao_transform_cache, ri_transform_cache
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
@@ -356,8 +349,6 @@ CONTAINS
          END IF
       END DO
 
-      CALL hfx_lri_build_ri_transform_cache(basis_set_AO, ao_transform_cache)
-      CALL hfx_lri_build_ri_transform_cache(basis_set_RI, ri_transform_cache)
       maxl_ao = 0
       maxl_ri = 0
       DO ibasis = 1, SIZE(basis_set_AO)
@@ -489,8 +480,8 @@ CONTAINS
       ! The neighbor-list iterator is serial, but every fitted pair is independent. Reuse the
       ! immutable basis transforms and give every worker its own Libint engines.
       !$OMP PARALLEL DEFAULT(NONE) &
-      !$OMP          SHARED(ao_transform_cache, basis_set_AO, basis_set_RI, maxl_ao, maxl_ri, &
-      !$OMP                 metric_caches, pair_diagnostics, pair_owner, para_env, active, ri_data, ri_transform_cache, &
+      !$OMP          SHARED(basis_set_AO, basis_set_RI, maxl_ao, maxl_ri, &
+      !$OMP                 metric_caches, pair_diagnostics, pair_owner, para_env, active, ri_data, &
       !$OMP                 validate_pair_fit) &
       !$OMP          PRIVATE(integral_context, ipair_block, ithread)
       ithread = 1
@@ -504,12 +495,12 @@ CONTAINS
          IF (validate_pair_fit) THEN
             CALL hfx_lri_build_pair_coefficients( &
                basis_set_AO, basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_block), ri_data, &
-               integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread), &
+               integral_context, metric_caches(ithread), &
                pair_diagnostics(ipair_block))
          ELSE
             CALL hfx_lri_build_pair_coefficients( &
                basis_set_AO, basis_set_RI, ri_data%lri_kp%pair_blocks(ipair_block), ri_data, &
-               integral_context, ao_transform_cache, ri_transform_cache, metric_caches(ithread))
+               integral_context, metric_caches(ithread))
          END IF
          active(ipair_block) = MERGE(1, 0, ALLOCATED(ri_data%lri_kp%pair_blocks(ipair_block)%c_fit))
       END DO
@@ -702,261 +693,144 @@ CONTAINS
    END SUBROUTINE hfx_lri_validate_pair_fits
 
 ! **************************************************************************************************
-!> \brief Counts raw Cartesian primitive-function slots in one basis.
-!> \param basis ...
-!> \return ...
+!> \brief Contract each two-center shell-set block before proceeding to the next one.
+!> \param basis_a First basis, including its initialized contraction matrix.
+!> \param basis_b Second basis, including its initialized contraction matrix.
+!> \param ra First center.
+!> \param rb Second center.
+!> \param integral_context Thread-local integral engine.
+!> \param potential Integral operator.
+!> \param mat Contracted spherical integral matrix.
 ! **************************************************************************************************
-   INTEGER FUNCTION hfx_lri_count_cart_functions(basis) RESULT(ncart)
-
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-
-      INTEGER                                            :: iset, nset
-      INTEGER, DIMENSION(:), POINTER                     :: lmax, npgf
-
-      ncart = 0
-      CALL get_gto_basis_set(basis, lmax=lmax, npgf=npgf, nset=nset)
-      DO iset = 1, nset
-         ncart = ncart + npgf(iset)*ncoset(lmax(iset))
-      END DO
-
-   END FUNCTION hfx_lri_count_cart_functions
-
-! **************************************************************************************************
-!> \brief Fills a raw Cartesian two-center integral block in a dense metric.
-!> \param basis_a ...
-!> \param basis_b ...
-!> \param ra ...
-!> \param rb ...
-!> \param integral_context ...
-!> \param potential integral operator used for this block
-!> \param mat ...
-!> \param offset_a ...
-!> \param offset_b ...
-!> \param symmetric ...
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_fill_2c_block(basis_a, basis_b, ra, rb, integral_context, potential, mat, offset_a, &
-                                    offset_b, symmetric)
-
+   SUBROUTINE hfx_lri_compute_2c(basis_a, basis_b, ra, rb, integral_context, potential, mat)
       TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb
       TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       TYPE(coulomb_operator_type), INTENT(IN)            :: potential
-      REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: mat
-      INTEGER, INTENT(IN)                                :: offset_a, offset_b
-      LOGICAL, INTENT(IN), OPTIONAL                      :: symmetric
+      REAL(dp), ALLOCATABLE, INTENT(OUT)                 :: mat(:, :)
 
-      INTEGER                                            :: ia0, ib0, iset, jset, ncoa, ncob, nseta, &
-                                                            nsetb
-      INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmin_a, lmin_b, npgf_a, &
-                                                            npgf_b
-      LOGICAL                                            :: do_sym
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: sij
-      REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, zeta_a, zeta_b
+      INTEGER                                            :: ia0, ib0, iset, jset, ncoa, ncob, nsga, &
+                                                            nsgb
+      REAL(dp), ALLOCATABLE                              :: sij(:, :), tmp(:, :)
 
-      CALL get_gto_basis_set(basis_a, lmax=lmax_a, lmin=lmin_a, npgf=npgf_a, nset=nseta, &
-                             pgf_radius=rpgf_a, zet=zeta_a)
-      CALL get_gto_basis_set(basis_b, lmax=lmax_b, lmin=lmin_b, npgf=npgf_b, nset=nsetb, &
-                             pgf_radius=rpgf_b, zet=zeta_b)
-
-      do_sym = .FALSE.
-      IF (PRESENT(symmetric)) do_sym = symmetric
-      ia0 = offset_a
-      DO iset = 1, nseta
-         ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
-         ib0 = offset_b
-         DO jset = 1, nsetb
-            ncob = npgf_b(jset)*ncoset(lmax_b(jset))
-            IF (ncoa*ncob > 0) THEN
-               ALLOCATE (sij(ncoa, ncob), SOURCE=0.0_dp)
-               CALL compute_coulomb_2c(integral_context, lmin_a(iset), lmax_a(iset), &
-                                       lmin_b(jset), lmax_b(jset), npgf_a(iset), npgf_b(jset), &
-                                       zeta_a(:, iset), zeta_b(:, jset), rpgf_a(:, iset), &
-                                       rpgf_b(:, jset), ra, rb, sij, potential)
-               mat(ia0 + 1:ia0 + ncoa, ib0 + 1:ib0 + ncob) = sij
-               IF (do_sym) THEN
-                  mat(ib0 + 1:ib0 + ncob, ia0 + 1:ia0 + ncoa) = TRANSPOSE(sij)
-               END IF
-               DEALLOCATE (sij)
-            END IF
-            ib0 = ib0 + ncob
+      CPASSERT(ASSOCIATED(basis_a%sphi))
+      CPASSERT(ASSOCIATED(basis_b%sphi))
+      ALLOCATE (mat(basis_a%nsgf, basis_b%nsgf), SOURCE=0.0_dp)
+      DO iset = 1, basis_a%nset
+         ncoa = basis_a%npgf(iset)*ncoset(basis_a%lmax(iset))
+         nsga = basis_a%nsgf_set(iset)
+         ia0 = basis_a%first_sgf(1, iset) - 1
+         IF (ncoa == 0 .OR. nsga == 0) CYCLE
+         DO jset = 1, basis_b%nset
+            ncob = basis_b%npgf(jset)*ncoset(basis_b%lmax(jset))
+            nsgb = basis_b%nsgf_set(jset)
+            ib0 = basis_b%first_sgf(1, jset) - 1
+            IF (ncob == 0 .OR. nsgb == 0) CYCLE
+            ALLOCATE (sij(ncoa, ncob), SOURCE=0.0_dp)
+            ALLOCATE (tmp(ncoa, nsgb))
+            CALL compute_coulomb_2c(integral_context, basis_a%lmin(iset), basis_a%lmax(iset), &
+                                    basis_b%lmin(jset), basis_b%lmax(jset), &
+                                    basis_a%npgf(iset), basis_b%npgf(jset), &
+                                    basis_a%zet(:, iset), basis_b%zet(:, jset), &
+                                    basis_a%pgf_radius(:, iset), basis_b%pgf_radius(:, jset), &
+                                    ra, rb, sij, potential)
+            CALL dgemm('N', 'N', ncoa, nsgb, ncob, 1.0_dp, sij(1, 1), ncoa, &
+                       basis_b%sphi(1, ib0 + 1), SIZE(basis_b%sphi, 1), 0.0_dp, tmp(1, 1), ncoa)
+            CALL dgemm('T', 'N', nsga, nsgb, ncoa, 1.0_dp, &
+                       basis_a%sphi(1, ia0 + 1), SIZE(basis_a%sphi, 1), tmp(1, 1), ncoa, &
+                       0.0_dp, mat(ia0 + 1, ib0 + 1), SIZE(mat, 1))
+            DEALLOCATE (sij, tmp)
          END DO
-         ia0 = ia0 + ncoa
       END DO
-
-   END SUBROUTINE hfx_lri_fill_2c_block
+   END SUBROUTINE hfx_lri_compute_2c
 
 ! **************************************************************************************************
-!> \brief Fills a raw Cartesian three-center integral block in a dense J matrix.
-!> \param basis_a ...
-!> \param basis_b ...
-!> \param basis_c ...
-!> \param ra ...
-!> \param rb ...
-!> \param rc ...
-!> \param integral_context ...
-!> \param potential integral operator used for this block
-!> \param mat ...
-!> \param offset_c ...
-!> \param ncart_b ...
+!> \brief Contract three-center integrals without storing a full Cartesian pair tensor.
+!>        Stream auxiliary primitives within each shell set and contract the AO indices first.
+!>        The output row order is (a-1)*nsgf_b+b, as in hfx_lri_product_index.
+!> \param basis_a First AO basis.
+!> \param basis_b Second AO basis.
+!> \param basis_c Auxiliary basis.
+!> \param ra First AO center.
+!> \param rb Second AO center.
+!> \param rc Auxiliary center.
+!> \param integral_context Thread-local integral engine.
+!> \param potential Integral operator.
+!> \param mat Contracted spherical three-center matrix.
+!> \param offset_c Number of auxiliary columns preceding this center.
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_fill_3c_block(basis_a, basis_b, basis_c, ra, rb, rc, integral_context, potential, mat, &
-                                    offset_c, ncart_b)
-
+   SUBROUTINE hfx_lri_compute_3c(basis_a, basis_b, basis_c, ra, rb, rc, integral_context, potential, mat, offset_c)
       TYPE(gto_basis_set_type), POINTER                  :: basis_a, basis_b, basis_c
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: ra, rb, rc
       TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       TYPE(coulomb_operator_type), INTENT(IN)            :: potential
       REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: mat
-      INTEGER, INTENT(IN)                                :: offset_c, ncart_b
+      INTEGER, INTENT(IN)                                :: offset_c
 
-      INTEGER                                            :: ia, ia0, ib, ib0, ic0, iset, jset, kset, &
-                                                            ncoa, ncob, ncoc, nseta, nsetb, nsetc
-      INTEGER, DIMENSION(:), POINTER                     :: lmax_a, lmax_b, lmax_c, lmin_a, lmin_b, &
-                                                            lmin_c, npgf_a, npgf_b, npgf_c
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: sijk
-      REAL(dp), DIMENSION(:, :), POINTER                 :: rpgf_a, rpgf_b, rpgf_c, zeta_a, zeta_b, &
-                                                            zeta_c
+      INTEGER                                            :: ia, ia0, ib0, ic, ic0, iset, jset, kco, &
+                                                            kpgf, kset, lco, ncoa, ncob, ncoc, &
+                                                            nsga, nsgb, nsgc, row
+      REAL(dp), ALLOCATABLE                              :: contracted(:, :), pair(:, :), &
+                                                            sij(:, :, :), tmp(:, :)
 
-      CALL get_gto_basis_set(basis_a, lmax=lmax_a, lmin=lmin_a, npgf=npgf_a, nset=nseta, &
-                             pgf_radius=rpgf_a, zet=zeta_a)
-      CALL get_gto_basis_set(basis_b, lmax=lmax_b, lmin=lmin_b, npgf=npgf_b, nset=nsetb, &
-                             pgf_radius=rpgf_b, zet=zeta_b)
-      CALL get_gto_basis_set(basis_c, lmax=lmax_c, lmin=lmin_c, npgf=npgf_c, nset=nsetc, &
-                             pgf_radius=rpgf_c, zet=zeta_c)
-
-      ia0 = 0
-      DO iset = 1, nseta
-         ncoa = npgf_a(iset)*ncoset(lmax_a(iset))
-         ib0 = 0
-         DO jset = 1, nsetb
-            ncob = npgf_b(jset)*ncoset(lmax_b(jset))
-            ic0 = offset_c
-            DO kset = 1, nsetc
-               ncoc = npgf_c(kset)*ncoset(lmax_c(kset))
-               IF (ncoa*ncob*ncoc > 0) THEN
-                  ALLOCATE (sijk(ncoa, ncob, ncoc), SOURCE=0.0_dp)
-                  CALL compute_coulomb_3c(integral_context, lmin_a(iset), lmax_a(iset), &
-                                          lmin_b(jset), lmax_b(jset), lmin_c(kset), lmax_c(kset), &
-                                          npgf_a(iset), npgf_b(jset), npgf_c(kset), zeta_a(:, iset), &
-                                          zeta_b(:, jset), zeta_c(:, kset), rpgf_a(:, iset), &
-                                          rpgf_b(:, jset), rpgf_c(:, kset), ra, rb, rc, sijk, &
-                                          potential)
-                  DO ia = 1, ncoa
-                     DO ib = 1, ncob
-                        mat((ia0 + ia - 1)*ncart_b + ib0 + ib, &
-                            ic0 + 1:ic0 + ncoc) = sijk(ia, ib, :)
-                     END DO
+      CPASSERT(ASSOCIATED(basis_a%sphi))
+      CPASSERT(ASSOCIATED(basis_b%sphi))
+      CPASSERT(ASSOCIATED(basis_c%sphi))
+      CPASSERT(SIZE(mat, 1) == basis_a%nsgf*basis_b%nsgf)
+      CPASSERT(SIZE(mat, 2) >= offset_c + basis_c%nsgf)
+      DO iset = 1, basis_a%nset
+         ncoa = basis_a%npgf(iset)*ncoset(basis_a%lmax(iset))
+         nsga = basis_a%nsgf_set(iset)
+         ia0 = basis_a%first_sgf(1, iset) - 1
+         IF (ncoa == 0 .OR. nsga == 0) CYCLE
+         DO jset = 1, basis_b%nset
+            ncob = basis_b%npgf(jset)*ncoset(basis_b%lmax(jset))
+            nsgb = basis_b%nsgf_set(jset)
+            ib0 = basis_b%first_sgf(1, jset) - 1
+            IF (ncob == 0 .OR. nsgb == 0) CYCLE
+            ALLOCATE (tmp(nsga, ncob))
+            DO kset = 1, basis_c%nset
+               ncoc = ncoset(basis_c%lmax(kset))
+               lco = ncoset(basis_c%lmin(kset) - 1)
+               nsgc = basis_c%nsgf_set(kset)
+               ic0 = basis_c%first_sgf(1, kset) - 1
+               IF (basis_c%npgf(kset) == 0 .OR. nsgc == 0) CYCLE
+               ALLOCATE (sij(ncoa, ncob, ncoc), pair(nsga*nsgb, ncoc - lco))
+               ALLOCATE (contracted(nsga*nsgb, nsgc), SOURCE=0.0_dp)
+               DO kpgf = 1, basis_c%npgf(kset)
+                  sij = 0.0_dp
+                  CALL compute_coulomb_3c(integral_context, basis_a%lmin(iset), basis_a%lmax(iset), &
+                                          basis_b%lmin(jset), basis_b%lmax(jset), &
+                                          basis_c%lmin(kset), basis_c%lmax(kset), &
+                                          basis_a%npgf(iset), basis_b%npgf(jset), 1, &
+                                          basis_a%zet(:, iset), basis_b%zet(:, jset), &
+                                          basis_c%zet(kpgf:kpgf, kset), &
+                                          basis_a%pgf_radius(:, iset), basis_b%pgf_radius(:, jset), &
+                                          basis_c%pgf_radius(kpgf:kpgf, kset), ra, rb, rc, sij, potential)
+                  DO ic = lco + 1, ncoc
+                     CALL dgemm('T', 'N', nsga, ncob, ncoa, 1.0_dp, &
+                                basis_a%sphi(1, ia0 + 1), SIZE(basis_a%sphi, 1), &
+                                sij(1, 1, ic), ncoa, 0.0_dp, tmp(1, 1), nsga)
+                     CALL dgemm('T', 'T', nsgb, nsga, ncob, 1.0_dp, &
+                                basis_b%sphi(1, ib0 + 1), SIZE(basis_b%sphi, 1), &
+                                tmp(1, 1), nsga, 0.0_dp, pair(1, ic - lco), nsgb)
                   END DO
-                  DEALLOCATE (sijk)
-               END IF
-               ic0 = ic0 + ncoc
+                  kco = (kpgf - 1)*ncoc
+                  CALL dgemm('N', 'N', nsga*nsgb, nsgc, ncoc - lco, 1.0_dp, pair(1, 1), nsga*nsgb, &
+                             basis_c%sphi(kco + lco + 1, ic0 + 1), SIZE(basis_c%sphi, 1), &
+                             1.0_dp, contracted(1, 1), nsga*nsgb)
+               END DO
+               DO ia = 1, nsga
+                  row = (ia0 + ia - 1)*basis_b%nsgf + ib0
+                  mat(row + 1:row + nsgb, offset_c + ic0 + 1:offset_c + ic0 + nsgc) = &
+                     contracted((ia - 1)*nsgb + 1:ia*nsgb, :)
+               END DO
+               DEALLOCATE (sij, pair, contracted)
             END DO
-            ib0 = ib0 + ncob
+            DEALLOCATE (tmp)
          END DO
-         ia0 = ia0 + ncoa
       END DO
-
-   END SUBROUTINE hfx_lri_fill_3c_block
-
-! **************************************************************************************************
-!> \brief Builds the raw-Cartesian to spherical/contracted transformation for one basis.
-!> \param basis ...
-!> \param transform ...
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_build_sphi_matrix(basis, transform)
-
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
-         INTENT(OUT)                                     :: transform
-
-      INTEGER                                            :: cart0, iset, ncart_set, nset, nsgf, sgf0
-      INTEGER, DIMENSION(:), POINTER                     :: lmax, npgf, nsgf_set
-      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf
-      REAL(dp), DIMENSION(:, :), POINTER                 :: sphi
-
-      CALL get_gto_basis_set(basis, first_sgf=first_sgf, lmax=lmax, npgf=npgf, nset=nset, &
-                             nsgf=nsgf, nsgf_set=nsgf_set, sphi=sphi)
-      ALLOCATE (transform(hfx_lri_count_cart_functions(basis), nsgf), SOURCE=0.0_dp)
-      cart0 = 0
-      DO iset = 1, nset
-         ncart_set = npgf(iset)*ncoset(lmax(iset))
-         sgf0 = first_sgf(1, iset)
-         IF (ncart_set > 0 .AND. nsgf_set(iset) > 0) THEN
-            transform(cart0 + 1:cart0 + ncart_set, sgf0:sgf0 + nsgf_set(iset) - 1) = &
-               sphi(1:ncart_set, sgf0:sgf0 + nsgf_set(iset) - 1)
-         END IF
-         cart0 = cart0 + ncart_set
-      END DO
-
-   END SUBROUTINE hfx_lri_build_sphi_matrix
-
-! **************************************************************************************************
-!> \brief Builds each basis-kind Cartesian-to-spherical transformation once.
-!> \param basis_set_RI ...
-!> \param transform_cache ...
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_build_ri_transform_cache(basis_set_RI, transform_cache)
-
-      TYPE(gto_basis_set_p_type), DIMENSION(:), &
-         INTENT(IN)                                      :: basis_set_RI
-      TYPE(lri_basis_transform_type), ALLOCATABLE, &
-         DIMENSION(:), INTENT(OUT)                       :: transform_cache
-
-      INTEGER                                            :: ikind
-      TYPE(gto_basis_set_type), POINTER                  :: basis
-
-      NULLIFY (basis)
-      ALLOCATE (transform_cache(SIZE(basis_set_RI)))
-      DO ikind = 1, SIZE(basis_set_RI)
-         basis => basis_set_RI(ikind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis)) CYCLE
-         CALL get_gto_basis_set(basis, kind_radius=transform_cache(ikind)%radius)
-         CALL hfx_lri_build_sphi_matrix(basis, transform_cache(ikind)%sphi)
-      END DO
-
-   END SUBROUTINE hfx_lri_build_ri_transform_cache
-
-! **************************************************************************************************
-!> \brief Applies the two AO transformations to a three-center block without forming their
-!>        Kronecker product.
-!> \param j_cart ...
-!> \param sphi_a ...
-!> \param sphi_b ...
-!> \param j_sph ...
-! **************************************************************************************************
-   SUBROUTINE hfx_lri_transform_ao_pair(j_cart, sphi_a, sphi_b, j_sph)
-
-      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: j_cart, sphi_a, sphi_b
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :), &
-         INTENT(OUT)                                     :: j_sph
-
-      INTEGER                                            :: iaux, naux, ncart_a, ncart_b, nsgf_a, &
-                                                            nsgf_b
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: cart_matrix, sph_matrix, tmp_b
-
-      ncart_a = SIZE(sphi_a, 1)
-      ncart_b = SIZE(sphi_b, 1)
-      nsgf_a = SIZE(sphi_a, 2)
-      nsgf_b = SIZE(sphi_b, 2)
-      naux = SIZE(j_cart, 2)
-      IF (SIZE(j_cart, 1) /= ncart_a*ncart_b) THEN
-         CPABORT("Inconsistent AO-product dimension in LRI-HFXk three-center transformation")
-      END IF
-
-      ALLOCATE (cart_matrix(ncart_b, ncart_a))
-      ALLOCATE (tmp_b(nsgf_b, ncart_a))
-      ALLOCATE (sph_matrix(nsgf_b, nsgf_a))
-      ALLOCATE (j_sph(nsgf_a*nsgf_b, naux))
-      DO iaux = 1, naux
-         ! hfx_lri_fill_3c_block stores the second AO index contiguously.
-         cart_matrix(:, :) = RESHAPE(j_cart(:, iaux), [ncart_b, ncart_a])
-         tmp_b(:, :) = MATMUL(TRANSPOSE(sphi_b), cart_matrix)
-         sph_matrix(:, :) = MATMUL(tmp_b, sphi_a)
-         ! The resulting row order is (a-1)*nsgf_b+b, matching hfx_lri_product_index.
-         j_sph(:, iaux) = RESHAPE(sph_matrix, [nsgf_a*nsgf_b])
-      END DO
-
-   END SUBROUTINE hfx_lri_transform_ao_pair
+   END SUBROUTINE hfx_lri_compute_3c
 
 ! **************************************************************************************************
 !> \brief Compares (mu nu|P) with the independently evaluated (nu mu|P), accounting for the
@@ -1032,34 +906,28 @@ CONTAINS
 !> \param pair_block ...
 !> \param ri_data ...
 !> \param integral_context ...
-!> \param ao_transform_cache ...
-!> \param ri_transform_cache ...
 !> \param metric_cache ...
 !> \param diagnostic pair-metric and fitting diagnostics
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_build_pair_coefficients(basis_set_AO, basis_set_RI, pair_block, ri_data, &
-                                              integral_context, ao_transform_cache, &
-                                              ri_transform_cache, metric_cache, diagnostic)
+                                              integral_context, metric_cache, diagnostic)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_AO, basis_set_RI
       TYPE(hfx_lri_pair_block_type), INTENT(INOUT)       :: pair_block
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
-      TYPE(lri_basis_transform_type), DIMENSION(:), &
-         INTENT(IN)                                      :: ao_transform_cache, ri_transform_cache
       TYPE(hfx_lri_metric_cache_type), INTENT(INOUT)     :: metric_cache
       TYPE(hfx_lri_pair_diagnostic_type), INTENT(OUT), &
          OPTIONAL                                        :: diagnostic
 
-      INTEGER :: cache_slot, discarded_modes, ikind, jkind, metric_dim, ncart_ai, ncart_aj, &
-         ncart_ri, ncart_rj, offset_j, retained_modes, reverse_metric_dim
+      INTEGER                                            :: cache_slot, discarded_modes, ikind, &
+                                                            jkind, retained_modes
       LOGICAL                                            :: cache_transpose, metric_zero
       REAL(dp)                                           :: c_norm, condition_number, eig_max, &
                                                             eig_min, j_norm, metric_norm
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :) :: c_sph, fit_difference, j_aux_cart, j_cart, &
-         j_reverse_aux_cart, j_reverse_cart, j_reverse_sph, j_sph, metric_sph, reverse_sphi_aux, &
-         sphi_aux
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: c_sph, fit_difference, j_reverse_sph, &
+                                                            j_sph, metric_sph
       REAL(dp), DIMENSION(3)                             :: r0, reverse_rab
       TYPE(gto_basis_set_type), POINTER                  :: obas_i, obas_j, rbas_i, rbas_j
 
@@ -1081,42 +949,19 @@ CONTAINS
           .NOT. ASSOCIATED(rbas_i) .OR. .NOT. ASSOCIATED(rbas_j)) THEN
          CPABORT("Missing basis in LRI-HFXk pair coefficient build")
       END IF
-      IF (.NOT. ALLOCATED(ao_transform_cache(ikind)%sphi) .OR. &
-          .NOT. ALLOCATED(ao_transform_cache(jkind)%sphi) .OR. &
-          .NOT. ALLOCATED(ri_transform_cache(ikind)%sphi) .OR. &
-          .NOT. ALLOCATED(ri_transform_cache(jkind)%sphi)) THEN
-         CPABORT("Missing basis transformation in LRI-HFXk pair coefficient build")
-      END IF
-
-      ncart_ai = SIZE(ao_transform_cache(ikind)%sphi, 1)
-      ncart_aj = SIZE(ao_transform_cache(jkind)%sphi, 1)
-      ncart_ri = SIZE(ri_transform_cache(ikind)%sphi, 1)
-      ncart_rj = SIZE(ri_transform_cache(jkind)%sphi, 1)
-      metric_dim = ncart_ri
-      IF (.NOT. pair_block%onsite_pair) metric_dim = metric_dim + ncart_rj
       IF (pair_block%naux_pair /= pair_block%naux_i + &
           MERGE(0, pair_block%naux_j, pair_block%onsite_pair)) THEN
          CPABORT("Inconsistent auxiliary dimension in LRI-HFXk pair coefficient build")
       END IF
 
       r0(:) = 0.0_dp
-      ALLOCATE (j_cart(ncart_ai*ncart_aj, metric_dim), SOURCE=0.0_dp)
-      ! The pair fit is defined by RI_METRIC: J=(mu nu|P)_M and M=(P|Q)_M.
-      ! The physical HFX operator enters only later through the lattice V table.
-      CALL hfx_lri_fill_3c_block(obas_i, obas_j, rbas_i, r0, pair_block%rab, r0, &
-                                 integral_context, ri_data%ri_metric, j_cart, 0, ncart_aj)
+      ALLOCATE (j_sph(pair_block%nao_i*pair_block%nao_j, pair_block%naux_pair), SOURCE=0.0_dp)
+      ! The pair fit uses RI_METRIC for both J and M. Contract each primitive block immediately.
+      CALL hfx_lri_compute_3c(obas_i, obas_j, rbas_i, r0, pair_block%rab, r0, &
+                              integral_context, ri_data%ri_metric, j_sph, 0)
       IF (.NOT. pair_block%onsite_pair) THEN
-         offset_j = ncart_ri
-         CALL hfx_lri_fill_3c_block(obas_i, obas_j, rbas_j, r0, pair_block%rab, &
-                                    pair_block%rab, integral_context, ri_data%ri_metric, j_cart, offset_j, &
-                                    ncart_aj)
-      END IF
-
-      ALLOCATE (sphi_aux(metric_dim, pair_block%naux_pair), SOURCE=0.0_dp)
-      sphi_aux(1:ncart_ri, 1:pair_block%naux_i) = ri_transform_cache(ikind)%sphi
-      IF (.NOT. pair_block%onsite_pair) THEN
-         sphi_aux(ncart_ri + 1:metric_dim, pair_block%naux_i + 1:pair_block%naux_pair) = &
-            ri_transform_cache(jkind)%sphi
+         CALL hfx_lri_compute_3c(obas_i, obas_j, rbas_j, r0, pair_block%rab, pair_block%rab, &
+                                 integral_context, ri_data%ri_metric, j_sph, pair_block%naux_i)
       END IF
 
       ! Assemble S^T M S from cached center-center blocks. This is algebraically identical to
@@ -1124,7 +969,7 @@ CONTAINS
       ! every AO pair and removes the dense Cartesian pair-metric workspace.
       ALLOCATE (metric_sph(pair_block%naux_pair, pair_block%naux_pair), SOURCE=0.0_dp)
       CALL hfx_lri_metric_cache_get( &
-         basis_set_RI, ri_transform_cache, ri_data, integral_context, ikind, ikind, r0, r0, &
+         basis_set_RI, ri_data, integral_context, ikind, ikind, r0, r0, &
          metric_cache, cache_slot, cache_transpose, metric_zero)
       IF (.NOT. metric_zero) THEN
          IF (ANY(SHAPE(metric_cache%entries(cache_slot)%values) /= &
@@ -1141,7 +986,7 @@ CONTAINS
       END IF
       IF (.NOT. pair_block%onsite_pair) THEN
          CALL hfx_lri_metric_cache_get( &
-            basis_set_RI, ri_transform_cache, ri_data, integral_context, ikind, jkind, &
+            basis_set_RI, ri_data, integral_context, ikind, jkind, &
             r0, pair_block%rab, metric_cache, cache_slot, cache_transpose, metric_zero)
          IF (.NOT. metric_zero) THEN
             IF (cache_transpose) THEN
@@ -1164,7 +1009,7 @@ CONTAINS
                                     pair_block%naux_i + 1:pair_block%naux_pair))
          END IF
          CALL hfx_lri_metric_cache_get( &
-            basis_set_RI, ri_transform_cache, ri_data, integral_context, jkind, jkind, &
+            basis_set_RI, ri_data, integral_context, jkind, jkind, &
             pair_block%rab, pair_block%rab, metric_cache, cache_slot, cache_transpose, metric_zero)
          IF (.NOT. metric_zero) THEN
             IF (ANY(SHAPE(metric_cache%entries(cache_slot)%values) /= &
@@ -1183,46 +1028,19 @@ CONTAINS
          END IF
       END IF
 
-      ALLOCATE (j_aux_cart(ncart_ai*ncart_aj, pair_block%naux_pair))
-      j_aux_cart(:, :) = MATMUL(j_cart, sphi_aux)
-      DEALLOCATE (j_cart, sphi_aux)
-      CALL hfx_lri_transform_ao_pair(j_aux_cart, ao_transform_cache(ikind)%sphi, &
-                                     ao_transform_cache(jkind)%sphi, j_sph)
-      DEALLOCATE (j_aux_cart)
-
       IF (PRESENT(diagnostic)) THEN
          ! Re-evaluate the three-centre integrals after interchanging the two AO centres. This is
          ! intentionally independent of the forward J array and catches AO-product ordering,
          ! auxiliary-centre ordering, and Cartesian-to-spherical transformation mistakes that a
          ! same-data C*M=J residual cannot expose.
          reverse_rab(:) = -pair_block%rab(:)
-         reverse_metric_dim = ncart_rj
-         IF (.NOT. pair_block%onsite_pair) reverse_metric_dim = reverse_metric_dim + ncart_ri
-         ALLOCATE (j_reverse_cart(ncart_aj*ncart_ai, reverse_metric_dim), SOURCE=0.0_dp)
-         CALL hfx_lri_fill_3c_block( &
-            obas_j, obas_i, rbas_j, r0, reverse_rab, r0, integral_context, &
-            ri_data%ri_metric, j_reverse_cart, 0, ncart_ai)
+         ALLOCATE (j_reverse_sph(pair_block%nao_j*pair_block%nao_i, pair_block%naux_pair), SOURCE=0.0_dp)
+         CALL hfx_lri_compute_3c(obas_j, obas_i, rbas_j, r0, reverse_rab, r0, &
+                                 integral_context, ri_data%ri_metric, j_reverse_sph, 0)
          IF (.NOT. pair_block%onsite_pair) THEN
-            CALL hfx_lri_fill_3c_block( &
-               obas_j, obas_i, rbas_i, r0, reverse_rab, reverse_rab, integral_context, &
-               ri_data%ri_metric, j_reverse_cart, ncart_rj, ncart_ai)
+            CALL hfx_lri_compute_3c(obas_j, obas_i, rbas_i, r0, reverse_rab, reverse_rab, &
+                                    integral_context, ri_data%ri_metric, j_reverse_sph, pair_block%naux_j)
          END IF
-
-         ALLOCATE (reverse_sphi_aux(reverse_metric_dim, pair_block%naux_pair), SOURCE=0.0_dp)
-         reverse_sphi_aux(1:ncart_rj, 1:pair_block%naux_j) = &
-            ri_transform_cache(jkind)%sphi
-         IF (.NOT. pair_block%onsite_pair) THEN
-            reverse_sphi_aux(ncart_rj + 1:reverse_metric_dim, &
-                             pair_block%naux_j + 1:pair_block%naux_pair) = &
-               ri_transform_cache(ikind)%sphi
-         END IF
-         ALLOCATE (j_reverse_aux_cart(ncart_aj*ncart_ai, pair_block%naux_pair))
-         j_reverse_aux_cart(:, :) = MATMUL(j_reverse_cart, reverse_sphi_aux)
-         DEALLOCATE (j_reverse_cart, reverse_sphi_aux)
-         CALL hfx_lri_transform_ao_pair( &
-            j_reverse_aux_cart, ao_transform_cache(jkind)%sphi, &
-            ao_transform_cache(ikind)%sphi, j_reverse_sph)
-         DEALLOCATE (j_reverse_aux_cart)
          CALL hfx_lri_three_center_exchange_check( &
             j_sph, j_reverse_sph, pair_block%nao_i, pair_block%nao_j, &
             pair_block%naux_i, pair_block%naux_j, pair_block%onsite_pair, &
@@ -2221,24 +2039,20 @@ CONTAINS
 !> \brief Evaluates one canonical table entry with a thread-private integral context.
 !> \param metric_entry ...
 !> \param basis_set_RI ...
-!> \param ri_transform_cache ...
 !> \param ri_data ...
 !> \param integral_context ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_metric_table_compute_entry(metric_entry, basis_set_RI, ri_transform_cache, &
+   SUBROUTINE hfx_lri_metric_table_compute_entry(metric_entry, basis_set_RI, &
                                                  ri_data, integral_context)
 
       TYPE(hfx_lri_metric_entry_type), INTENT(INOUT)     :: metric_entry
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_RI
-      TYPE(lri_basis_transform_type), DIMENSION(:), &
-         INTENT(IN)                                      :: ri_transform_cache
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
 
       INTEGER                                            :: kind_left, kind_right
       REAL(dp)                                           :: block_norm2, screen_distance
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: tmp, v_raw
       REAL(dp), DIMENSION(3)                             :: r0
       TYPE(gto_basis_set_type), POINTER                  :: basis_left, basis_right
 
@@ -2247,32 +2061,21 @@ CONTAINS
       kind_right = metric_entry%kind_right
       r0(:) = 0.0_dp
       metric_entry%zero = .FALSE.
-      screen_distance = ri_transform_cache(kind_left)%radius + &
-                        ri_transform_cache(kind_right)%radius + &
+      basis_left => basis_set_RI(kind_left)%gto_basis_set
+      basis_right => basis_set_RI(kind_right)%gto_basis_set
+      IF (.NOT. ASSOCIATED(basis_left) .OR. .NOT. ASSOCIATED(basis_right)) THEN
+         CPABORT("Missing basis data in LRI-HFXk metric")
+      END IF
+      screen_distance = basis_left%kind_radius + &
+                        basis_right%kind_radius + &
                         coulomb_cutoff_screen_factor*ri_data%hfx_pot%cutoff_radius
       IF (SUM(metric_entry%displacement**2) > screen_distance*screen_distance) THEN
          metric_entry%zero = .TRUE.
          RETURN
       END IF
 
-      basis_left => basis_set_RI(kind_left)%gto_basis_set
-      basis_right => basis_set_RI(kind_right)%gto_basis_set
-      IF (.NOT. ASSOCIATED(basis_left) .OR. .NOT. ASSOCIATED(basis_right) .OR. &
-          .NOT. ALLOCATED(ri_transform_cache(kind_left)%sphi) .OR. &
-          .NOT. ALLOCATED(ri_transform_cache(kind_right)%sphi)) THEN
-         CPABORT("Missing basis data while building the LRI-HFXk metric table")
-      END IF
-
-      ALLOCATE (v_raw(SIZE(ri_transform_cache(kind_left)%sphi, 1), &
-                      SIZE(ri_transform_cache(kind_right)%sphi, 1)), SOURCE=0.0_dp)
-      CALL hfx_lri_fill_2c_block(basis_left, basis_right, r0, metric_entry%displacement, &
-                                 integral_context, ri_data%hfx_pot, v_raw, 0, 0)
-      ALLOCATE (tmp(SIZE(v_raw, 1), SIZE(ri_transform_cache(kind_right)%sphi, 2)))
-      tmp(:, :) = MATMUL(v_raw, ri_transform_cache(kind_right)%sphi)
-      ALLOCATE (metric_entry%values(SIZE(ri_transform_cache(kind_left)%sphi, 2), &
-                                    SIZE(ri_transform_cache(kind_right)%sphi, 2)))
-      metric_entry%values(:, :) = MATMUL(TRANSPOSE(ri_transform_cache(kind_left)%sphi), tmp)
-      DEALLOCATE (tmp, v_raw)
+      CALL hfx_lri_compute_2c(basis_left, basis_right, r0, metric_entry%displacement, &
+                              integral_context, ri_data%hfx_pot, metric_entry%values)
       block_norm2 = SUM(metric_entry%values**2)
       IF (block_norm2 == 0.0_dp) THEN
          DEALLOCATE (metric_entry%values)
@@ -2663,7 +2466,6 @@ CONTAINS
 !> \param density_cache ...
 !> \param target_pairs ...
 !> \param basis_set_RI ...
-!> \param ri_transform_cache ...
 !> \param particle_set ...
 !> \param cell ...
 !> \param stable_images use the deterministic k-point image gauge used by the neighbor list
@@ -2671,7 +2473,7 @@ CONTAINS
 !> \param filter_eps ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_metric_lattice_build( &
-      ri_data, pair_lookup, density_cache, target_pairs, basis_set_RI, ri_transform_cache, &
+      ri_data, pair_lookup, density_cache, target_pairs, basis_set_RI, &
       particle_set, cell, stable_images, maxl_ri, filter_eps)
 
       TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
@@ -2681,8 +2483,6 @@ CONTAINS
          INTENT(IN)                                      :: target_pairs
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_RI
-      TYPE(lri_basis_transform_type), DIMENSION(:), &
-         INTENT(IN)                                      :: ri_transform_cache
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(cell_type), POINTER                           :: cell
       LOGICAL, INTENT(IN)                                :: stable_images
@@ -2740,13 +2540,13 @@ CONTAINS
          batch_last = MIN(unique_entries, batch_first + batch_size*nranks - 1)
          !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(DYNAMIC, 1) &
          !$OMP SHARED(atom_position, basis_set_RI, batch_first, batch_last, buffer, cell, &
-         !$OMP        integral_contexts, mepos, metric_table, nranks, ri_data, ri_transform_cache) &
+         !$OMP        integral_contexts, mepos, metric_table, nranks, ri_data) &
          !$OMP PRIVATE(ientry, ithread)
          DO ientry = batch_first + mepos, batch_last, nranks
             ithread = 1
 !$          ithread = omp_get_thread_num() + 1
             CALL hfx_lri_metric_table_compute_entry(metric_table%entries(ientry), basis_set_RI, &
-                                                    ri_transform_cache, ri_data, integral_contexts(ithread))
+                                                    ri_data, integral_contexts(ithread))
             IF (ALLOCATED(metric_table%entries(ientry)%values)) THEN
                CALL hfx_lri_metric_lattice_add_entry(ri_data%lri_kp, metric_table%entries(ientry), &
                                                      atom_position, cell, buffer)
@@ -4768,8 +4568,6 @@ CONTAINS
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: target_pairs
       TYPE(kpoint_type), POINTER                         :: kpoints
-      TYPE(lri_basis_transform_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: ri_transform_cache
       TYPE(lri_density_cache_type)                       :: density_cache
       TYPE(lri_pair_lookup_type)                         :: pair_lookup
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
@@ -4811,8 +4609,9 @@ CONTAINS
       CALL hfx_lri_distribute_density(ri_data%lri_kp, density_cache, density_keys, ri_data%filter_eps)
       IF (.NOT. need_geometry) THEN
          support_changed = ANY(SHAPE(density_keys) /= SHAPE(ri_data%lri_kp%parallel%density_keys))
-         IF (.NOT. support_changed) &
+         IF (.NOT. support_changed) THEN
             support_changed = ANY(density_keys /= ri_data%lri_kp%parallel%density_keys)
+         END IF
          IF (SIZE(target_pairs) /= SIZE(ri_data%lri_kp%target_pairs)) THEN
             support_changed = .TRUE.
          ELSE
@@ -4859,7 +4658,6 @@ CONTAINS
             END IF
          END DO
          CALL hfx_lri_pair_lookup_create(pair_lookup, ri_data%lri_kp%pair_blocks, natom)
-         CALL hfx_lri_build_ri_transform_cache(basis_set_RI, ri_transform_cache)
          maxl_ri = 0
          DO ikind = 1, nkind
             ri_basis => basis_set_RI(ikind)%gto_basis_set
@@ -4874,7 +4672,7 @@ CONTAINS
             ri_data%lri_kp, natom, grid, twist, ri_data%filter_eps)
          CALL hfx_lri_metric_lattice_build( &
             ri_data, pair_lookup, density_cache, target_pairs, basis_set_RI, &
-            ri_transform_cache, particle_set, cell, kpoint_symmetry, maxl_ri, ri_data%filter_eps_2c)
+            particle_set, cell, kpoint_symmetry, maxl_ri, ri_data%filter_eps_2c)
 
          CALL hfx_lri_task_plan(ri_data%lri_kp, ri_data%unit_nr)
 
@@ -4949,8 +4747,9 @@ CONTAINS
          ipair = ri_data%lri_kp%k_target(key)
          IF (ipair == 0) CYCLE
          IF (ANY(ri_data%lri_kp%target_pairs(ipair)%cell < LBOUND(cell_to_index)) .OR. &
-             ANY(ri_data%lri_kp%target_pairs(ipair)%cell > UBOUND(cell_to_index))) &
+             ANY(ri_data%lri_kp%target_pairs(ipair)%cell > UBOUND(cell_to_index))) THEN
             CPABORT("LRI-HFXk target cell is outside the k-point image map")
+         END IF
          img = cell_to_index(ri_data%lri_kp%target_pairs(ipair)%cell(1), &
                              ri_data%lri_kp%target_pairs(ipair)%cell(2), ri_data%lri_kp%target_pairs(ipair)%cell(3))
          CPASSERT(img >= 1 .AND. img <= SIZE(ks_matrix, 2))
@@ -5001,7 +4800,6 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Returns a cached spherical two-center auxiliary block.
 !> \param basis_set_RI ...
-!> \param ri_transform_cache ...
 !> \param ri_data ...
 !> \param integral_context ...
 !> \param kind_left ...
@@ -5013,15 +4811,13 @@ CONTAINS
 !> \param use_transpose ...
 !> \param is_zero ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_metric_cache_get(basis_set_RI, ri_transform_cache, ri_data, &
+   SUBROUTINE hfx_lri_metric_cache_get(basis_set_RI, ri_data, &
                                        integral_context, kind_left, kind_right, &
                                        r_left, r_right, metric_cache, islot, &
                                        use_transpose, is_zero)
 
       TYPE(gto_basis_set_p_type), DIMENSION(:), &
          INTENT(IN)                                      :: basis_set_RI
-      TYPE(lri_basis_transform_type), DIMENSION(:), &
-         INTENT(IN)                                      :: ri_transform_cache
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
       TYPE(coulomb_integral_context_type), INTENT(INOUT) :: integral_context
       INTEGER, INTENT(IN)                                :: kind_left, kind_right
@@ -5035,15 +4831,12 @@ CONTAINS
                                                             reverse_set
       INTEGER(int_8)                                     :: oldest_stamp
       REAL(dp)                                           :: block_norm2, screen_distance
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: tmp, v_raw
       REAL(dp), DIMENSION(3)                             :: displacement
       TYPE(gto_basis_set_type), POINTER                  :: basis_left, basis_right
 
       NULLIFY (basis_left, basis_right)
       IF (kind_left < 1 .OR. kind_left > SIZE(basis_set_RI) .OR. &
-          kind_right < 1 .OR. kind_right > SIZE(basis_set_RI) .OR. &
-          kind_left > SIZE(ri_transform_cache) .OR. &
-          kind_right > SIZE(ri_transform_cache)) THEN
+          kind_right < 1 .OR. kind_right > SIZE(basis_set_RI)) THEN
          CPABORT("Invalid basis kind in LRI-HFXk metric cache")
       END IF
       use_transpose = .FALSE.
@@ -5054,8 +4847,13 @@ CONTAINS
       ! Match the shell-distance test in eri_2center before touching either Libint or the cache.
       ! The kind radius bounds every primitive radius, hence this rejects only blocks for which all
       ! primitive pairs are screened by the RI metric cutoff.
-      screen_distance = ri_transform_cache(kind_left)%radius + &
-                        ri_transform_cache(kind_right)%radius + &
+      basis_left => basis_set_RI(kind_left)%gto_basis_set
+      basis_right => basis_set_RI(kind_right)%gto_basis_set
+      IF (.NOT. ASSOCIATED(basis_left) .OR. .NOT. ASSOCIATED(basis_right)) THEN
+         CPABORT("Missing basis data in LRI-HFXk metric")
+      END IF
+      screen_distance = basis_left%kind_radius + &
+                        basis_right%kind_radius + &
                         coulomb_cutoff_screen_factor*ri_data%ri_metric%cutoff_radius
       IF (SUM(displacement**2) > screen_distance*screen_distance) THEN
          is_zero = .TRUE.
@@ -5121,30 +4919,12 @@ CONTAINS
       END DO
       IF (islot == 0) islot = oldest_slot
 
-      basis_left => basis_set_RI(kind_left)%gto_basis_set
-      basis_right => basis_set_RI(kind_right)%gto_basis_set
-      IF (.NOT. ASSOCIATED(basis_left) .OR. .NOT. ASSOCIATED(basis_right) .OR. &
-          .NOT. ALLOCATED(ri_transform_cache(kind_left)%sphi) .OR. &
-          .NOT. ALLOCATED(ri_transform_cache(kind_right)%sphi)) THEN
-         CPABORT("Missing basis data in LRI-HFXk metric cache")
-      END IF
-
       IF (ALLOCATED(metric_cache%entries(islot)%values)) THEN
          DEALLOCATE (metric_cache%entries(islot)%values)
       END IF
       metric_cache%entries(islot)%zero = .FALSE.
-      ALLOCATE (v_raw(SIZE(ri_transform_cache(kind_left)%sphi, 1), &
-                      SIZE(ri_transform_cache(kind_right)%sphi, 1)), SOURCE=0.0_dp)
-      CALL hfx_lri_fill_2c_block(basis_left, basis_right, r_left, r_right, integral_context, &
-                                 ri_data%ri_metric, v_raw, 0, 0)
-      ALLOCATE (tmp(SIZE(v_raw, 1), SIZE(ri_transform_cache(kind_right)%sphi, 2)))
-      tmp(:, :) = MATMUL(v_raw, ri_transform_cache(kind_right)%sphi)
-      ALLOCATE (metric_cache%entries(islot)%values( &
-                SIZE(ri_transform_cache(kind_left)%sphi, 2), &
-                SIZE(ri_transform_cache(kind_right)%sphi, 2)))
-      metric_cache%entries(islot)%values(:, :) = &
-         MATMUL(TRANSPOSE(ri_transform_cache(kind_left)%sphi), tmp)
-      DEALLOCATE (tmp, v_raw)
+      CALL hfx_lri_compute_2c(basis_left, basis_right, r_left, r_right, &
+                              integral_context, ri_data%ri_metric, metric_cache%entries(islot)%values)
       block_norm2 = SUM(metric_cache%entries(islot)%values**2)
       ! Cache an exactly zero backend result without retaining its dense storage. No numerical
       ! threshold is applied here; EPS_FILTER_2C is evaluated on the assembled pair block below.
@@ -5761,8 +5541,9 @@ CONTAINS
          ni = lri_kp%atom_ao_offset(i + 1) - lri_kp%atom_ao_offset(i)
          nj = lri_kp%atom_ao_offset(j + 1) - lri_kp%atom_ao_offset(j)
          IF (.NOT. ALLOCATED(blocks(key)%values)) ALLOCATE (blocks(key)%values(ni, nj), SOURCE=0.0_dp)
-         IF (.NOT. ALLOCATED(blocks(reverse_key)%values)) &
+         IF (.NOT. ALLOCATED(blocks(reverse_key)%values)) THEN
             ALLOCATE (blocks(reverse_key)%values(nj, ni), SOURCE=0.0_dp)
+         END IF
          difference = MAXVAL(ABS(blocks(key)%values - factor*TRANSPOSE(blocks(reverse_key)%values)))
          residual = MAX(residual, difference/scale)
          ALLOCATE (symmetric, SOURCE=0.5_dp*(blocks(key)%values + factor*TRANSPOSE(blocks(reverse_key)%values)))
@@ -5812,12 +5593,15 @@ CONTAINS
             density_bytes = density_bytes + INT(SIZE(density(key)%values), int_8)*8_int_8
          END IF
          IF (ri_data%lri_kp%parallel%owner(key) /= rank) CYCLE
-         IF (ALLOCATED(ri_data%lri_kp%centered_blocks(key)%values)) &
+         IF (ALLOCATED(ri_data%lri_kp%centered_blocks(key)%values)) THEN
             integral_bytes = integral_bytes + INT(SIZE(ri_data%lri_kp%centered_blocks(key)%values), int_8)*16_int_8
-         IF (ALLOCATED(ri_data%lri_kp%centered_blocks(key)%inner_values)) &
+         END IF
+         IF (ALLOCATED(ri_data%lri_kp%centered_blocks(key)%inner_values)) THEN
             integral_bytes = integral_bytes + INT(SIZE(ri_data%lri_kp%centered_blocks(key)%inner_values), int_8)*16_int_8
-         IF (ALLOCATED(ri_data%lri_kp%lattice_metric(key)%values)) &
+         END IF
+         IF (ALLOCATED(ri_data%lri_kp%lattice_metric(key)%values)) THEN
             integral_bytes = integral_bytes + INT(SIZE(ri_data%lri_kp%lattice_metric(key)%values), int_8)*8_int_8
+         END IF
       END DO
       CALL ri_data%lri_kp%parallel%para_env%max(present_flags)
       CALL ri_data%lri_kp%parallel%para_env%sum(integral_bytes)
