@@ -263,6 +263,7 @@ list(
   hfx_exx.F
   hfx_helpers.F
   hfx_load_balance_methods.F
+  hfx_lri_basis.F
   hfx_lri_contract.F
   hfx_lri_kp.F
   hfx_lri_lattice.F

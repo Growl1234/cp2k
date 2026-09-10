@@ -593,7 +593,11 @@ CONTAINS
                           description="Selects the RI-HFX backend used for k-point calculations. "// &
                           "EXTENDED is the current image/extended-RI implementation. "// &
                           "LRI selects the new pair-local LRI backend. The LRI backend is initially "// &
-                          "a development path for short-range HSE and truncated-Coulomb exchange.", &
+                          "a development path for short-range HSE and truncated-Coulomb exchange. "// &
+                          "For LRI, missing RI_HFX bases are generated from contracted ORB products. "// &
+                          "AUTO_BASIS RI_HFX SMALL/MEDIUM/LARGE/HUGE sets the maximum relative squared "// &
+                          "radial L2 product error to 1E-4/1E-6/1E-8/1E-10, respectively; this is not "// &
+                          "an exchange-energy error bound. Explicit RI_HFX bases take precedence.", &
                           usage="KP_RI_METHOD {EXTENDED|LRI}", &
                           repeats=.FALSE., &
                           default_i_val=hfx_ri_kp_extended, &
