@@ -246,6 +246,7 @@ list(
   hfx_exx.F
   hfx_helpers.F
   hfx_libint_interface.F
+  hfx_lri_basis.F
   hfx_lri_contract.F
   hfx_lri_lattice.F
   hfx_lri_kp.F
