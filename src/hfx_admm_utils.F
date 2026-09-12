@@ -60,6 +60,7 @@ MODULE hfx_admm_utils
    USE external_potential_types,        ONLY: copy_potential
    USE hfx_derivatives,                 ONLY: derivatives_four_center
    USE hfx_energy_potential,            ONLY: integrate_four_center
+   USE hfx_lri_kp,                      ONLY: hfx_lri_update_ks_kp
    USE hfx_pw_methods,                  ONLY: pw_hfx
    USE hfx_ri,                          ONLY: hfx_ri_update_forces,&
                                               hfx_ri_update_ks
@@ -75,6 +76,8 @@ MODULE hfx_admm_utils
         do_potential_coulomb, do_potential_id, do_potential_long, do_potential_mix_cl, &
         do_potential_mix_cl_trunc, do_potential_short, do_potential_truncated, &
         xc_funct_no_shortcut, xc_none
+   USE input_cp2k_hfx,                  ONLY: hfx_ri_kp_extended,&
+                                              hfx_ri_kp_lri
    USE input_section_types,             ONLY: section_vals_duplicate,&
                                               section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -1070,11 +1073,23 @@ CONTAINS
             CPABORT("Only RI-HFX is implemented for K-points")
          END IF
 
-         CALL hfx_ri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
-                                  rho_ao_orb, s_mstruct_changed, nspins, &
-                                  x_data(irep, 1)%general_parameter%fraction)
+         SELECT CASE (x_data(irep, 1)%ri_data%kp_ri_method)
+         CASE (hfx_ri_kp_extended)
+            CALL hfx_ri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
+                                     rho_ao_orb, s_mstruct_changed, nspins, &
+                                     x_data(irep, 1)%general_parameter%fraction)
+         CASE (hfx_ri_kp_lri)
+            CALL hfx_lri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
+                                      rho_ao_orb, s_mstruct_changed, nspins, &
+                                      x_data(irep, 1)%general_parameter%fraction)
+         CASE DEFAULT
+            CPABORT("Unknown k-point RI-HFX backend")
+         END SELECT
 
          IF (calculate_forces) THEN
+            IF (x_data(irep, 1)%ri_data%kp_ri_method == hfx_ri_kp_lri) THEN
+               CPABORT("Forces are not implemented for the LRI-HFXk backend")
+            END IF
             !Scale auxiliary density matrix for ADMMP (see Merlot2014) with gsi(ispin) to scale force
             IF (dft_control%do_admm) THEN
                CALL scale_dm(qs_env, rho_ao_orb, scale_back=.FALSE.)
@@ -1266,6 +1281,12 @@ CONTAINS
          ehfx = 0.0_dp
 
          IF (x_data(irep, 1)%do_hfx_ri) THEN
+
+            IF (x_data(irep, 1)%ri_data%kp_ri_method == hfx_ri_kp_lri) THEN
+               CALL cp_abort(__LOCATION__, "The LRI-HFX backend is currently only available "// &
+                             "for k-point calculations. Use KPOINTS or select the default "// &
+                             "RI-HFX backend for Gamma-only HFX.")
+            END IF
 
             CALL hfx_ri_update_ks(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
                                   mo_array, rho_ao_orb, &

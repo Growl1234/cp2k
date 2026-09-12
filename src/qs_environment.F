@@ -85,6 +85,7 @@ MODULE qs_environment
                                               se_header,&
                                               tblite_header,&
                                               xtb_header
+   USE hfx_lri_basis,                   ONLY: create_hfx_lri_basis
    USE hfx_types,                       ONLY: compare_hfx_sections,&
                                               hfx_create
    USE input_constants,                 ONLY: &
@@ -99,6 +100,7 @@ MODULE qs_environment
         wfi_linear_wf_method_nr, wfi_use_guess_method_nr, wfi_use_prev_wf_method_nr, &
         xc_vdw_fun_none, xc_vdw_fun_nonloc, xc_vdw_fun_pairpot, xtb_vdw_type_d3, xtb_vdw_type_d4, &
         xtb_vdw_type_none
+   USE input_cp2k_hfx,                  ONLY: hfx_ri_kp_lri
    USE input_section_types,             ONLY: section_get_ival,&
                                               section_get_ivals,&
                                               section_vals_get,&
@@ -1007,15 +1009,15 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'qs_init_subsys'
 
       CHARACTER(len=2)                                   :: element_symbol
-      INTEGER :: gfn_type, handle, ikind, ispin, iw, lmax_sphere, maxl, maxlgto, maxlgto_lri, &
-         maxlgto_nuc, maxlppl, maxlppnl, method_id, multiplicity, my_ival, n_ao, n_mo_add, &
-         n_mo_auto, n_mo_target, natom, nelectron, ngauss, nkind, nlumo_dos, nlumo_molden, &
-         nlumo_required, output_unit, sort_basis, tnadd_method
+      INTEGER :: gfn_type, handle, ikind, ispin, iw, kp_ri_method, lmax_sphere, maxl, maxlgto, &
+         maxlgto_lri, maxlgto_nuc, maxlppl, maxlppnl, method_id, multiplicity, my_ival, n_ao, &
+         n_mo_add, n_mo_auto, n_mo_target, natom, nelectron, ngauss, nkind, nlumo_dos, &
+         nlumo_molden, nlumo_required, output_unit, sort_basis, tnadd_method
       INTEGER, DIMENSION(2)                              :: n_mo, nelectron_spin
       INTEGER, DIMENSION(5)                              :: ngaussflex, occ
       INTEGER, DIMENSION(:), POINTER                     :: mo_index_range
-      LOGICAL :: all_potential_present, be_silent, cneo_potential_present, do_kpoints, do_ri_hfx, &
-         do_ri_mp2, do_ri_rpa, do_ri_sos_mp2, do_rpa_ri_exx, do_wfc_im_time, e1terms, &
+      LOGICAL :: all_potential_present, be_silent, cneo_potential_present, do_kpoints, do_lri_hfx, &
+         do_ri_hfx, do_ri_mp2, do_ri_rpa, do_ri_sos_mp2, do_rpa_ri_exx, do_wfc_im_time, e1terms, &
          has_unit_metric, lribas, mp2_present, orb_gradient, paw_atom
       REAL(KIND=dp)                                      :: alpha, ccore, ewald_rcut, fxx, maxocc, &
                                                             rc, rcut, total_zeff_corr, &
@@ -1408,6 +1410,11 @@ CONTAINS
       IF (do_ri_hfx .OR. do_rpa_ri_exx) THEN
          CALL get_qs_env(qs_env, nkind=nkind)
          CALL section_vals_val_get(qs_env%input, "DFT%SORT_BASIS", i_val=sort_basis)
+         do_lri_hfx = .FALSE.
+         IF (do_ri_hfx .AND. do_kpoints) THEN
+            CALL section_vals_val_get(qs_env%input, "DFT%XC%HF%RI%KP_RI_METHOD", i_val=kp_ri_method)
+            do_lri_hfx = kp_ri_method == hfx_ri_kp_lri
+         END IF
          DO ikind = 1, nkind
             NULLIFY (ri_hfx_basis)
             qs_kind => qs_kind_set(ikind)
@@ -1418,6 +1425,10 @@ CONTAINS
                IF (dft_control%do_admm) THEN
                   CALL create_ri_aux_basis_set(ri_hfx_basis, qs_kind, dft_control%auto_basis_ri_hfx, &
                                                basis_type="AUX_FIT", basis_sort=sort_basis)
+               ELSE IF (do_lri_hfx) THEN
+                  CALL get_qs_kind(qs_kind, basis_set=tmp_basis_set, basis_type="ORB")
+                  CALL create_hfx_lri_basis(ri_hfx_basis, tmp_basis_set, dft_control%auto_basis_ri_hfx, &
+                                            sort_basis, MERGE(-1, output_unit, be_silent))
                ELSE
                   CALL create_ri_aux_basis_set(ri_hfx_basis, qs_kind, dft_control%auto_basis_ri_hfx, &
                                                basis_sort=sort_basis)
