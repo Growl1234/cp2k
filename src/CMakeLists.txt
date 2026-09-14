@@ -222,6 +222,12 @@ list(
   group_dist_types.F
   grrm_utils.F
   gapw_1c_basis_set.F
+  gw_compute_Z_lP.F
+  gw_compute_Z_lP_utils.F
+  gw_auto_ri_generate_RI_basis.F
+  gw_auto_ri_types.F
+  gw_dbcsr_utils.F
+  gw_fm_utils.F
   gw_communication.F
   gw_main.F
   gw_large_cell_gamma.F
@@ -246,6 +252,12 @@ list(
   hfx_exx.F
   hfx_helpers.F
   hfx_libint_interface.F
+  hfx_lri_basis.F
+  hfx_lri_contract.F
+  hfx_lri_lattice.F
+  hfx_lri_kp.F
+  hfx_lri_parallel.F
+  hfx_lri_types.F
   hfx_load_balance_methods.F
   hfx_pair_list_methods.F
   hfx_pw_methods.F
@@ -395,6 +407,7 @@ list(
   molecular_dipoles.F
   molecular_moments.F
   molecular_states.F
+  mo_window.F
   mol_force.F
   molsym.F
   moments_utils.F
@@ -864,6 +877,7 @@ list(
   tblite_ks_matrix.F
   tblite_scc_mixer.F
   tblite_types.F
+  time_frequency_grid_types.F
   tip_scan_methods.F
   tip_scan_types.F
   topology_amber.F
@@ -1564,6 +1578,7 @@ set(CP2K_PROGS_F
     common/parallel_rng_types_unittest.F
     kpoint_lattice_fft_unittest.F
     kpoint_smearing_unittest.F
+    kpsym_unittest.F
     qs_ot_minimizer_unittest.F
     optbas_frontier_orbitals_utils_unittest.F
     rirs_grid_utils_unittest.F
@@ -1979,6 +1994,7 @@ list(
   "parallel_rng_types_unittest"
   "kpoint_lattice_fft_unittest"
   "kpoint_smearing_unittest"
+  "kpsym_unittest"
   "qs_ot_minimizer_unittest"
   "optbas_frontier_orbitals_utils_unittest"
   "rirs_grid_utils_unittest"
@@ -2011,6 +2027,7 @@ add_executable(memory_utilities_unittest common/memory_utilities_unittest.F)
 add_executable(parallel_rng_types_unittest common/parallel_rng_types_unittest.F)
 add_executable(kpoint_lattice_fft_unittest kpoint_lattice_fft_unittest.F)
 add_executable(kpoint_smearing_unittest kpoint_smearing_unittest.F)
+add_executable(kpsym_unittest kpsym_unittest.F)
 add_executable(qs_ot_minimizer_unittest qs_ot_minimizer_unittest.F)
 add_executable(optbas_frontier_orbitals_utils_unittest
                optbas_frontier_orbitals_utils_unittest.F)
