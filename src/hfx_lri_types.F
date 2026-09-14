@@ -41,6 +41,8 @@ MODULE hfx_lri_types
    TYPE hfx_lri_centered_block_type
       LOGICAL                                            :: inner_active = .TRUE.
       LOGICAL                                            :: present = .FALSE., inner_override = .FALSE.
+      ! Unpacked tensors are temporary during construction, or retained only for literal validation.
+      ! Production contractions keep remote_flat(center*aux,remote) as the single persistent copy.
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: values
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: remote_flat
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: inner_values
