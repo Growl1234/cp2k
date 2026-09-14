@@ -24,7 +24,7 @@ MODULE hfx_lri_parallel
 
    PUBLIC :: hfx_lri_block_type, hfx_lri_buffer_type, hfx_lri_parallel_type, &
              hfx_lri_buffer_init, hfx_lri_buffer_clear, hfx_lri_buffer_release, &
-             hfx_lri_buffer_add, hfx_lri_exchange_blocks, hfx_lri_fetch_blocks, &
+             hfx_lri_buffer_add, hfx_lri_buffer_merge, hfx_lri_exchange_blocks, hfx_lri_fetch_blocks, &
              hfx_lri_gather_metadata, hfx_lri_assign_tasks
 
    ! Limit each sender's numerical payload per collective. A single larger block is indivisible.
@@ -46,6 +46,8 @@ MODULE hfx_lri_parallel
       TYPE(mp_para_env_type), POINTER :: para_env => NULL(), subgroup => NULL()
       INTEGER :: ngroups = 1, group_size = 1
       INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, tasks_s, tasks_t
+      ! Canonical key of the untwisted V(i,j,R) = TRANSPOSE(V(j,i,-R)) orbit.
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: metric_key
       INTEGER, ALLOCATABLE, DIMENSION(:, :) :: density_keys
       LOGICAL, ALLOCATABLE, DIMENSION(:) :: need_d, metric_present
    END TYPE hfx_lri_parallel_type
@@ -60,14 +62,20 @@ CONTAINS
 !> \brief Allocate one sparse rank buffer, with a lock for each possible output block.
 !> \param buffer ...
 !> \param nblocks ...
+!> \param thread_private omit locks when the buffer belongs to one thread
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_buffer_init(buffer, nblocks)
+   SUBROUTINE hfx_lri_buffer_init(buffer, nblocks, thread_private)
       TYPE(hfx_lri_buffer_type), INTENT(OUT)             :: buffer
       INTEGER, INTENT(IN)                                :: nblocks
+      LOGICAL, INTENT(IN), OPTIONAL                      :: thread_private
 
       INTEGER                                            :: i
 
-      ALLOCATE (buffer%blocks(nblocks), buffer%locks(nblocks), buffer%keys(nblocks))
+      ALLOCATE (buffer%blocks(nblocks), buffer%keys(nblocks))
+      IF (PRESENT(thread_private)) THEN
+         IF (thread_private) RETURN
+      END IF
+      ALLOCATE (buffer%locks(nblocks))
       !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer, nblocks) PRIVATE(i)
       DO i = 1, nblocks
          CALL omp_init_lock(buffer%locks(i))
@@ -101,13 +109,15 @@ CONTAINS
 
       INTEGER                                            :: i
 
-      IF (.NOT. ALLOCATED(buffer%locks)) RETURN
-      !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer) PRIVATE(i)
-      DO i = 1, SIZE(buffer%locks)
-         CALL omp_destroy_lock(buffer%locks(i))
-      END DO
-      !$OMP END PARALLEL DO
-      DEALLOCATE (buffer%locks, buffer%blocks, buffer%keys)
+      IF (ALLOCATED(buffer%locks)) THEN
+         !$OMP PARALLEL DO DEFAULT(NONE) SHARED(buffer) PRIVATE(i)
+         DO i = 1, SIZE(buffer%locks)
+            CALL omp_destroy_lock(buffer%locks(i))
+         END DO
+         !$OMP END PARALLEL DO
+         DEALLOCATE (buffer%locks)
+      END IF
+      IF (ALLOCATED(buffer%blocks)) DEALLOCATE (buffer%blocks, buffer%keys)
       buffer%nkeys = 0
    END SUBROUTINE hfx_lri_buffer_release
 
@@ -135,7 +145,7 @@ CONTAINS
          nrow = SIZE(values, 2)
          ncol = SIZE(values, 1)
       END IF
-      CALL omp_set_lock(buffer%locks(key))
+      IF (ALLOCATED(buffer%locks)) CALL omp_set_lock(buffer%locks(key))
       IF (.NOT. ALLOCATED(buffer%blocks(key)%values)) THEN
          ALLOCATE (buffer%blocks(key)%values(nrow, ncol))
          IF (transposed) THEN
@@ -157,8 +167,35 @@ CONTAINS
             buffer%blocks(key)%values(:, :) = buffer%blocks(key)%values + factor*values
          END IF
       END IF
-      CALL omp_unset_lock(buffer%locks(key))
+      IF (ALLOCATED(buffer%locks)) CALL omp_unset_lock(buffer%locks(key))
    END SUBROUTINE hfx_lri_buffer_add
+
+! **************************************************************************************************
+!> \brief Merge a completed private buffer. The caller must exclude other destination writers.
+!> \param destination ...
+!> \param source ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_buffer_merge(destination, source)
+      TYPE(hfx_lri_buffer_type), INTENT(INOUT)           :: destination, source
+
+      INTEGER                                            :: i, key
+
+      DO i = 1, source%nkeys
+         key = source%keys(i)
+         IF (ALLOCATED(destination%blocks(key)%values)) THEN
+            IF (ANY(SHAPE(destination%blocks(key)%values) /= SHAPE(source%blocks(key)%values))) THEN
+               CPABORT("Inconsistent block dimensions in the LRI thread-buffer merge")
+            END IF
+            destination%blocks(key)%values(:, :) = destination%blocks(key)%values + source%blocks(key)%values
+            DEALLOCATE (source%blocks(key)%values)
+         ELSE
+            CALL MOVE_ALLOC(source%blocks(key)%values, destination%blocks(key)%values)
+            destination%nkeys = destination%nkeys + 1
+            destination%keys(destination%nkeys) = key
+         END IF
+      END DO
+      source%nkeys = 0
+   END SUBROUTINE hfx_lri_buffer_merge
 
 ! **************************************************************************************************
 !> \brief Gather small integer metadata; numerical tensors use selective block communication.
