@@ -81,15 +81,14 @@ CONTAINS
          END IF
       END IF
 
+      beta = MERGE(0.0_dp, 1.0_dp, first)
       IF (ALLOCATED(RESULT)) THEN
          IF (ANY(SHAPE(RESULT) /= [nfirst, nout, SIZE(centered, 3)])) DEALLOCATE (RESULT)
       END IF
       IF (.NOT. ALLOCATED(RESULT)) THEN
-         ALLOCATE (RESULT(nfirst, nout, SIZE(centered, 3)), SOURCE=0.0_dp)
-      ELSE IF (first) THEN
-         RESULT(:, :, :) = 0.0_dp
+         ALLOCATE (RESULT(nfirst, nout, SIZE(centered, 3)))
+         beta = 0.0_dp
       END IF
-      beta = MERGE(0.0_dp, 1.0_dp, first)
       IF (.NOT. transpose_centered) THEN
          ! C(center,remote,aux) is already a contiguous center-by-(remote*aux) matrix.
          CALL dgemm("N", "N", nfirst, nout*SIZE(centered, 3), ncontract, factor, &
@@ -136,17 +135,16 @@ CONTAINS
       IF (SIZE(source, 3) /= nright) THEN
          CPABORT("Inconsistent metric dimension in LRI loop3 auxiliary contraction")
       END IF
+      beta = MERGE(0.0_dp, 1.0_dp, first)
       IF (ALLOCATED(TARGET)) THEN
          IF (ANY(SHAPE(TARGET) /= [SIZE(source, 1), SIZE(source, 2), nleft])) THEN
             DEALLOCATE (TARGET)
          END IF
       END IF
       IF (.NOT. ALLOCATED(TARGET)) THEN
-         ALLOCATE (TARGET(SIZE(source, 1), SIZE(source, 2), nleft), SOURCE=0.0_dp)
-      ELSE IF (first) THEN
-         TARGET(:, :, :) = 0.0_dp
+         ALLOCATE (TARGET(SIZE(source, 1), SIZE(source, 2), nleft))
+         beta = 0.0_dp
       END IF
-      beta = MERGE(0.0_dp, 1.0_dp, first)
       CALL dgemm("N", "T", nflat, nleft, nright, factor, source(1, 1, 1), nflat, &
                  metric(1, 1), nleft, beta, TARGET(1, 1, 1), nflat)
 
