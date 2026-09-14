@@ -144,6 +144,14 @@ MODULE hfx_lri_kp
       TYPE(hfx_lri_metric_entry_type), ALLOCATABLE, DIMENSION(:) :: entries
    END TYPE hfx_lri_metric_table_type
 
+   ! Bounded candidate buffer shared by the OpenMP team during metric-key lookup.
+   TYPE hfx_lri_metric_key_buffer_type
+      INTEGER                                            :: nkeys = 0
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)               :: kinds
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)              :: displacement
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                  :: found
+   END TYPE hfx_lri_metric_key_buffer_type
+
    TYPE lri_pair_lookup_type
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_offset, atom_pairs
    END TYPE lri_pair_lookup_type
@@ -287,7 +295,7 @@ CONTAINS
 
       INTEGER :: handle, iatom, ibasis, ikind, ipair_block, ithread, jatom, jkind, maxl_ao, &
          maxl_ao_kind, maxl_ri, maxl_ri_kind, mepos, mmax, nao_i, nao_j, natom, naux_i, naux_j, &
-         naux_pair, nkind, npair_candidates, nthreads, tc_mmax, unit_id
+         naux_pair, nkind, npair_candidates, nthreads, phase_handle, tc_mmax, unit_id
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: active, pair_owner, pair_panel
       INTEGER, DIMENSION(3)                              :: cell_j
       LOGICAL                                            :: kpoint_symmetry, validate_pair_fit
@@ -479,6 +487,7 @@ CONTAINS
 
       ! The neighbor-list iterator is serial, but every fitted pair is independent. Reuse the
       ! immutable basis transforms and give every worker its own Libint engines.
+      CALL timeset('hfx_lri_pair_fit', phase_handle)
       !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          SHARED(basis_set_AO, basis_set_RI, maxl_ao, maxl_ri, &
       !$OMP                 metric_caches, pair_diagnostics, pair_owner, para_env, active, ri_data, &
@@ -507,6 +516,7 @@ CONTAINS
       !$OMP END DO
       CALL coulomb_integral_cleanup(integral_context)
       !$OMP END PARALLEL
+      CALL timestop(phase_handle)
       DEALLOCATE (metric_caches)
       CALL para_env%max(active)
       ri_data%lri_kp%pair_blocks%fit_active = active /= 0
@@ -1477,6 +1487,41 @@ CONTAINS
    END SUBROUTINE hfx_lri_metric_table_rehash
 
 ! **************************************************************************************************
+!> \brief Finds a canonical metric key in a read-only table, or its empty insertion slot.
+!> \param metric_table ...
+!> \param kind_left ...
+!> \param kind_right ...
+!> \param displacement ...
+!> \param islot ...
+!> \param ientry zero if the key is absent
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_metric_table_find(metric_table, kind_left, kind_right, displacement, islot, ientry)
+
+      TYPE(hfx_lri_metric_table_type), INTENT(IN)        :: metric_table
+      INTEGER, INTENT(IN)                                :: kind_left, kind_right
+      REAL(dp), DIMENSION(3), INTENT(IN)                 :: displacement
+      INTEGER, INTENT(OUT)                               :: islot, ientry
+
+      INTEGER                                            :: nprobe
+
+      islot = 0
+      ientry = 0
+      IF (.NOT. ALLOCATED(metric_table%slot)) RETURN
+      islot = hfx_lri_metric_hash(kind_left, kind_right, displacement, metric_table%capacity)
+      DO nprobe = 1, metric_table%capacity
+         ientry = metric_table%slot(islot)
+         IF (ientry == 0) RETURN
+         IF (metric_table%entries(ientry)%kind_left == kind_left .AND. &
+             metric_table%entries(ientry)%kind_right == kind_right .AND. &
+             MAXVAL(ABS(metric_table%entries(ientry)%displacement - displacement)) <= &
+             lri_metric_cache_position_tol) RETURN
+         islot = MOD(islot, metric_table%capacity) + 1
+      END DO
+      CPABORT("LRI-HFXk metric key table is full")
+
+   END SUBROUTINE hfx_lri_metric_table_find
+
+! **************************************************************************************************
 !> \brief Adds one geometry-only metric key. Values are filled in a later parallel pass.
 !> \param metric_table ...
 !> \param kind_left_in ...
@@ -1787,13 +1832,14 @@ CONTAINS
 
       INTEGER                                            :: iatom, icol, ikind, image, image_rev, &
                                                             ipair, irow, jatom, jkind, nentry, &
-                                                            owner
+                                                            owner, timing_handle
       INTEGER, DIMENSION(3)                              :: cell, cell_rev
       LOGICAL                                            :: found, source_transposed
       REAL(dp)                                           :: factor
       REAL(dp), DIMENSION(3)                             :: rab
       REAL(dp), DIMENSION(:, :), POINTER                 :: rho_block
 
+      CALL timeset('hfx_lri_density_cache_create', timing_handle)
       NULLIFY (rho_block)
       CPASSERT(ASSOCIATED(rho_ao))
 
@@ -1859,6 +1905,7 @@ CONTAINS
          END IF
       END DO
 
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_density_cache_create
 
 ! **************************************************************************************************
@@ -1939,33 +1986,91 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Collects the atom-center metric keys needed by one oriented fitting pair.
 !> \param metric_table ...
+!> \param buffer ...
 !> \param pair_left ...
 !> \param left_reversed ...
 !> \param right_kind ...
 !> \param right_position ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_metric_table_add_pair_center(metric_table, pair_left, left_reversed, &
+   SUBROUTINE hfx_lri_metric_table_add_pair_center(metric_table, buffer, pair_left, left_reversed, &
                                                    right_kind, right_position)
 
       TYPE(hfx_lri_metric_table_type), INTENT(INOUT)     :: metric_table
+      TYPE(hfx_lri_metric_key_buffer_type), &
+         INTENT(INOUT)                                   :: buffer
       TYPE(hfx_lri_pair_block_type), INTENT(IN)          :: pair_left
       LOGICAL, INTENT(IN)                                :: left_reversed
       INTEGER, INTENT(IN)                                :: right_kind
       REAL(dp), DIMENSION(3), INTENT(IN)                 :: right_position
 
-      INTEGER                                            :: ic_left
+      INTEGER                                            :: ic_left, ikey
       REAL(dp), DIMENSION(3)                             :: left_origin, left_position
 
       left_origin(:) = 0.0_dp
       IF (left_reversed) left_origin(:) = pair_left%rab(:)
       DO ic_left = 1, pair_left%naux_centers
          left_position(:) = pair_left%aux_r(:, ic_left) - left_origin(:)
-         CALL hfx_lri_metric_table_add_key( &
-            metric_table, pair_left%aux_kind(ic_left), right_kind, &
-            right_position - left_position)
+         IF (ALLOCATED(buffer%kinds)) THEN
+            buffer%nkeys = buffer%nkeys + 1
+            ikey = buffer%nkeys
+            buffer%kinds(:, ikey) = [pair_left%aux_kind(ic_left), right_kind]
+            buffer%displacement(:, ikey) = right_position - left_position
+            IF (buffer%nkeys == SIZE(buffer%kinds, 2)) CALL hfx_lri_metric_key_flush(metric_table, buffer)
+         ELSE
+            CALL hfx_lri_metric_table_add_key( &
+               metric_table, pair_left%aux_kind(ic_left), right_kind, &
+               right_position - left_position)
+         END IF
       END DO
 
    END SUBROUTINE hfx_lri_metric_table_add_pair_center
+
+! **************************************************************************************************
+!> \brief Looks up a bounded candidate batch in parallel, then inserts missing keys in order.
+!> \param metric_table ...
+!> \param buffer ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_metric_key_flush(metric_table, buffer)
+
+      TYPE(hfx_lri_metric_table_type), INTENT(INOUT)     :: metric_table
+      TYPE(hfx_lri_metric_key_buffer_type), &
+         INTENT(INOUT)                                   :: buffer
+
+      INTEGER                                            :: ientry, ikey, islot, kind_left, &
+                                                            kind_right, scan_capacity, &
+                                                            timing_handle
+      REAL(dp), DIMENSION(3)                             :: displacement
+
+      IF (buffer%nkeys == 0) RETURN
+      scan_capacity = metric_table%capacity
+      CALL timeset('hfx_lri_metric_key_scan', timing_handle)
+      ! The table is immutable for the whole parallel scan; each worker owns its buffer slots.
+      !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) SHARED(buffer, metric_table) &
+      !$OMP PRIVATE(displacement, ientry, ikey, islot, kind_left, kind_right)
+      DO ikey = 1, buffer%nkeys
+         CALL hfx_lri_metric_key_canonical(buffer%kinds(1, ikey), buffer%kinds(2, ikey), &
+                                           buffer%displacement(:, ikey), kind_left, kind_right, displacement)
+         buffer%kinds(:, ikey) = [kind_left, kind_right]
+         buffer%displacement(:, ikey) = displacement
+         CALL hfx_lri_metric_table_find(metric_table, kind_left, kind_right, displacement, islot, ientry)
+         buffer%found(ikey) = ientry /= 0
+      END DO
+      !$OMP END PARALLEL DO
+      CALL timestop(timing_handle)
+
+      CALL timeset('hfx_lri_metric_key_merge', timing_handle)
+      DO ikey = 1, buffer%nkeys
+         ! Insertions preserve existing lookup hits until rehashing changes the probe path.
+         ! After growth, recheck the remaining candidates to retain the serial tolerance
+         ! semantics and first representatives, independently of the OpenMP team size.
+         IF (buffer%found(ikey) .AND. metric_table%capacity == scan_capacity) CYCLE
+         CALL hfx_lri_metric_table_add_key(metric_table, buffer%kinds(1, ikey), buffer%kinds(2, ikey), &
+                                           buffer%displacement(:, ikey))
+      END DO
+      buffer%nkeys = 0
+      CALL timestop(timing_handle)
+
+   END SUBROUTINE hfx_lri_metric_key_flush
 
 ! **************************************************************************************************
 !> \brief Enumerates unique two-center metric keys without evaluating any integral.  The two loops
@@ -1987,11 +2092,32 @@ CONTAINS
       TYPE(hfx_lri_pair_block_type), DIMENSION(:), &
          INTENT(IN)                                      :: target_pairs
 
-      INTEGER                                            :: iblock, ipair_left, ipair_left_ref, &
-                                                            ipair_target, ipos_left, &
-                                                            jatom_density, target_iatom
+      INTEGER, PARAMETER                                 :: batch_size = 65536
+
+      INTEGER :: iblock, ipair_left, ipair_left_ref, ipair_target, ipos_left, jatom_density, &
+         nthreads, target_iatom, timing_handle
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: density_head, density_next
       LOGICAL                                            :: left_reversed
       REAL(dp), DIMENSION(3)                             :: left_rab, right_position
+      TYPE(hfx_lri_metric_key_buffer_type)               :: buffer
+
+      CALL timeset('hfx_lri_metric_table_collect', timing_handle)
+      nthreads = 1
+!$    nthreads = omp_get_max_threads()
+      ! Keep direct insertion for one thread. Otherwise buffer at most 65536 candidates
+      ! (2.25 MiB with default integers/logicals), independently of the OpenMP team size.
+      IF (nthreads > 1) THEN
+         ALLOCATE (buffer%kinds(2, batch_size), buffer%displacement(3, batch_size), buffer%found(batch_size))
+      END IF
+      ! Index the density blocks by their first atom. Reverse insertion preserves the original
+      ! order within each atom, including the first representative of every metric key.
+      ALLOCATE (density_head(SIZE(pair_lookup%atom_offset) - 1), SOURCE=0)
+      ALLOCATE (density_next(density_cache%nblocks))
+      DO iblock = density_cache%nblocks, 1, -1
+         jatom_density = density_cache%blocks(iblock)%iatom
+         density_next(iblock) = density_head(jatom_density)
+         density_head(jatom_density) = iblock
+      END DO
 
       ! V between either center of C_IJ and the first (K) center of C_KL.  It depends only on the
       ! target I-K and the left pair, not on L.
@@ -2003,7 +2129,7 @@ CONTAINS
             ipair_left = ABS(ipair_left_ref)
             left_reversed = ipair_left_ref < 0
             CALL hfx_lri_metric_table_add_pair_center( &
-               metric_table, pair_blocks(ipair_left), left_reversed, &
+               metric_table, buffer, pair_blocks(ipair_left), left_reversed, &
                target_pairs(ipair_target)%jkind, target_pairs(ipair_target)%rab)
          END DO
       END DO
@@ -2023,16 +2149,19 @@ CONTAINS
                jatom_density = pair_blocks(ipair_left)%jatom
                left_rab(:) = pair_blocks(ipair_left)%rab(:)
             END IF
-            DO iblock = 1, density_cache%nblocks
-               IF (density_cache%blocks(iblock)%iatom /= jatom_density) CYCLE
+            iblock = density_head(jatom_density)
+            DO WHILE (iblock /= 0)
                right_position(:) = left_rab(:) + density_cache%blocks(iblock)%rab(:)
                CALL hfx_lri_metric_table_add_pair_center( &
-                  metric_table, pair_blocks(ipair_left), left_reversed, &
+                  metric_table, buffer, pair_blocks(ipair_left), left_reversed, &
                   density_cache%blocks(iblock)%jkind, right_position)
+               iblock = density_next(iblock)
             END DO
          END DO
       END DO
 
+      CALL hfx_lri_metric_key_flush(metric_table, buffer)
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_metric_table_collect
 
 ! **************************************************************************************************
@@ -2149,12 +2278,13 @@ CONTAINS
 
       INTEGER                                            :: block_index, cell_index, iatom, iaux, &
                                                             ipair, jatom, nactive, ncell, &
-                                                            pair_cell(3), reduced(3)
+                                                            pair_cell(3), reduced(3), timing_handle
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_count, atom_nao, cursor, &
                                                             inner_flags, present_flags, &
                                                             remote_count
       REAL(dp)                                           :: block_norm2, factor
 
+      CALL timeset('hfx_lri_centered_build', timing_handle)
       ncell = PRODUCT(grid)
       lri_kp%lattice_natom = natom
       lri_kp%lattice_ncell = ncell
@@ -2330,6 +2460,7 @@ CONTAINS
       END DO
       DEALLOCATE (atom_count, cursor, remote_count)
 
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_centered_build
 
 ! **************************************************************************************************
@@ -2489,9 +2620,8 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: maxl_ri
       REAL(dp), INTENT(IN)                               :: filter_eps
 
-      INTEGER                                            :: batch_first, batch_last, batch_size, &
-                                                            block_index, ientry, ithread, mepos, &
-                                                            nranks, nthreads, unique_entries
+      INTEGER :: batch_first, batch_last, batch_size, block_index, ientry, ithread, mepos, nranks, &
+         nthreads, timing_handle, unique_entries
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: present_flags
       REAL(dp)                                           :: block_norm2
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: atom_position
@@ -2500,6 +2630,7 @@ CONTAINS
       TYPE(hfx_lri_buffer_type)                          :: buffer
       TYPE(hfx_lri_metric_table_type)                    :: metric_table
 
+      CALL timeset('hfx_lri_metric_lattice_build', timing_handle)
       IF (.NOT. ASSOCIATED(ri_data%lri_kp) .OR. .NOT. ASSOCIATED(particle_set) .OR. &
           .NOT. ASSOCIATED(cell)) THEN
          CPABORT("Missing state or geometry while streaming the LRI metric")
@@ -2581,6 +2712,7 @@ CONTAINS
       ri_data%lri_kp%parallel%metric_present(:) = present_flags /= 0
       DEALLOCATE (atom_position)
 
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_metric_lattice_build
 
 ! **************************************************************************************************
@@ -2603,7 +2735,8 @@ CONTAINS
 
       INTEGER :: alias_collisions, averaged_blocks, block_index, cell_index, completed_partners, &
          counts(4), hermitian_projected_pairs, iatom, iblock, jatom, reverse_cell_index, &
-         reverse_index, source_iblock, worst_iatom, worst_jatom, worst_key(11), worst_rank
+         reverse_index, source_iblock, timing_handle, worst_iatom, worst_jatom, worst_key(11), &
+         worst_rank
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: sample_count, source_block
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: source_cell
       INTEGER, DIMENSION(3)                              :: reduced, reverse_cell, &
@@ -2620,6 +2753,7 @@ CONTAINS
          worst_representative_factor, worst_values(3)
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: source_factor
 
+      CALL timeset('hfx_lri_loop3_density_create', timing_handle)
       ALLOCATE (density_blocks(lri_kp%lattice_natom**2*lri_kp%lattice_ncell))
       ALLOCATE (sample_count(SIZE(density_blocks)), SOURCE=0)
       ALLOCATE (source_block(SIZE(density_blocks)), SOURCE=0)
@@ -2895,6 +3029,7 @@ CONTAINS
          CPABORT("Hermitian projection of the LRI density quotient failed")
       END IF
 
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_loop3_density_create
 
 ! **************************************************************************************************
@@ -4197,12 +4332,13 @@ CONTAINS
 
       INTEGER                                            :: block_index, cell_index, ipair, &
                                                             reverse_cell_index, reverse_index, &
-                                                            stored_blocks
+                                                            stored_blocks, timing_handle
       INTEGER, DIMENSION(3)                              :: reduced, reverse_cell
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: selected
       REAL(dp)                                           :: factor, k_norm
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
 
+      CALL timeset('hfx_lri_loop3_store_k', timing_handle)
       IF (ALLOCATED(lri_kp%k_blocks)) THEN
          DO ipair = 1, SIZE(lri_kp%k_blocks)
             IF (ALLOCATED(lri_kp%k_blocks(ipair)%k_block)) THEN
@@ -4263,6 +4399,7 @@ CONTAINS
       DEALLOCATE (selected)
       lri_kp%nk_blocks = stored_blocks
 
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_loop3_store_k
 
 ! **************************************************************************************************
@@ -4332,8 +4469,8 @@ CONTAINS
       REAL(dp), INTENT(OUT)                              :: exchange_trace
 
       INTEGER :: batch_first, batch_last, batch_size, density_cell_index, density_iatom, &
-         density_jatom, igroup, ithread, itopology, max_tasks, nblocks, ntasks_s, nthreads, rank, &
-         reference_mode, task
+         density_jatom, igroup, ithread, itopology, max_tasks, nblocks, ntasks_s, nthreads, &
+         phase_handle, rank, reference_mode, task, timing_handle
       INTEGER(int_8)                                     :: validation_terms, validation_work, &
                                                             work_limit
       LOGICAL :: is_root, literal_validate, reciprocal_failed, reciprocal_validate, &
@@ -4348,6 +4485,7 @@ CONTAINS
          topology_owned(lri_topology_count)
       TYPE(hfx_lri_contract_workspace_type)              :: workspace
 
+      CALL timeset('hfx_lri_loop3_quotient_contract', timing_handle)
       rank = ri_data%lri_kp%parallel%para_env%mepos
       is_root = rank == 0
       CALL hfx_lri_loop3_density_create( &
@@ -4372,6 +4510,7 @@ CONTAINS
       CALL ri_data%lri_kp%parallel%para_env%max(batch_size)
       DO batch_first = 1, max_tasks, batch_size
          batch_last = MIN(batch_first + batch_size - 1, ntasks_s + SIZE(ri_data%lri_kp%parallel%tasks_t))
+         CALL timeset('hfx_lri_contract_tasks', phase_handle)
          !$OMP PARALLEL DEFAULT(NONE) &
          !$OMP SHARED(density_blocks, k_batch, topology_batch, literal_validate, ri_data, &
          !$OMP        batch_first, batch_last, ntasks_s) &
@@ -4406,6 +4545,7 @@ CONTAINS
          !$OMP END DO
          CALL hfx_lri_contract_workspace_move(workspace, ri_data%lri_kp%thread_workspaces(ithread))
          !$OMP END PARALLEL
+         CALL timestop(phase_handle)
          ! All ranks, including those with no local tasks, execute the same collective sequence.
          CALL hfx_lri_reduce_k(ri_data%lri_kp, k_batch, k_owned)
          CALL hfx_lri_buffer_clear(k_batch)
@@ -4536,6 +4676,7 @@ CONTAINS
       IF (storage_trace_residual > 1.0E-8_dp) THEN
          CPABORT("LRI-HFXk quotient and symmetric KS-storage traces disagree")
       END IF
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_loop3_quotient_contract
 
 ! **************************************************************************************************
@@ -4724,7 +4865,8 @@ CONTAINS
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix
       REAL(dp), INTENT(IN)                               :: hf_fraction
 
-      INTEGER                                            :: icol, image, img, ipair, irow, key
+      INTEGER                                            :: icol, image, img, ipair, irow, key, &
+                                                            timing_handle
       INTEGER, ALLOCATABLE                               :: images(:), owners(:)
       INTEGER, DIMENSION(3)                              :: reduced
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
@@ -4734,6 +4876,7 @@ CONTAINS
       TYPE(hfx_lri_block_type), ALLOCATABLE              :: received(:), source(:)
       TYPE(kpoint_type), POINTER                         :: kpoints
 
+      CALL timeset('hfx_lri_write_rank_local_k_blocks', timing_handle)
       NULLIFY (cell_to_index, kpoints, ks_block)
       CPASSERT(ASSOCIATED(ri_data%lri_kp))
       CPASSERT(ASSOCIATED(ks_matrix))
@@ -4795,6 +4938,7 @@ CONTAINS
          END IF
       END DO
       !$OMP END PARALLEL DO
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_write_rank_local_k_blocks
 
 ! **************************************************************************************************
@@ -5080,7 +5224,7 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: keys
       REAL(dp), INTENT(IN)                               :: filter_eps
 
-      INTEGER                                            :: i, image, key
+      INTEGER                                            :: i, image, key, timing_handle
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: mapping, owners
       INTEGER, DIMENSION(3)                              :: reduced
       TYPE(hfx_lri_block_type), ALLOCATABLE, &
@@ -5088,6 +5232,7 @@ CONTAINS
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: pairs
 
+      CALL timeset('hfx_lri_distribute_density', timing_handle)
       CPASSERT(filter_eps >= 0.0_dp)
       ALLOCATE (pairs(density_cache%nblocks))
       DO i = 1, SIZE(pairs)
@@ -5131,6 +5276,7 @@ CONTAINS
          density_cache%blocks(i)%rab = pairs(i)%rab
          CALL MOVE_ALLOC(received(i)%values, density_cache%blocks(i)%values)
       END DO
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_distribute_density
 
 ! **************************************************************************************************
@@ -5171,10 +5317,12 @@ CONTAINS
    SUBROUTINE hfx_lri_sum_centered(lri_kp)
       TYPE(hfx_lri_kp_type), INTENT(INOUT)               :: lri_kp
 
-      INTEGER                                            :: i, iatom, image, jatom, na, nc, nr, pass
+      INTEGER                                            :: i, iatom, image, jatom, na, nc, nr, &
+                                                            pass, timing_handle
       TYPE(hfx_lri_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: received, source
 
+      CALL timeset('hfx_lri_sum_centered', timing_handle)
       DO pass = 1, 2
          ALLOCATE (source(SIZE(lri_kp%centered_blocks)), received(SIZE(lri_kp%centered_blocks)))
          DO i = 1, SIZE(source)
@@ -5211,6 +5359,7 @@ CONTAINS
          END DO
          DEALLOCATE (source, received)
       END DO
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_sum_centered
 
 ! **************************************************************************************************
@@ -5223,11 +5372,13 @@ CONTAINS
       TYPE(hfx_lri_kp_type), INTENT(INOUT)               :: lri_kp
       LOGICAL, DIMENSION(:), INTENT(IN)                  :: need_c, need_v
 
-      INTEGER                                            :: i, iatom, image, jatom, na, nc, nr, pass
+      INTEGER                                            :: i, iatom, image, jatom, na, nc, nr, &
+                                                            pass, timing_handle
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: requested
       TYPE(hfx_lri_block_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: received, source
 
+      CALL timeset('hfx_lri_import_integrals', timing_handle)
       ALLOCATE (requested(SIZE(need_c)))
       DO pass = 1, 2
          ALLOCATE (source(SIZE(need_c)), received(SIZE(need_c)))
@@ -5286,6 +5437,7 @@ CONTAINS
       DO i = 1, SIZE(received)
          IF (ALLOCATED(received(i)%values)) CALL MOVE_ALLOC(received(i)%values, lri_kp%lattice_metric(i)%values)
       END DO
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_import_integrals
 
 ! **************************************************************************************************
@@ -5299,7 +5451,8 @@ CONTAINS
 
       INTEGER                                            :: cc, ci, cj, ck, counts(4), dk, i, image, &
                                                             j, key, maxima(4), minima(4), naux, &
-                                                            nblocks, ni, rank, ref, totals(4), vk
+                                                            nblocks, ni, rank, ref, timing_handle, &
+                                                            totals(4), vk
       INTEGER, ALLOCATABLE                               :: indices(:), panels(:), task_owner(:)
       INTEGER, DIMENSION(3)                              :: ccell, cell, reduced
       LOGICAL                                            :: local_task
@@ -5307,6 +5460,7 @@ CONTAINS
                                                             need_v(:), support(:)
       REAL(dp), ALLOCATABLE                              :: cost(:)
 
+      CALL timeset('hfx_lri_task_plan', timing_handle)
       nblocks = SIZE(lri_kp%parallel%owner)
       rank = lri_kp%parallel%para_env%mepos
       ALLOCATE (support(nblocks), active_s(nblocks), active_t(nblocks), SOURCE=.FALSE.)
@@ -5446,6 +5600,7 @@ CONTAINS
          WRITE (unit_nr, '(T4,A,2I12)') "resident V blocks min/max", minima(4), maxima(4)
       END IF
 
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_task_plan
 
 ! **************************************************************************************************
@@ -5460,9 +5615,11 @@ CONTAINS
       TYPE(hfx_lri_block_type), DIMENSION(:), &
          INTENT(INOUT)                                   :: destination
 
+      INTEGER                                            :: timing_handle
       INTEGER, ALLOCATABLE                               :: owners(:)
       TYPE(hfx_lri_block_type), ALLOCATABLE              :: partial(:)
 
+      CALL timeset('hfx_lri_reduce_k', timing_handle)
       IF (lri_kp%parallel%ngroups == 1 .OR. lri_kp%parallel%group_size == 1) THEN
          CALL hfx_lri_exchange_blocks(source%blocks, lri_kp%parallel%owner, destination, lri_kp%parallel%para_env, &
                                       source%keys(:source%nkeys))
@@ -5473,6 +5630,7 @@ CONTAINS
                                       source%keys(:source%nkeys))
          CALL hfx_lri_exchange_blocks(partial, lri_kp%parallel%owner, destination, lri_kp%parallel%para_env)
       END IF
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_reduce_k
 
 ! **************************************************************************************************
@@ -5515,11 +5673,12 @@ CONTAINS
          INTENT(INOUT)                                   :: blocks
 
       INTEGER                                            :: i, image, j, key, ni, nj, reverse_image, &
-                                                            reverse_key
+                                                            reverse_key, timing_handle
       INTEGER, DIMENSION(3)                              :: cell, reduced
       REAL(dp)                                           :: difference, factor, residual, scale
       REAL(dp), ALLOCATABLE                              :: symmetric(:, :)
 
+      CALL timeset('hfx_lri_sparse_hermitize', timing_handle)
       scale = 1.0E-14_dp
       DO key = 1, SIZE(blocks)
          IF (ALLOCATED(blocks(key)%values)) scale = MAX(scale, MAXVAL(ABS(blocks(key)%values)))
@@ -5554,6 +5713,7 @@ CONTAINS
       !$OMP END PARALLEL DO
       CALL lri_kp%parallel%para_env%max(residual)
       IF (residual > 1.0E-8_dp) CPABORT("LRI loop3 K contraction failed the Hermiticity check")
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_sparse_hermitize
 
 ! **************************************************************************************************
@@ -5572,7 +5732,8 @@ CONTAINS
       LOGICAL, INTENT(OUT)                               :: reciprocal_validate
       INTEGER(int_8), INTENT(OUT)                        :: work_limit
 
-      INTEGER                                            :: budget, key, nao, ncells, rank
+      INTEGER                                            :: budget, key, nao, ncells, rank, &
+                                                            timing_handle
       INTEGER(int_8)                                     :: dense_bytes, density_bytes, &
                                                             integral_bytes, memory_limit, &
                                                             reciprocal_limit, reciprocal_work
@@ -5582,6 +5743,7 @@ CONTAINS
       LOGICAL, ALLOCATABLE                               :: need_c(:), need_v(:), requested(:)
       TYPE(hfx_lri_block_type), ALLOCATABLE              :: fetched(:)
 
+      CALL timeset('hfx_lri_prepare_density', timing_handle)
       rank = ri_data%lri_kp%parallel%para_env%mepos
       ALLOCATE (present_flags(SIZE(density)), SOURCE=0)
       ALLOCATE (fetched(SIZE(density)))
@@ -5662,6 +5824,7 @@ CONTAINS
                                                     ri_data%unit_nr, reference_mode)
          CALL ri_data%lri_kp%parallel%para_env%bcast(reference_mode, 0)
       END IF
+      CALL timestop(timing_handle)
    END SUBROUTINE hfx_lri_prepare_density
 
 END MODULE hfx_lri_kp
