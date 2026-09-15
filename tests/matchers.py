@@ -84,6 +84,11 @@ registry["OT_kpoint_ref_refresh"] = TextPresenceMatcher(
 registry["OT_added_mos_auto_grow"] = TextPresenceMatcher(
     "K-point ADDED_MOS AUTO: growing virtual-space buffer"
 )
+registry["OT_lattice_fft_selected"] = TextPresenceMatcher("selected: T")
+registry["OT_lattice_fft_fallback"] = TextPresenceMatcher("selected: F")
+registry["OT_lattice_local_correction"] = TextPresenceMatcher(
+    "Balanced local correction cells:"
+)
 registry["Kubo_sigma_iso"] = GenericMatcher(r"KUBO_TRANSPORT| sigma_iso[S/cm]", col=3)
 registry["Kubo_sigma_iso_2d"] = GenericMatcher(r"KUBO_TRANSPORT| sigma_iso[S]", col=3)
 registry["Kubo_sigma_iso_1d"] = GenericMatcher(r"KUBO_TRANSPORT| sigma_iso[S*m]", col=3)
@@ -404,6 +409,10 @@ registry["BC_near_K_point"] = GenericMatcher(r"   1    4", col=5)
 registry["gext"] = GenericMatcher(r"GEXT overlap fitting error:", col=5)
 
 # RI-RS G0W0 calculation for molecules
+registry["E_HF_SCF_direct_gap"] = GenericMatcher(
+    r"Hartree-Fock with SCF orbitals direct band gap (eV):", col=9
+)
+registry["Auto_RI_Size"] = GenericMatcher(r"Number of automatic RI functions", col=11)
 registry["RIRS_Grid"] = GenericMatcher(r"Total grid points used for RI-RS:", col=7)
 registry["RIRS_CUTOFF"] = GenericMatcher(
     r"INPUT: Cutoff radius for grid points in RI-RS", col=9

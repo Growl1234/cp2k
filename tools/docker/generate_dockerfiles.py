@@ -423,7 +423,7 @@ RUN ./test_manual.sh "${{ADD_EDIT_LINKS}}" 2>&1 | tee report.log
 # ======================================================================================
 def precommit() -> str:
     return rf"""
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Install dependencies.
 WORKDIR /opt/cp2k-precommit
@@ -453,7 +453,7 @@ RUN ./test_{name}.sh 2>&1 | tee report.log
 # ======================================================================================
 def test_without_build(name: str) -> str:
     return rf"""
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Install dependencies.
 WORKDIR /opt/cp2k
@@ -874,7 +874,13 @@ COPY --from=build_cp2k /opt/cp2k/tools/conventions /opt/cp2k/tools/conventions
 COPY --from=build_cp2k /workspace /workspace
 """
     elif test_type == "gromacs":
-        pass
+        output += rf"""
+# Preserve GROMACS QM/MM test data in the final container image
+COPY --from=build_cp2k /opt/cp2k/build/gromacs/src/gromacs/applied_forces/qmmm/tests /opt/cp2k/build/gromacs/src/gromacs/applied_forces/qmmm/tests
+COPY --from=build_cp2k /opt/cp2k/build/gromacs/src/testutils/simulationdatabase /opt/cp2k/build/gromacs/src/testutils/simulationdatabase
+COPY --from=build_cp2k /opt/cp2k/build/gromacs/share/top /opt/cp2k/build/gromacs/share/top
+RUN mkdir -p /opt/cp2k/build/gromacs/build/src/gromacs/applied_forces/qmmm/tests/Testing/Temporary
+"""
     else:
         sys.exit(f"\nERROR: Unknown test type {test_type} specified\n")
     output += rf"""

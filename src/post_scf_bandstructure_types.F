@@ -24,6 +24,8 @@ MODULE post_scf_bandstructure_types
                                               cp_fm_type
    USE dbt_api,                         ONLY: dbt_destroy,&
                                               dbt_type
+   USE gw_auto_ri_types,                ONLY: auto_ri_release,&
+                                              auto_ri_type
    USE input_constants,                 ONLY: G0W0,&
                                               rtp_method_bse,&
                                               rtp_method_bse_linearized,&
@@ -42,6 +44,8 @@ MODULE post_scf_bandstructure_types
    USE physcon,                         ONLY: angstrom,&
                                               evolt
    USE qs_tensors_types,                ONLY: neighbor_list_3c_type
+   USE time_frequency_grid_types,       ONLY: time_frequency_grid_release,&
+                                              time_frequency_grid_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -50,8 +54,8 @@ MODULE post_scf_bandstructure_types
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'post_scf_bandstructure_types'
 
-   PUBLIC :: post_scf_bandstructure_type, ri_rs_env, rirs_grid_type, ri_rs_grid_opt_type, &
-             band_edges_type, data_3_type, bs_env_release
+   PUBLIC :: post_scf_bandstructure_type, ri_rs_env, &
+             rirs_grid_type, ri_rs_grid_opt_type, band_edges_type, data_3_type, bs_env_release
 
    ! valence band maximum (VBM), conduction band minimum (CBM), direct band gap (DBG),
    ! indirect band gap (IDBG)
@@ -112,6 +116,7 @@ MODULE post_scf_bandstructure_types
 
       ! Data types for cutoffs based DBCSR matrices
       REAL(KIND=dp), ALLOCATABLE                       :: chunk_centroids(:, :)
+      ! Centers of atom-blocked AO/RI matrices for CUTOFF_RADIUS_G_W.
       REAL(KIND=dp), ALLOCATABLE                       :: atom_centers(:, :)
       INTEGER, ALLOCATABLE                             :: grid_atom_boundaries(:)
       INTEGER, ALLOCATABLE                             :: pan_first(:), pan_last(:)
@@ -186,6 +191,9 @@ MODULE post_scf_bandstructure_types
       ! parameters for RI-RS implementation of GW
       TYPE(ri_rs_env)                                 :: ri_rs
 
+      ! Parameters for automatic RI basis set optimization.
+      TYPE(auto_ri_type)                              :: auto_ri = auto_ri_type()
+
       ! DBCSR ships each rank's matrix panel in one MPI message whose length is stored in a
       ! 32-bit default INTEGER (dbcsr_mpiwrap.F: msglen = SIZE(buffer)). Exceeding this ceiling
       ! overflows the count to a negative/garbage value and multiply_cannon segfaults. This is
@@ -245,18 +253,14 @@ MODULE post_scf_bandstructure_types
       INTEGER                                      :: small_cell_full_kp_or_large_cell_Gamma = -1, &
                                                       nimages_scf = -1
       INTEGER, DIMENSION(3)                        :: periodic = -1
+      LOGICAL                                      :: do_periodic = .FALSE.
       REAL(KIND=dp), DIMENSION(3, 3)               :: hmat = -1.0_dp
 
       ! imaginary time and frequency grids
       INTEGER                                         :: num_time_freq_points = -1, &
                                                          num_freq_points_fit = -1
-      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE        :: imag_time_points, &
-                                                         imag_time_weights_freq_zero, &
-                                                         imag_freq_points, &
-                                                         imag_freq_points_fit
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: weights_cos_t_to_w, &
-                                                         weights_cos_w_to_t, &
-                                                         weights_sin_t_to_w
+      TYPE(time_frequency_grid_type)                  :: time_frequency_grid
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE        :: imag_freq_points_fit
       INTEGER                                         :: nparam_pade = -1, &
                                                          num_points_per_magnitude = -1
       REAL(KIND=dp)                                   :: freq_max_fit = -1.0_dp, &
@@ -283,6 +287,7 @@ MODULE post_scf_bandstructure_types
                                                       fm_mo_coeff_Gamma = cp_fm_type()
       TYPE(cp_fm_type), DIMENSION(4)               :: fm_work_mo = cp_fm_type()
       TYPE(cp_fm_type)                             :: fm_RI_RI = cp_fm_type(), &
+                                                      fm_Minv_Gamma = cp_fm_type(), &
                                                       fm_chi_Gamma_freq = cp_fm_type(), &
                                                       fm_W_MIC_freq = cp_fm_type(), &
                                                       fm_W_MIC_freq_1_extra = cp_fm_type(), &
@@ -321,6 +326,7 @@ MODULE post_scf_bandstructure_types
                                                       tensor_group_color = -1, &
                                                       num_tensor_groups = -1
       REAL(KIND=dp)                                :: input_memory_per_proc_GB = -1.0_dp
+      LOGICAL                                      :: auto_memory_per_proc = .FALSE.
       TYPE(mp_para_env_type), POINTER              :: para_env => NULL(), &
                                                       para_env_tensor => NULL()
       REAL(KIND=dp)                                :: occupation_3c_int = -1.0_dp, &
@@ -485,9 +491,7 @@ CONTAINS
       IF (ALLOCATED(bs_env%wkp_no_extra)) DEALLOCATE (bs_env%wkp_no_extra)
       IF (ALLOCATED(bs_env%l_RI)) DEALLOCATE (bs_env%l_RI)
       IF (ALLOCATED(bs_env%xkp_special)) DEALLOCATE (bs_env%xkp_special)
-      IF (ALLOCATED(bs_env%imag_time_points)) DEALLOCATE (bs_env%imag_time_points)
-      IF (ALLOCATED(bs_env%imag_time_weights_freq_zero)) DEALLOCATE (bs_env%imag_time_weights_freq_zero)
-      IF (ALLOCATED(bs_env%imag_freq_points)) DEALLOCATE (bs_env%imag_freq_points)
+      CALL time_frequency_grid_release(bs_env%time_frequency_grid)
       IF (ALLOCATED(bs_env%eigenval_scf_Gamma)) DEALLOCATE (bs_env%eigenval_scf_Gamma)
       IF (ALLOCATED(bs_env%eigenval_scf)) DEALLOCATE (bs_env%eigenval_scf)
       IF (ALLOCATED(bs_env%eigenval_GW)) DEALLOCATE (bs_env%eigenval_GW)
@@ -542,6 +546,7 @@ CONTAINS
       CALL cp_fm_release(bs_env%fm_work_mo(3))
       CALL cp_fm_release(bs_env%fm_work_mo(4))
       CALL cp_fm_release(bs_env%fm_RI_RI)
+      CALL cp_fm_release(bs_env%fm_Minv_Gamma)
       CALL cp_fm_release(bs_env%fm_chi_Gamma_freq)
       CALL cp_fm_release(bs_env%fm_W_MIC_freq)
       IF (bs_env%rtp_method == rtp_method_bse .OR. bs_env%rtp_method == rtp_method_bse_linearized) THEN
@@ -607,6 +612,7 @@ CONTAINS
       NULLIFY (bs_env%ri_rs%atomic_kind_set, bs_env%ri_rs%cell, bs_env%ri_rs%particle_set)
       IF (ALLOCATED(bs_env%ri_rs%pan_first)) DEALLOCATE (bs_env%ri_rs%pan_first)
       IF (ALLOCATED(bs_env%ri_rs%pan_last)) DEALLOCATE (bs_env%ri_rs%pan_last)
+      CALL auto_ri_release(bs_env%auto_ri)
 
       DEALLOCATE (bs_env)
 

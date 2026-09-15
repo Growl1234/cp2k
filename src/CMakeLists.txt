@@ -222,6 +222,12 @@ list(
   group_dist_types.F
   grrm_utils.F
   gapw_1c_basis_set.F
+  gw_compute_Z_lP.F
+  gw_compute_Z_lP_utils.F
+  gw_auto_ri_generate_RI_basis.F
+  gw_auto_ri_types.F
+  gw_dbcsr_utils.F
+  gw_fm_utils.F
   gw_communication.F
   gw_main.F
   gw_large_cell_gamma.F
@@ -395,6 +401,7 @@ list(
   molecular_dipoles.F
   molecular_moments.F
   molecular_states.F
+  mo_window.F
   mol_force.F
   molsym.F
   moments_utils.F
@@ -490,7 +497,7 @@ list(
   pme.F
   pme_tools.F
   population_analyses.F
-  lattice_low_rank_preconditioner.F
+  lattice_preconditioner_operator.F
   low_rank_preconditioner_model.F
   preconditioner_apply.F
   preconditioner.F
@@ -555,7 +562,6 @@ list(
   qs_cneo_types.F
   qs_cneo_utils.F
   qs_collocate_density.F
-  qs_commutators.F
   qs_condnum.F
   qs_core_energies.F
   qs_core_hamiltonian.F
@@ -776,6 +782,7 @@ list(
   qs_fgxc_atom.F
   qs_vxc_atom_utils.F
   qs_vxc_atom.F
+  qs_native_grid_cache.F
   qs_vxc.F
   qs_wannier90.F
   qs_wf_history_methods.F
@@ -864,6 +871,7 @@ list(
   tblite_ks_matrix.F
   tblite_scc_mixer.F
   tblite_types.F
+  time_frequency_grid_types.F
   tip_scan_methods.F
   tip_scan_types.F
   topology_amber.F
@@ -1564,10 +1572,12 @@ set(CP2K_PROGS_F
     common/parallel_rng_types_unittest.F
     kpoint_lattice_fft_unittest.F
     kpoint_smearing_unittest.F
+    kpsym_unittest.F
     qs_ot_minimizer_unittest.F
     optbas_frontier_orbitals_utils_unittest.F
     rirs_grid_utils_unittest.F
     low_rank_preconditioner_unittest.F
+    ot_covariant_preconditioner_unittest.F
     qs_charge_mixing_unittest.F
     qs_ot_complex_ref_unittest.F
     subsys/cell_types_unittest.F
@@ -1847,8 +1857,7 @@ target_link_libraries(
     cp2k_linalg_libs
     # Torch includes some LAPACK routines, but with floating-point exceptions.
     $<$<BOOL:${CP2K_USE_LIBTORCH}>:${TORCH_LIBRARIES}>
-    $<$<BOOL:${CP2K_USE_OPENPMD}>:openPMD::openPMD>
-    $<$<AND:$<CONFIG:COVERAGE>,$<Fortran_COMPILER_ID:GNU>>:gcov>)
+    $<$<BOOL:${CP2K_USE_OPENPMD}>:openPMD::openPMD>)
 
 set(CP2K_BUILD_INFO_FILE "${CMAKE_CURRENT_BINARY_DIR}/cp2k_build_info.h")
 file(
@@ -1979,10 +1988,12 @@ list(
   "parallel_rng_types_unittest"
   "kpoint_lattice_fft_unittest"
   "kpoint_smearing_unittest"
+  "kpsym_unittest"
   "qs_ot_minimizer_unittest"
   "optbas_frontier_orbitals_utils_unittest"
   "rirs_grid_utils_unittest"
   "low_rank_preconditioner_unittest"
+  "ot_covariant_preconditioner_unittest"
   "qs_charge_mixing_unittest"
   "qs_ot_complex_ref_unittest"
   "cell_types_unittest"
@@ -2010,12 +2021,15 @@ add_executable(memory_utilities_unittest common/memory_utilities_unittest.F)
 add_executable(parallel_rng_types_unittest common/parallel_rng_types_unittest.F)
 add_executable(kpoint_lattice_fft_unittest kpoint_lattice_fft_unittest.F)
 add_executable(kpoint_smearing_unittest kpoint_smearing_unittest.F)
+add_executable(kpsym_unittest kpsym_unittest.F)
 add_executable(qs_ot_minimizer_unittest qs_ot_minimizer_unittest.F)
 add_executable(optbas_frontier_orbitals_utils_unittest
                optbas_frontier_orbitals_utils_unittest.F)
 add_executable(rirs_grid_utils_unittest rirs_grid_utils_unittest.F)
 add_executable(low_rank_preconditioner_unittest
                low_rank_preconditioner_unittest.F)
+add_executable(ot_covariant_preconditioner_unittest
+               ot_covariant_preconditioner_unittest.F)
 add_executable(qs_charge_mixing_unittest qs_charge_mixing_unittest.F)
 add_executable(qs_ot_complex_ref_unittest qs_ot_complex_ref_unittest.F)
 add_executable(cell_types_unittest subsys/cell_types_unittest.F)
@@ -2152,10 +2166,7 @@ foreach(__app grid_miniapp grid_unittest dbm_miniapp)
            $<$<BOOL:${CP2K_USE_CUDA}>:${CMAKE_CUDA_INCLUDE_DIRECTORIES}>
            $<$<BOOL:${CP2K_USE_HIP}>:${CMAKE_HIP_INCLUDE_DIRECTORIES}>)
 
-  target_link_libraries(
-    ${__app}
-    PUBLIC cp2k_linalg_libs
-           $<$<AND:$<CONFIG:COVERAGE>,$<Fortran_COMPILER_ID:GNU>>:gcov> m)
+  target_link_libraries(${__app} PUBLIC cp2k_linalg_libs m)
 endforeach()
 
 # ##############################################################################

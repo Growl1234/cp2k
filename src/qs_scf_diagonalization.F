@@ -685,7 +685,7 @@ CONTAINS
       TYPE(dbcsr_type), POINTER                          :: cmatrix, rmatrix, tmpmat
       TYPE(kpoint_env_type), POINTER                     :: kp
       TYPE(kpoint_operator_context_type)                 :: op_ctx
-      TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_global
+      TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
       TYPE(qs_matrix_pools_type), POINTER                :: mpools
@@ -956,7 +956,6 @@ CONTAINS
 
       ! Finish communication then diagonalise in each group
       IF (do_diis) THEN
-         CALL get_qs_env(qs_env, para_env=para_env_global)
          scf_section => section_vals_get_subs_vals(qs_env%input, "DFT%SCF")
          cdiis_ncall = kpoints%scf_diis_buffer%ncall
          CALL qs_diis_b_info_kp(kpoints%scf_diis_buffer, ib, nb)
@@ -998,7 +997,7 @@ CONTAINS
          CALL qs_diis_b_step_kp(kpoints%scf_diis_buffer, coeffs, ib, nb, scf_env%iter_delta, diis_error, &
                                 cdiis_step, scf_control%eps_diis, nspin, nkp, kplocal, &
                                 MERGE(2, scf_control%nmixing, use_adiis), &
-                                scf_section, para_env_global)
+                                scf_section, kpoints%para_env_inter_kp)
          diis_weight = 1.0_dp
          IF (use_adiis) THEN
             diis_weight = scf_env%scf_subspace_buffer%diis_weight
@@ -1281,11 +1280,10 @@ CONTAINS
          DIMENSION(:)                                    :: workspace
       TYPE(kp_transform_plan_type)                       :: transform_plan
       TYPE(kpoint_env_type), POINTER                     :: kp
-      TYPE(mp_para_env_type), POINTER                    :: para_env_global
       TYPE(section_vals_type), POINTER                   :: scf_section
 
       CALL timeset(routineN, handle)
-      NULLIFY (matrix_struct, mo_struct, mo_coeff, kp, para_env_global, scf_section)
+      NULLIFY (matrix_struct, mo_struct, mo_coeff, kp, scf_section)
 
       kplocal = SIZE(xkp, 2)
       nspin = SIZE(matrix_ks, 1)
@@ -1302,7 +1300,6 @@ CONTAINS
                                     matrix_ks(1, 1)%matrix)
 
       IF (do_diis) THEN
-         CALL get_qs_env(qs_env, para_env=para_env_global)
          scf_section => section_vals_get_subs_vals(qs_env%input, "DFT%SCF")
          cdiis_ncall = kpoints%scf_diis_buffer%ncall
          CALL qs_diis_b_info_kp(kpoints%scf_diis_buffer, ib, nb)
@@ -1324,7 +1321,7 @@ CONTAINS
          CALL qs_diis_b_step_kp(kpoints%scf_diis_buffer, coeffs, ib, nb, scf_env%iter_delta, diis_error, &
                                 cdiis_step, scf_control%eps_diis, nspin, kplocal, kplocal, &
                                 MERGE(2, scf_control%nmixing, use_adiis), &
-                                scf_section, para_env_global)
+                                scf_section, kpoints%para_env_inter_kp)
          diis_weight = 1.0_dp
          IF (use_adiis) THEN
             diis_weight = scf_env%scf_subspace_buffer%diis_weight
@@ -3174,15 +3171,17 @@ CONTAINS
 !> \param matrix_s_kp real-space overlap matrix, dbcsr image set
 !> \param kpoints ...
 !> \param scf_control ...
+!> \param added_mos_auto_grow ...
 ! **************************************************************************************************
    SUBROUTINE do_block_davidson_diag_kp(qs_env, scf_env, matrix_ks_kp, matrix_s_kp, kpoints, &
-                                        scf_control)
+                                        scf_control, added_mos_auto_grow)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp, matrix_s_kp
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(scf_control_type), POINTER                    :: scf_control
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: added_mos_auto_grow
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'do_block_davidson_diag_kp'
       REAL(KIND=dp), PARAMETER                           :: empty_factor = 5.0_dp, &
@@ -3194,7 +3193,8 @@ CONTAINS
       INTEGER, DIMENSION(2)                              :: kp_range
       INTEGER, DIMENSION(:, :), POINTER                  :: kp_dist
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      LOGICAL                                            :: do_prec, use_real_wfn
+      LOGICAL                                            :: do_prec, my_added_mos_auto_grow, &
+                                                            use_real_wfn
       REAL(KIND=dp)                                      :: eps_iter, eps_iter_empty
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
       TYPE(cp_cfm_type)                                  :: cksmat, csmat, csmat_base
@@ -3377,10 +3377,20 @@ CONTAINS
       END DO
 
       ! occupations and density, same exit chain as do_general_diag_kp
-      CALL kpoint_set_mo_occupation(kpoints, scf_control%smear)
-      CALL kpoint_density_matrices(kpoints)
-      CALL kpoint_density_transform(kpoints, scf_env%p_mix_new, .FALSE., &
-                                    matrix_s_kp(1, 1)%matrix, sab_nl, fmwork, overlap_rs=matrix_s_kp)
+      my_added_mos_auto_grow = .FALSE.
+      CALL kpoint_set_mo_occupation(kpoints, scf_control%smear, &
+                                    added_mos_auto=scf_control%added_mos_auto, &
+                                    added_mos_auto_grow=my_added_mos_auto_grow)
+      IF (my_added_mos_auto_grow) THEN
+         ! the virtual-space buffer is too small for the smearing tail; the
+         ! outer loop grows the MOS and redoes this SCF step, the density of
+         ! the abandoned step must not be assembled
+         IF (PRESENT(added_mos_auto_grow)) added_mos_auto_grow = .TRUE.
+      ELSE
+         CALL kpoint_density_matrices(kpoints)
+         CALL kpoint_density_transform(kpoints, scf_env%p_mix_new, .FALSE., &
+                                       matrix_s_kp(1, 1)%matrix, sab_nl, fmwork, overlap_rs=matrix_s_kp)
+      END IF
 
       CALL cp_cfm_release(cksmat)
       CALL cp_cfm_release(csmat)
