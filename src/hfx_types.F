@@ -46,11 +46,14 @@ MODULE hfx_types
         dbt_pgrid_destroy, dbt_pgrid_type, dbt_type
    USE hfx_helpers,                     ONLY: count_cells_perd,&
                                               next_image_cell_perd
+   USE hfx_lri_types,                   ONLY: hfx_lri_kp_release,&
+                                              hfx_lri_kp_type
    USE input_constants,                 ONLY: &
         do_hfx_auto_shells, do_potential_coulomb, do_potential_gaussian, do_potential_id, &
         do_potential_long, do_potential_mix_cl, do_potential_mix_cl_trunc, do_potential_mix_lg, &
         do_potential_short, do_potential_truncated, hfx_ri_do_2c_diag, hfx_ri_do_2c_iter
-   USE input_cp2k_hfx,                  ONLY: ri_mo,&
+   USE input_cp2k_hfx,                  ONLY: hfx_ri_kp_extended,&
+                                              ri_mo,&
                                               ri_pmat
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -380,7 +383,8 @@ MODULE hfx_types
                        kp_image_range = 0.0_dp, kp_bump_rad = 0.0_dp
       INTEGER :: t2c_sqrt_order = 0, max_iter_lanczos = 0, flavor = 0, unit_nr_dbcsr = -1, unit_nr = -1, &
                  min_bsize = 0, max_bsize_MO = 0, t2c_method = 0, nelectron_total = 0, input_flavor = 0, &
-                 ncell_RI = 0, nimg = 0, kp_stack_size = 0, nimg_nze = 0, kp_ngroups = 1
+                 ncell_RI = 0, nimg = 0, kp_stack_size = 0, nimg_nze = 0, kp_ngroups = 1, &
+                 kp_ri_method = hfx_ri_kp_extended
       LOGICAL :: check_2c_inv = .FALSE., calc_condnum = .FALSE.
 
       TYPE(libint_potential_type) :: ri_metric = libint_potential_type()
@@ -473,6 +477,8 @@ MODULE hfx_types
       REAL(dp)       :: dbcsr_time = 0.0_dp
       INTEGER        :: num_pe = 0
       TYPE(hfx_compression_type), DIMENSION(:, :), ALLOCATABLE :: store_3c
+
+      TYPE(hfx_lri_kp_type), POINTER :: lri_kp => NULL()
 
    END TYPE hfx_ri_type
 
@@ -1232,6 +1238,7 @@ CONTAINS
       CALL section_vals_val_get(ri_section, "SQRT_ORDER", i_val=ri_data%t2c_sqrt_order)
       CALL section_vals_val_get(ri_section, "EPS_LANCZOS", r_val=ri_data%eps_lanczos)
       CALL section_vals_val_get(ri_section, "MAX_ITER_LANCZOS", i_val=ri_data%max_iter_lanczos)
+      CALL section_vals_val_get(ri_section, "KP_RI_METHOD", i_val=ri_data%kp_ri_method)
       CALL section_vals_val_get(ri_section, "RI_FLAVOR", i_val=ri_data%flavor)
       CALL section_vals_val_get(ri_section, "EPS_PGF_ORB", r_val=ri_data%eps_pgf_orb)
       CALL section_vals_val_get(ri_section, "MIN_BLOCK_SIZE", i_val=ri_data%min_bsize)
@@ -1510,7 +1517,9 @@ CONTAINS
 
       ASSOCIATE (unit_nr => ri_data%unit_nr, dbcsr_nflop => ri_data%dbcsr_nflop, &
                  dbcsr_time => ri_data%dbcsr_time, num_pe => ri_data%num_pe)
-         my_flop_rate = REAL(dbcsr_nflop, dp)/(1.0E09_dp*ri_data%dbcsr_time)
+         ! The pair-local backend does not execute DBT contractions.
+         my_flop_rate = 0.0_dp
+         IF (dbcsr_time > 0.0_dp) my_flop_rate = REAL(dbcsr_nflop, dp)/(1.0E09_dp*dbcsr_time)
          IF (unit_nr > 0) WRITE (UNIT=unit_nr, FMT="(/T2,A,T73,ES8.2)") &
             "RI-HFX PERFORMANCE| DBT total number of flops:", REAL(dbcsr_nflop*num_pe, dp)
          IF (unit_nr > 0) WRITE (UNIT=unit_nr, FMT="(T2,A,T66,F15.2)") &
@@ -1702,6 +1711,8 @@ CONTAINS
          END DO
          DEALLOCATE (ri_data%iatom_to_subgroup)
       END IF
+
+      CALL hfx_lri_kp_release(ri_data%lri_kp)
 
       CALL timestop(handle)
    END SUBROUTINE hfx_ri_release
