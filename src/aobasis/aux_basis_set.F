@@ -47,9 +47,10 @@ CONTAINS
 !> \param nl ...
 !> \param npgf ...
 !> \param zet ...
+!> \param gcc Optional supplied contractions on normalized primitives; bypass automatic contraction.
 !> \version 1.0
 ! **************************************************************************************************
-   SUBROUTINE create_aux_basis(aux_basis, bsname, nsets, lmin, lmax, nl, npgf, zet)
+   SUBROUTINE create_aux_basis(aux_basis, bsname, nsets, lmin, lmax, nl, npgf, zet, gcc)
 
       TYPE(gto_basis_set_type), POINTER                  :: aux_basis
       CHARACTER(LEN=default_string_length)               :: bsname
@@ -58,6 +59,8 @@ CONTAINS
       INTEGER, DIMENSION(0:, :), INTENT(IN)              :: nl
       INTEGER, DIMENSION(:), INTENT(IN)                  :: npgf
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: zet
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN), &
+         OPTIONAL                                        :: gcc
 
       INTEGER                                            :: i, ico, info, iset, ishell, j, l, &
                                                             lshell, m, maxco, maxpgf, maxshell, &
@@ -105,7 +108,17 @@ CONTAINS
 
       ! contraction
       aux_basis%gcc = 0.0_dp
+      IF (PRESENT(gcc)) THEN
+         CPASSERT(SIZE(gcc, 1) >= maxpgf)
+         CPASSERT(SIZE(gcc, 2) >= maxshell)
+         CPASSERT(SIZE(gcc, 3) >= nsets)
+      END IF
       DO iset = 1, nsets
+         IF (PRESENT(gcc)) THEN
+            aux_basis%gcc(1:npgf(iset), 1:aux_basis%nshell(iset), iset) = &
+               gcc(1:npgf(iset), 1:aux_basis%nshell(iset), iset)
+            CYCLE
+         END IF
          ns = 0
          DO l = lmin(iset), lmax(iset)
             nx = aux_basis%npgf(iset)
