@@ -14,7 +14,7 @@ MODULE hfx_lri_types
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_k_block_type, hfx_lri_kp_type, &
+   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_kp_type, &
              hfx_lri_pair_block_type, hfx_lri_kp_release
 
    TYPE hfx_lri_pair_block_type
@@ -29,12 +29,6 @@ MODULE hfx_lri_types
       REAL(dp), DIMENSION(3, 2)                          :: aux_r = 0.0_dp
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :)          :: c_fit
    END TYPE hfx_lri_pair_block_type
-
-   TYPE hfx_lri_k_block_type
-      INTEGER                                            :: iatom = 0, jatom = 0
-      INTEGER, DIMENSION(3)                              :: cell = 0
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: k_block
-   END TYPE hfx_lri_k_block_type
 
    ! One coefficient slice with its auxiliary functions fixed on the first atom.  Lattice cells
    ! are reduced to the finite k-mesh quotient before these blocks are stored.
@@ -64,11 +58,10 @@ MODULE hfx_lri_types
 
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: pair_blocks
       TYPE(hfx_lri_pair_block_type), ALLOCATABLE, DIMENSION(:) :: target_pairs
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: k_target
       TYPE(hfx_lri_contract_workspace_type), ALLOCATABLE, DIMENSION(:) :: thread_workspaces
 
-      INTEGER :: nk_blocks = 0
-      TYPE(hfx_lri_k_block_type), ALLOCATABLE, DIMENSION(:) :: k_blocks
+      ! Physical exchange blocks use the same indices and metadata as target_pairs.
+      TYPE(hfx_lri_block_type), ALLOCATABLE, DIMENSION(:) :: k_blocks
    END TYPE hfx_lri_kp_type
 
 CONTAINS
