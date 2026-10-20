@@ -48,7 +48,7 @@ MODULE hfx_lri_parallel
       ! The QS environment owns para_env; this object owns only the split communicator.
       TYPE(mp_para_env_type), POINTER :: para_env => NULL(), subgroup => NULL()
       INTEGER :: ngroups = 1, group_size = 1
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, tasks_s, tasks_t
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: owner, tasks
       ! Canonical key of the untwisted V(i,j,R) = TRANSPOSE(V(j,i,-R)) orbit.
       INTEGER, ALLOCATABLE, DIMENSION(:) :: metric_key
       INTEGER, ALLOCATABLE, DIMENSION(:, :) :: density_keys
