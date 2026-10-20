@@ -96,9 +96,11 @@ CONTAINS
 !> \param first ...
 ! **************************************************************************************************
    SUBROUTINE hfx_lri_loop3_density_remote_add(centered_remote_flat, ncenter, density, RESULT, factor, first)
-      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: centered_remote_flat, density
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: centered_remote_flat
       INTEGER, INTENT(IN)                                :: ncenter
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(INOUT) :: result
+      REAL(dp), DIMENSION(:, :), INTENT(IN)              :: density
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), &
+         INTENT(INOUT)                                   :: result
       REAL(dp), INTENT(IN)                               :: factor
       LOGICAL, INTENT(IN)                                :: first
 
@@ -143,8 +145,8 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: first
       LOGICAL, INTENT(IN), OPTIONAL                      :: transposed
 
+      CHARACTER                                          :: operation
       INTEGER                                            :: nflat, nleft, nright
-      CHARACTER                                         :: operation
       REAL(dp)                                           :: beta
 
       nflat = SIZE(source, 1)*SIZE(source, 2)
@@ -211,7 +213,8 @@ CONTAINS
    SUBROUTINE hfx_lri_loop3_unpack_aux(packed, nfirst, unpacked)
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: packed
       INTEGER, INTENT(IN)                                :: nfirst
-      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(INOUT) :: unpacked
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), &
+         INTENT(INOUT)                                   :: unpacked
 
       INTEGER                                            :: iaux, naux, nsecond
 
@@ -280,42 +283,21 @@ CONTAINS
          INTENT(INOUT)                                   :: workspace
       LOGICAL, INTENT(IN), OPTIONAL                      :: transposed
 
-      INTEGER                                            :: naux, ncenter, nintermediate_aux, nout, &
-                                                            nremote
-      CHARACTER                                         :: operation
+      INTEGER                                            :: ncenter, nintermediate_aux, nout, nremote
+      LOGICAL                                            :: transpose_metric
 
       ncenter = SIZE(centered, 1)
       nremote = SIZE(centered, 2)
-      naux = SIZE(centered, 3)
       nout = SIZE(intermediate_aux_flat, 2)
-      nintermediate_aux = SIZE(metric, 2)
-      operation = "N"
-      IF (PRESENT(transposed)) THEN
-         IF (transposed) THEN
-            nintermediate_aux = SIZE(metric, 1)
-            operation = "T"
-         END IF
-      END IF
-      IF (SIZE(metric, MERGE(1, 2, operation == "N")) /= naux) THEN
-         CPABORT("Inconsistent auxiliary dimensions in LRI loop3 central contraction")
-      END IF
+      transpose_metric = .TRUE.
+      IF (PRESENT(transposed)) transpose_metric = .NOT. transposed
+      CALL hfx_lri_loop3_aux_transform(centered, metric, workspace%loop3_w, &
+                                       1.0_dp, .TRUE., transpose_metric)
+      nintermediate_aux = SIZE(workspace%loop3_w, 3)
       IF (ANY(SHAPE(intermediate_aux_flat) /= &
               [nremote*nintermediate_aux, nout])) THEN
          CPABORT("Inconsistent packed intermediate in LRI loop3 central contraction")
       END IF
-      IF (ALLOCATED(workspace%loop3_w)) THEN
-         IF (ANY(SHAPE(workspace%loop3_w) /= &
-                 [ncenter, nremote, nintermediate_aux])) THEN
-            DEALLOCATE (workspace%loop3_w)
-         END IF
-      END IF
-      IF (.NOT. ALLOCATED(workspace%loop3_w)) THEN
-         ALLOCATE (workspace%loop3_w(ncenter, nremote, nintermediate_aux))
-      END IF
-      CALL dgemm("N", operation, ncenter*nremote, nintermediate_aux, naux, &
-                 1.0_dp, centered(1, 1, 1), ncenter*nremote, metric(1, 1), &
-                 SIZE(metric, 1), 0.0_dp, workspace%loop3_w(1, 1, 1), &
-                 ncenter*nremote)
       IF (ALLOCATED(block)) THEN
          IF (ANY(SHAPE(block) /= [ncenter, nout])) DEALLOCATE (block)
       END IF
