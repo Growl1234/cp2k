@@ -11,6 +11,9 @@
 MODULE hfx_lri_parallel
    USE kinds,                           ONLY: dp,&
                                               int_8
+   USE matrix_communication,            ONLY: allocate_matrix_buffers,&
+                                              exchange_matrix_buffers,&
+                                              matrix_buffer_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE omp_lib,                         ONLY: omp_destroy_lock,&
                                               omp_init_lock,&
@@ -408,9 +411,10 @@ CONTAINS
       INTEGER                                            :: first, h, i, key, last, more, n, nc, nr, &
                                                             p, v
       INTEGER(int_8)                                     :: total
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: hc, headers, incoming, rh, rho, rv, rvo, &
-                                                            sh, sho, sv, svo, vc
-      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: received, values
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: cursor, recv_count, send_count
+      TYPE(matrix_buffer_type)                           :: buffer_rec, buffer_send
+
+! Row 1 counts numerical elements; row 2 counts three-integer block headers.
 
       CPASSERT(SIZE(keys) == SIZE(ranks))
       n = para_env%num_pe
@@ -430,14 +434,13 @@ CONTAINS
          END DO
          RETURN
       END IF
-      ALLOCATE (sh(n), rh(n), sv(n), rv(n), sho(n), rho(n), svo(n), rvo(n), hc(n), vc(n))
+      ALLOCATE (send_count(2, 0:n - 1), recv_count(2, 0:n - 1), cursor(2, 0:n - 1))
       first = 1
       DO
          more = MERGE(1, 0, first <= SIZE(keys))
          CALL para_env%max(more)
          IF (more == 0) EXIT
-         sh = 0
-         sv = 0
+         send_count = 0
          total = 0_int_8
          last = first - 1
          DO i = first, SIZE(keys)
@@ -448,59 +451,56 @@ CONTAINS
             CPASSERT(n > 0)
             IF (i > first .AND. total + INT(n, int_8) > transfer_elements) EXIT
             CPASSERT(total + INT(n, int_8) <= HUGE(0))
-            p = ranks(i) + 1
-            CPASSERT(p >= 1 .AND. p <= para_env%num_pe)
-            sh(p) = sh(p) + 3
-            sv(p) = sv(p) + n
+            p = ranks(i)
+            CPASSERT(p >= 0 .AND. p < para_env%num_pe)
+            send_count(:, p) = send_count(:, p) + [n, 1]
             total = total + INT(n, int_8)
             last = i
          END DO
-         CALL para_env%alltoall(sh, rh, 1)
-         CALL para_env%alltoall(sv, rv, 1)
-         CALL block_offsets(sh, sho)
-         CALL block_offsets(rh, rho)
-         CALL block_offsets(sv, svo)
-         CALL block_offsets(rv, rvo)
-         ALLOCATE (headers(SUM(sh)), incoming(SUM(rh)), values(SUM(sv)), received(SUM(rv)))
-         hc(:) = sho
-         vc(:) = svo
+         CALL para_env%alltoall(send_count, recv_count, 2)
+         ! Check both channels before the shared allocator forms default-integer offsets.
+         IF (MAX(SUM(INT(send_count(1, :), int_8)), SUM(INT(recv_count(1, :), int_8)), &
+                 3_int_8*SUM(INT(send_count(2, :), int_8)), 3_int_8*SUM(INT(recv_count(2, :), int_8))) > &
+             INT(HUGE(0), int_8)) CPABORT("LRI-HFXk MPI buffer exceeds the integer count range")
+         CALL allocate_matrix_buffers(send_count(1, :), recv_count(1, :), 3, buffer_send, buffer_rec, &
+                                      send_count(2, :), recv_count(2, :))
+         cursor(1, :) = buffer_send%msg_offset(:para_env%num_pe - 1)
+         cursor(2, :) = buffer_send%indx_offset(:para_env%num_pe - 1)
          DO i = first, last
             key = keys(i)
-            p = ranks(i) + 1
+            p = ranks(i)
             nr = SIZE(source(key)%values, 1)
             nc = SIZE(source(key)%values, 2)
-            headers(hc(p) + 1:hc(p) + 3) = [key, nr, nc]
-            values(vc(p) + 1:vc(p) + nr*nc) = RESHAPE(source(key)%values, [nr*nc])
-            hc(p) = hc(p) + 3
-            vc(p) = vc(p) + nr*nc
+            buffer_send%indx(:, cursor(2, p) + 1) = [key, nr, nc]
+            buffer_send%msg(cursor(1, p) + 1:cursor(1, p) + nr*nc) = RESHAPE(source(key)%values, [nr*nc])
+            cursor(:, p) = cursor(:, p) + [nr*nc, 1]
          END DO
-         CALL para_env%alltoall(headers, sh, sho, incoming, rh, rho)
-         CALL para_env%alltoall(values, sv, svo, received, rv, rvo)
+         CALL exchange_matrix_buffers(para_env, buffer_rec, buffer_send)
          ! Different source ranks may contribute to the same key. Merge in source-rank order.
-         DO p = 1, para_env%num_pe
-            v = rvo(p)
-            DO h = rho(p) + 1, rho(p) + rh(p), 3
-               key = incoming(h)
-               nr = incoming(h + 1)
-               nc = incoming(h + 2)
+         DO p = 0, para_env%num_pe - 1
+            v = buffer_rec%msg_offset(p)
+            DO h = buffer_rec%indx_offset(p) + 1, buffer_rec%indx_offset(p + 1)
+               key = buffer_rec%indx(1, h)
+               nr = buffer_rec%indx(2, h)
+               nc = buffer_rec%indx(3, h)
                CPASSERT(key >= 1 .AND. key <= SIZE(destination))
                CPASSERT(nr > 0 .AND. nc > 0)
-               CPASSERT(INT(nr, int_8)*INT(nc, int_8) <= INT(rv(p), int_8))
+               CPASSERT(INT(nr, int_8)*INT(nc, int_8) <= INT(recv_count(1, p), int_8))
                n = nr*nc
-               CPASSERT(v + n <= rvo(p) + rv(p))
+               CPASSERT(n <= buffer_rec%msg_offset(p + 1) - v)
                IF (ALLOCATED(destination(key)%values)) THEN
                   CPASSERT(add)
                   CPASSERT(ALL(SHAPE(destination(key)%values) == [nr, nc]))
-                  destination(key)%values(:, :) = destination(key)%values + RESHAPE(received(v + 1:v + n), [nr, nc])
+                  destination(key)%values(:, :) = destination(key)%values + &
+                                                  RESHAPE(buffer_rec%msg(v + 1:v + n), [nr, nc])
                ELSE
                   ALLOCATE (destination(key)%values(nr, nc))
-                  destination(key)%values(:, :) = RESHAPE(received(v + 1:v + n), [nr, nc])
+                  destination(key)%values(:, :) = RESHAPE(buffer_rec%msg(v + 1:v + n), [nr, nc])
                END IF
                v = v + n
             END DO
-            CPASSERT(v == rvo(p) + rv(p))
+            CPASSERT(v == buffer_rec%msg_offset(p + 1))
          END DO
-         DEALLOCATE (headers, incoming, values, received)
          first = last + 1
       END DO
    END SUBROUTINE send_blocks
