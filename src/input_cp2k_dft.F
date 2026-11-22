@@ -76,6 +76,7 @@ MODULE input_cp2k_dft
    USE input_cp2k_transport,            ONLY: create_transport_section
    USE input_cp2k_xas,                  ONLY: create_xas_section,&
                                               create_xas_tdp_section
+   USE input_cp2k_hfx,                  ONLY: create_hf_pair_local_section
    USE input_cp2k_xc,                   ONLY: create_xc_section
    USE input_keyword_types,             ONLY: keyword_create,&
                                               keyword_release,&
@@ -83,6 +84,7 @@ MODULE input_cp2k_dft
    USE input_section_types,             ONLY: section_add_keyword,&
                                               section_add_subsection,&
                                               section_create,&
+                                              section_get_subsection,&
                                               section_release,&
                                               section_type
    USE input_val_types,                 ONLY: char_t,&
@@ -123,7 +125,7 @@ CONTAINS
       TYPE(section_type), POINTER                        :: section
 
       TYPE(keyword_type), POINTER                        :: keyword
-      TYPE(section_type), POINTER                        :: subsection
+      TYPE(section_type), POINTER                        :: hf_section, pair_local, subsection
 
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="DFT", &
@@ -425,6 +427,11 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL create_xc_section(subsection)
+      hf_section => section_get_subsection(subsection, "HF")
+      NULLIFY (pair_local)
+      CALL create_hf_pair_local_section(pair_local)
+      CALL section_add_subsection(hf_section, pair_local)
+      CALL section_release(pair_local)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 

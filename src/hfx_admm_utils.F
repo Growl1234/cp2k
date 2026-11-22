@@ -55,6 +55,8 @@ MODULE hfx_admm_utils
                                               cp_logger_get_default_io_unit,&
                                               cp_logger_type,&
                                               cp_to_string
+   USE cp_output_handling,              ONLY: cp_print_key_unit_nr,&
+                                              cp_print_key_finished_output
    USE distribution_1d_types,           ONLY: distribution_1d_type
    USE distribution_2d_types,           ONLY: distribution_2d_type
    USE external_potential_types,        ONLY: copy_potential
@@ -76,8 +78,6 @@ MODULE hfx_admm_utils
         do_potential_coulomb, do_potential_id, do_potential_long, do_potential_mix_cl, &
         do_potential_mix_cl_trunc, do_potential_short, do_potential_truncated, &
         xc_funct_no_shortcut, xc_none
-   USE input_cp2k_hfx,                  ONLY: hfx_ri_kp_extended,&
-                                              hfx_ri_kp_lri
    USE input_section_types,             ONLY: section_vals_duplicate,&
                                               section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -984,8 +984,8 @@ CONTAINS
                                                             nimages, nspins
       LOGICAL                                            :: do_adiabatic_rescaling, &
                                                             s_mstruct_changed, use_virial
-      REAL(dp)                                           :: eh1, ehfx, eold
-      REAL(dp), ALLOCATABLE, DIMENSION(:)                :: hf_energy
+      REAL(dp)                                           :: eh1, ehfx
+      TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_ks_aux_fit_im, matrix_ks_im
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_h, matrix_ks_aux_fit_hfx_kp, &
                                                             matrix_ks_aux_fit_kp, matrix_ks_orb, &
@@ -998,7 +998,7 @@ CONTAINS
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
       TYPE(qs_rho_type), POINTER                         :: rho_orb
       TYPE(section_vals_type), POINTER                   :: adiabatic_rescaling_section, &
-                                                            hfx_sections, input
+                                                            hf_info, hfx_sections, input
       TYPE(virial_type), POINTER                         :: virial
 
       CALL timeset(routineN, handle)
@@ -1056,9 +1056,8 @@ CONTAINS
          END DO
       END DO
 
-      ALLOCATE (hf_energy(n_rep_hf))
-
-      eold = 0.0_dp
+      logger => cp_get_default_logger()
+      ehfx = 0.0_dp
 
       DO irep = 1, n_rep_hf
 
@@ -1070,30 +1069,24 @@ CONTAINS
          END IF
          CALL qs_rho_get(rho_struct=rho_orb, rho_ao_kp=rho_ao_orb)
 
-         ! Finally the real hfx calulation
-         ehfx = 0.0_dp
-
-         IF (.NOT. x_data(irep, 1)%do_hfx_ri) THEN
-            CPABORT("Only RI-HFX is implemented for K-points")
-         END IF
-
-         SELECT CASE (x_data(irep, 1)%ri_data%kp_ri_method)
-         CASE (hfx_ri_kp_extended)
-            CALL hfx_ri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
+         IF (ALLOCATED(x_data(irep, 1)%lri)) THEN
+            IF (calculate_forces) CPABORT("Forces are not implemented for HF%PAIR_LOCAL")
+            ASSOCIATE (lri => x_data(irep, 1)%lri)
+               hf_info => section_vals_get_subs_vals(hfx_sections, "HF_INFO", i_rep_section=irep)
+               lri%unit_nr = cp_print_key_unit_nr(logger, hf_info, extension=".scfLog")
+               CALL hfx_lri_update_ks_kp(qs_env, lri, matrix_ks_orb, eh1, rho_ao_orb, &
+                                         s_mstruct_changed, x_data(irep, 1)%general_parameter%fraction)
+               CALL cp_print_key_finished_output(lri%unit_nr, logger, hf_info)
+            END ASSOCIATE
+         ELSE IF (x_data(irep, 1)%do_hfx_ri) THEN
+            CALL hfx_ri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, eh1, &
                                      rho_ao_orb, s_mstruct_changed, nspins, &
                                      x_data(irep, 1)%general_parameter%fraction)
-         CASE (hfx_ri_kp_lri)
-            CALL hfx_lri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
-                                      rho_ao_orb, s_mstruct_changed, nspins, &
-                                      x_data(irep, 1)%general_parameter%fraction)
-         CASE DEFAULT
-            CPABORT("Unknown k-point RI-HFX backend")
-         END SELECT
+         ELSE
+            CPABORT("K-point HFX requires HF%RI or HF%PAIR_LOCAL")
+         END IF
 
          IF (calculate_forces) THEN
-            IF (x_data(irep, 1)%ri_data%kp_ri_method == hfx_ri_kp_lri) THEN
-               CPABORT("Forces are not implemented for the LRI-HFXk backend")
-            END IF
             !Scale auxiliary density matrix for ADMMP (see Merlot2014) with gsi(ispin) to scale force
             IF (dft_control%do_admm) THEN
                CALL scale_dm(qs_env, rho_ao_orb, scale_back=.FALSE.)
@@ -1109,9 +1102,8 @@ CONTAINS
          END IF
 
          CALL pw_env_get(pw_env, auxbas_pw_pool=auxbas_pw_pool, poisson_env=poisson_env)
-         eh1 = ehfx - eold
+         ehfx = ehfx + eh1
          CALL pw_hfx(qs_env, eh1, hfx_sections, poisson_env, auxbas_pw_pool, irep)
-         eold = ehfx
 
       END DO
 
@@ -1285,12 +1277,6 @@ CONTAINS
          ehfx = 0.0_dp
 
          IF (x_data(irep, 1)%do_hfx_ri) THEN
-
-            IF (x_data(irep, 1)%ri_data%kp_ri_method == hfx_ri_kp_lri) THEN
-               CALL cp_abort(__LOCATION__, "The LRI-HFX backend is currently only available "// &
-                             "for k-point calculations. Use KPOINTS or select the default "// &
-                             "RI-HFX backend for Gamma-only HFX.")
-            END IF
 
             CALL hfx_ri_update_ks(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
                                   mo_array, rho_ao_orb, &

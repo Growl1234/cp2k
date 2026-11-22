@@ -9,13 +9,14 @@ MODULE hfx_lri_types
    USE hfx_lri_contract,                ONLY: hfx_lri_contract_workspace_type
    USE hfx_lri_parallel,                ONLY: hfx_lri_block_type,&
                                               hfx_lri_parallel_type
+   USE integral_library_types,          ONLY: coulomb_operator_type
    USE kinds,                           ONLY: dp
 
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_kp_type, &
-             hfx_lri_pair_block_type, hfx_lri_kp_release
+   PUBLIC :: hfx_lri_centered_block_type, hfx_lri_lattice_type, &
+             hfx_lri_pair_block_type, hfx_lri_release_lattice, hfx_lri_type
 
    TYPE hfx_lri_pair_block_type
       LOGICAL                                            :: onsite_pair = .FALSE., fit_active = .FALSE.
@@ -43,7 +44,7 @@ MODULE hfx_lri_types
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: inner_remote_flat
    END TYPE hfx_lri_centered_block_type
 
-   TYPE hfx_lri_kp_type
+   TYPE hfx_lri_lattice_type
       TYPE(hfx_lri_parallel_type) :: parallel = hfx_lri_parallel_type()
       INTEGER                                            :: lattice_natom = 0, lattice_ncell = 0, &
                                                             lattice_total_nao = 0
@@ -62,25 +63,35 @@ MODULE hfx_lri_types
 
       ! Physical exchange blocks use the same indices and metadata as target_pairs.
       TYPE(hfx_lri_block_type), ALLOCATABLE, DIMENSION(:) :: k_blocks
-   END TYPE hfx_lri_kp_type
+   END TYPE hfx_lri_lattice_type
+
+   TYPE hfx_lri_type
+      TYPE(coulomb_operator_type) :: ri_metric, hfx_pot
+      REAL(dp) :: eps_eigval, eps_pgf_orb, filter_eps, filter_eps_2c
+      INTEGER :: ngroups, validate_max_work, validate_max_memory, validate_reciprocal_work
+      LOGICAL :: validate
+      INTEGER :: unit_nr = -1
+      TYPE(hfx_lri_lattice_type), ALLOCATABLE :: lattice
+   END TYPE hfx_lri_type
 
 CONTAINS
 
 ! **************************************************************************************************
 !> \brief ...
-!> \param lri_kp ...
+!> \param lattice ...
 ! **************************************************************************************************
-   SUBROUTINE hfx_lri_kp_release(lri_kp)
-      TYPE(hfx_lri_kp_type), POINTER                     :: lri_kp
+   SUBROUTINE hfx_lri_release_lattice(lattice)
+      TYPE(hfx_lri_lattice_type), ALLOCATABLE, &
+         INTENT(INOUT)                                   :: lattice
 
-      IF (ASSOCIATED(lri_kp)) THEN
-         IF (ASSOCIATED(lri_kp%parallel%subgroup)) THEN
-            CALL lri_kp%parallel%subgroup%free()
-            DEALLOCATE (lri_kp%parallel%subgroup)
+      IF (ALLOCATED(lattice)) THEN
+         IF (ASSOCIATED(lattice%parallel%subgroup)) THEN
+            CALL lattice%parallel%subgroup%free()
+            DEALLOCATE (lattice%parallel%subgroup)
          END IF
-         DEALLOCATE (lri_kp)
+         DEALLOCATE (lattice)
       END IF
 
-   END SUBROUTINE hfx_lri_kp_release
+   END SUBROUTINE hfx_lri_release_lattice
 
 END MODULE hfx_lri_types

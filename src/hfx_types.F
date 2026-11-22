@@ -52,20 +52,21 @@ MODULE hfx_types
                                               hfx_screen_coeff_type => eri4_screen_coeff_type
    USE hfx_helpers,                     ONLY: count_cells_perd,&
                                               next_image_cell_perd
-   USE hfx_lri_types,                   ONLY: hfx_lri_kp_release,&
-                                              hfx_lri_kp_type
+   USE hfx_lri_types,                   ONLY: hfx_lri_release_lattice,&
+                                              hfx_lri_type
    USE input_constants,                 ONLY: &
         do_hfx_auto_shells, do_potential_coulomb, do_potential_gaussian, do_potential_id, &
         do_potential_long, do_potential_mix_cl, do_potential_mix_cl_trunc, do_potential_mix_lg, &
         do_potential_short, do_potential_truncated, hfx_ri_do_2c_diag, hfx_ri_do_2c_iter
-   USE input_cp2k_hfx,                  ONLY: hfx_ri_kp_extended,&
-                                              ri_mo,&
+   USE input_cp2k_hfx,                  ONLY: ri_mo,&
                                               ri_pmat
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
-   USE integral_library_types,          ONLY: compare_potential_types,&
+   USE integral_library_types,          ONLY: active_integral_library,&
+                                              library_libint,&
+                                              compare_potential_types,&
                                               coulomb_operator_type,&
                                               hfx_potential_type => coulomb_operator_type
    USE kinds,                           ONLY: default_path_length,&
@@ -115,7 +116,7 @@ MODULE hfx_types
              alloc_containers, dealloc_containers, hfx_task_list_type, &
              hfx_create_neighbor_cells, hfx_create_basis_types, hfx_release_basis_types, &
              hfx_ri_type, hfx_compression_type, block_ind_type, hfx_ri_init, hfx_ri_release, &
-             compare_hfx_sections
+             compare_hfx_sections, hfx_pair_local_section
 
 #define CACHE_SIZE 1024
 #define BITS_MAX_VAL 6
@@ -335,8 +336,7 @@ MODULE hfx_types
                        kp_image_range = 0.0_dp, kp_bump_rad = 0.0_dp
       INTEGER :: t2c_sqrt_order = 0, max_iter_lanczos = 0, flavor = 0, unit_nr_dbcsr = -1, unit_nr = -1, &
                  min_bsize = 0, max_bsize_MO = 0, t2c_method = 0, nelectron_total = 0, input_flavor = 0, &
-                 ncell_RI = 0, nimg = 0, kp_stack_size = 0, nimg_nze = 0, kp_ngroups = 1, &
-                 kp_ri_method = hfx_ri_kp_extended
+                 ncell_RI = 0, nimg = 0, kp_stack_size = 0, nimg_nze = 0, kp_ngroups = 1
       LOGICAL :: check_2c_inv = .FALSE., calc_condnum = .FALSE.
 
       TYPE(coulomb_operator_type) :: ri_metric = coulomb_operator_type()
@@ -439,8 +439,6 @@ MODULE hfx_types
       INTEGER        :: num_pe = 0
       TYPE(hfx_compression_type), DIMENSION(:, :), ALLOCATABLE :: store_3c
 
-      TYPE(hfx_lri_kp_type), POINTER :: lri_kp => NULL()
-
    END TYPE hfx_ri_type
 
 ! **************************************************************************************************
@@ -531,6 +529,7 @@ MODULE hfx_types
       LOGICAL, DIMENSION(:, :), POINTER         :: atomic_pair_list_forces => NULL()
       LOGICAL                                   :: do_hfx_ri = .FALSE.
       TYPE(hfx_ri_type), POINTER                :: ri_data => NULL()
+      TYPE(hfx_lri_type), ALLOCATABLE            :: lri
 
       ! ACE fields
       LOGICAL  :: use_ace = .FALSE.
@@ -594,7 +593,7 @@ CONTAINS
       REAL(dp)                                           :: real_val
       TYPE(hfx_type), POINTER                            :: actual_x_data
       TYPE(section_vals_type), POINTER                   :: hf_pbc_section, hf_sub_section, &
-                                                            hfx_ri_section
+                                                            hfx_ri_section, pair_local
 
       CALL timeset(routineN, handle)
 
@@ -605,11 +604,16 @@ CONTAINS
 
       !! There might be 2 hf sections
       CALL section_vals_get(hfx_section, n_repetition=n_rep_hf)
+      ! Only four-center HFX needs one hfx_type instance per OpenMP thread.
       n_threads = 1
-!$    n_threads = omp_get_max_threads()
-
-      CALL section_vals_val_get(hfx_section, "RI%_SECTION_PARAMETERS_", l_val=do_ri)
-      IF (do_ri) n_threads = 1 ! RI implementation does not use threads
+      DO irep = 1, n_rep_hf
+         hfx_ri_section => section_vals_get_subs_vals(hfx_section, "RI", i_rep_section=irep)
+         CALL section_vals_val_get(hfx_ri_section, "_SECTION_PARAMETERS_", l_val=do_ri)
+         IF (.NOT. do_ri .AND. .NOT. ASSOCIATED(hfx_pair_local_section(hfx_section, irep))) THEN
+!$          n_threads = omp_get_max_threads()
+            EXIT
+         END IF
+      END DO
 
       IF (PRESENT(orb_basis)) THEN
          orb_basis_type = orb_basis
@@ -641,13 +645,8 @@ CONTAINS
             CALL section_vals_val_get(hfx_section, "HFX_LIBRARY", i_val=int_val, i_rep_section=irep)
             actual_x_data%general_parameter%hfx_library = int_val
 
-            hfx_ri_section => section_vals_get_subs_vals(hfx_section, "RI")
+            hfx_ri_section => section_vals_get_subs_vals(hfx_section, "RI", i_rep_section=irep)
             CALL section_vals_val_get(hfx_ri_section, "_SECTION_PARAMETERS_", l_val=actual_x_data%do_hfx_ri)
-
-            !! MEMORY section
-            hf_sub_section => section_vals_get_subs_vals(hfx_section, "MEMORY", i_rep_section=irep)
-            CALL parse_memory_section(actual_x_data%memory_parameter, hf_sub_section, storage_id, i_thread, &
-                                      n_threads, para_env, irep, skip_disk=.FALSE., skip_in_core_forces=.FALSE.)
 
             !! PERIODIC section
             hf_sub_section => section_vals_get_subs_vals(hfx_section, "PERIODIC", i_rep_section=irep)
@@ -733,6 +732,46 @@ CONTAINS
             IF (actual_x_data%potential_parameter%potential_type == do_potential_id) THEN
                actual_x_data%potential_parameter%cutoff_radius = 0.0_dp
             END IF
+
+            ! ACE section — read only on thread 1 to avoid redundant work
+            IF (i_thread == 1) THEN
+               hf_sub_section => section_vals_get_subs_vals(hfx_section, "ACE", &
+                                                            i_rep_section=irep)
+               CALL section_vals_get(hf_sub_section, explicit=logic_val)
+               IF (logic_val) THEN
+                  CALL section_vals_val_get(hf_sub_section, "ACTIVE", &
+                                            l_val=actual_x_data%use_ace)
+                  CALL section_vals_val_get(hf_sub_section, "REBUILD_FREQUENCY", &
+                                            i_val=actual_x_data%ace_rebuild_freq)
+               END IF
+               ! Sanity checks
+               IF (actual_x_data%use_ace) THEN
+                  ! ACE requires HFX to be meaningful
+                  IF (actual_x_data%general_parameter%fraction <= 0.0_dp) THEN
+                     CPABORT("ACE requires FRACTION > 0.")
+                  END IF
+                  ! If frequency is 1, it is full HFX
+                  IF (actual_x_data%ace_rebuild_freq < 1) THEN
+                     CPABORT("ACE: REBUILD_FREQUENCY must be >= 1")
+                  END IF
+               END IF
+            END IF
+
+            pair_local => hfx_pair_local_section(hfx_section, irep)
+            IF (ASSOCIATED(pair_local)) THEN
+               IF (actual_x_data%use_ace) CPABORT("ACE is unavailable for pair-local k-point exchange")
+               IF (actual_x_data%periodic_parameter%do_periodic) CALL hfx_check_periodic_potential(actual_x_data, cell, nkp_grid)
+               ALLOCATE (actual_x_data%lri)
+               hf_sub_section => section_vals_get_subs_vals(hfx_section, "INTERACTION_POTENTIAL", i_rep_section=irep)
+               CALL hfx_lri_init(actual_x_data%lri, pair_local, actual_x_data%potential_parameter, &
+                                 actual_x_data%screening_parameter%eps_schwarz, hf_sub_section, para_env%num_pe)
+               CYCLE
+            END IF
+
+            !! MEMORY section
+            hf_sub_section => section_vals_get_subs_vals(hfx_section, "MEMORY", i_rep_section=irep)
+            CALL parse_memory_section(actual_x_data%memory_parameter, hf_sub_section, storage_id, i_thread, &
+                                      n_threads, para_env, irep, skip_disk=.FALSE., skip_in_core_forces=.FALSE.)
 
             !! LOAD_BALANCE section
             hf_sub_section => section_vals_get_subs_vals(hfx_section, "LOAD_BALANCE", i_rep_section=irep)
@@ -982,39 +1021,15 @@ CONTAINS
             actual_x_data%b_first_load_balance_energy = .TRUE.
             actual_x_data%b_first_load_balance_forces = .TRUE.
 
-            hf_sub_section => section_vals_get_subs_vals(hfx_section, "RI", i_rep_section=irep)
             IF (actual_x_data%do_hfx_ri) THEN
                CPASSERT(PRESENT(nelectron_total))
                ALLOCATE (actual_x_data%ri_data)
                CALL hfx_ri_init_read_input_from_hfx(actual_x_data%ri_data, actual_x_data, hfx_section, &
-                                                    hf_sub_section, qs_kind_set, &
+                                                    hfx_ri_section, qs_kind_set, &
                                                     particle_set, atomic_kind_set, dft_control, para_env, irep, &
                                                     nelectron_total, orb_basis_type, ri_basis_type)
             END IF
 
-            ! ACE section — read only on thread 1 to avoid redundant work
-            IF (i_thread == 1) THEN
-               hf_sub_section => section_vals_get_subs_vals(hfx_section, "ACE", &
-                                                            i_rep_section=irep)
-               CALL section_vals_get(hf_sub_section, explicit=logic_val)
-               IF (logic_val) THEN
-                  CALL section_vals_val_get(hf_sub_section, "ACTIVE", &
-                                            l_val=actual_x_data%use_ace)
-                  CALL section_vals_val_get(hf_sub_section, "REBUILD_FREQUENCY", &
-                                            i_val=actual_x_data%ace_rebuild_freq)
-               END IF
-               ! Sanity checks
-               IF (actual_x_data%use_ace) THEN
-                  ! ACE requires HFX to be meaningful
-                  IF (actual_x_data%general_parameter%fraction <= 0.0_dp) THEN
-                     CPABORT("ACE requires FRACTION > 0.")
-                  END IF
-                  ! If frequency is 1, it is full HFX
-                  IF (actual_x_data%ace_rebuild_freq < 1) THEN
-                     CPABORT("ACE: REBUILD_FREQUENCY must be >= 1")
-                  END IF
-               END IF
-            END IF
          END DO
       END DO
 
@@ -1026,6 +1041,119 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE hfx_create
+
+! **************************************************************************************************
+!> \brief Reads the operator used for fitting, with defaults from the exchange potential.
+!> \param ri_section ...
+!> \param hfx_pot ...
+!> \param eps_schwarz ...
+!> \param ri_metric ...
+! **************************************************************************************************
+   SUBROUTINE hfx_read_ri_metric(ri_section, hfx_pot, eps_schwarz, ri_metric)
+      TYPE(section_vals_type), POINTER                   :: ri_section
+      TYPE(coulomb_operator_type), INTENT(IN)            :: hfx_pot
+      REAL(dp), INTENT(IN)                               :: eps_schwarz
+      TYPE(coulomb_operator_type), INTENT(INOUT)         :: ri_metric
+
+      LOGICAL                                            :: explicit
+
+      CALL section_vals_val_get(ri_section, "RI_METRIC", i_val=ri_metric%potential_type, explicit=explicit)
+      IF (.NOT. explicit .OR. ri_metric%potential_type == 0) THEN
+         ri_metric%potential_type = hfx_pot%potential_type
+      END IF
+
+      CALL section_vals_val_get(ri_section, "OMEGA", r_val=ri_metric%omega, explicit=explicit)
+      IF (.NOT. explicit) THEN
+         ri_metric%omega = hfx_pot%omega
+      END IF
+
+      CALL section_vals_val_get(ri_section, "CUTOFF_RADIUS", r_val=ri_metric%cutoff_radius, explicit=explicit)
+      IF (.NOT. explicit) THEN
+         IF (ri_metric%potential_type == do_potential_short) THEN
+            CALL erfc_cutoff(eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
+         ELSE
+            ri_metric%cutoff_radius = hfx_pot%cutoff_radius
+         END IF
+      END IF
+      IF (ri_metric%potential_type == do_potential_id) ri_metric%cutoff_radius = 0.0_dp
+
+   END SUBROUTINE hfx_read_ri_metric
+
+! **************************************************************************************************
+!> \brief Returns the active pair-local subsection for one HF repetition.
+!> \param hf_section ...
+!> \param irep ...
+!> \return Null if pair-local exchange is disabled or unavailable here.
+! **************************************************************************************************
+   FUNCTION hfx_pair_local_section(hf_section, irep) RESULT(pair_local)
+      TYPE(section_vals_type), POINTER                   :: hf_section
+      INTEGER, INTENT(IN)                                :: irep
+      TYPE(section_vals_type), POINTER                   :: pair_local
+
+      LOGICAL                                            :: active
+
+      pair_local => section_vals_get_subs_vals(hf_section, "PAIR_LOCAL", i_rep_section=irep, can_return_null=.TRUE.)
+      IF (ASSOCIATED(pair_local)) THEN
+         CALL section_vals_val_get(pair_local, "_SECTION_PARAMETERS_", l_val=active)
+         IF (.NOT. active) NULLIFY (pair_local)
+      END IF
+   END FUNCTION hfx_pair_local_section
+
+! **************************************************************************************************
+!> \brief Reads pair-local settings once, before the first exchange build.
+!> \param lri ...
+!> \param pair_local ...
+!> \param hfx_pot ...
+!> \param eps_schwarz ...
+!> \param potential_section ...
+!> \param num_pe ...
+! **************************************************************************************************
+   SUBROUTINE hfx_lri_init(lri, pair_local, hfx_pot, eps_schwarz, potential_section, num_pe)
+      TYPE(hfx_lri_type), INTENT(OUT)                    :: lri
+      TYPE(section_vals_type), POINTER                   :: pair_local, potential_section
+      TYPE(coulomb_operator_type), INTENT(IN)            :: hfx_pot
+      REAL(dp), INTENT(IN)                               :: eps_schwarz
+      INTEGER, INTENT(IN)                                :: num_pe
+
+      LOGICAL                                            :: explicit_hfx_cutoff
+
+      IF (hfx_pot%potential_type /= do_potential_short .AND. hfx_pot%potential_type /= do_potential_truncated) THEN
+         CPABORT("HF%PAIR_LOCAL requires SHORTRANGE or TRUNCATED exchange")
+      END IF
+      IF (active_integral_library%coulomb2_library /= library_libint .OR. &
+          active_integral_library%coulomb3_library /= library_libint) THEN
+         CPABORT("HF%PAIR_LOCAL requires LIBINT for COULOMB_2C and COULOMB_3C")
+      END IF
+
+      CALL section_vals_val_get(pair_local, "NGROUPS", i_val=lri%ngroups)
+      IF (lri%ngroups <= 0) CPABORT("PAIR_LOCAL%NGROUPS must be positive")
+      IF (MODULO(num_pe, lri%ngroups) /= 0) THEN
+         CPWARN("PAIR_LOCAL%NGROUPS must divide the number of MPI ranks. Using one subgroup.")
+         lri%ngroups = 1
+      END IF
+      CALL section_vals_val_get(pair_local, "EPS_FILTER", r_val=lri%filter_eps)
+      CALL section_vals_val_get(pair_local, "EPS_FILTER_2C", r_val=lri%filter_eps_2c)
+      CALL section_vals_val_get(pair_local, "EPS_EIGVAL", r_val=lri%eps_eigval)
+      CALL section_vals_val_get(pair_local, "EPS_PGF_ORB", r_val=lri%eps_pgf_orb)
+      CALL section_vals_val_get(pair_local, "VALIDATE", l_val=lri%validate)
+      CALL section_vals_val_get(pair_local, "VALIDATE_MAX_WORK", i_val=lri%validate_max_work)
+      CALL section_vals_val_get(pair_local, "VALIDATE_MAX_MEMORY", i_val=lri%validate_max_memory)
+      CALL section_vals_val_get(pair_local, "VALIDATE_RECIPROCAL_WORK", i_val=lri%validate_reciprocal_work)
+      IF (MIN(lri%validate_max_work, lri%validate_max_memory, lri%validate_reciprocal_work) < 0) THEN
+         CPABORT("PAIR_LOCAL validation budgets must be nonnegative")
+      END IF
+
+      lri%hfx_pot = hfx_pot
+      CALL hfx_read_ri_metric(pair_local, hfx_pot, eps_schwarz, lri%ri_metric)
+      IF (lri%ri_metric%potential_type == do_potential_truncated) THEN
+         CALL section_vals_val_get(potential_section, "T_C_G_DATA", c_val=lri%ri_metric%filename)
+         CALL compress(lri%ri_metric%filename, .TRUE.)
+      END IF
+      CALL section_vals_val_get(potential_section, "CUTOFF_RADIUS", explicit=explicit_hfx_cutoff)
+      IF (hfx_pot%potential_type == do_potential_short .AND. .NOT. explicit_hfx_cutoff) THEN
+         CALL erfc_cutoff(lri%filter_eps_2c, hfx_pot%omega, lri%hfx_pot%cutoff_radius)
+      END IF
+   END SUBROUTINE hfx_lri_init
 
 ! **************************************************************************************************
 !> \brief Read RI input and initialize RI data for use within Hartree-Fock
@@ -1150,25 +1278,8 @@ CONTAINS
       CALL section_vals_val_get(ri_section, "EPS_FILTER_MO", r_val=ri_data%filter_eps_mo)
 
       ASSOCIATE (ri_metric => ri_data%ri_metric, hfx_pot => ri_data%hfx_pot)
-         CALL section_vals_val_get(ri_section, "RI_METRIC", i_val=ri_metric%potential_type, explicit=explicit)
-         IF (.NOT. explicit .OR. ri_metric%potential_type == 0) THEN
-            ri_metric%potential_type = hfx_pot%potential_type
-         END IF
-
-         CALL section_vals_val_get(ri_section, "OMEGA", r_val=ri_metric%omega, explicit=explicit)
-         IF (.NOT. explicit) THEN
-            ri_metric%omega = hfx_pot%omega
-         END IF
-
-         CALL section_vals_val_get(ri_section, "CUTOFF_RADIUS", r_val=ri_metric%cutoff_radius, explicit=explicit_ri_cutoff)
-         IF (.NOT. explicit_ri_cutoff) THEN
-            IF (ri_metric%potential_type == do_potential_short) THEN
-               CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
-            ELSE
-               ri_metric%cutoff_radius = hfx_pot%cutoff_radius
-            END IF
-         END IF
-
+         CALL hfx_read_ri_metric(ri_section, hfx_pot, ri_data%eps_schwarz, ri_metric)
+         CALL section_vals_val_get(ri_section, "CUTOFF_RADIUS", explicit=explicit_ri_cutoff)
          CALL section_vals_val_get(ri_section, "SCALE_COULOMB", r_val=ri_metric%scale_coulomb, explicit=explicit)
          IF (.NOT. explicit) THEN
             ri_metric%scale_coulomb = hfx_pot%scale_coulomb
@@ -1179,7 +1290,6 @@ CONTAINS
             ri_metric%scale_longrange = hfx_pot%scale_longrange
          END IF
 
-         IF (ri_metric%potential_type == do_potential_id) ri_metric%cutoff_radius = 0.0_dp
          IF (hfx_pot%potential_type == do_potential_short .AND. .NOT. ri_data%explicit_hfx_cutoff) THEN
             ! Use the tighter 2c screening threshold for the exchange metric.
             CALL erfc_cutoff(ri_data%filter_eps_2c, hfx_pot%omega, hfx_pot%cutoff_radius)
@@ -1200,7 +1310,6 @@ CONTAINS
       CALL section_vals_val_get(ri_section, "SQRT_ORDER", i_val=ri_data%t2c_sqrt_order)
       CALL section_vals_val_get(ri_section, "EPS_LANCZOS", r_val=ri_data%eps_lanczos)
       CALL section_vals_val_get(ri_section, "MAX_ITER_LANCZOS", i_val=ri_data%max_iter_lanczos)
-      CALL section_vals_val_get(ri_section, "KP_RI_METHOD", i_val=ri_data%kp_ri_method)
       CALL section_vals_val_get(ri_section, "RI_FLAVOR", i_val=ri_data%flavor)
       CALL section_vals_val_get(ri_section, "EPS_PGF_ORB", r_val=ri_data%eps_pgf_orb)
       CALL section_vals_val_get(ri_section, "MIN_BLOCK_SIZE", i_val=ri_data%min_bsize)
@@ -1459,7 +1568,6 @@ CONTAINS
 
       ASSOCIATE (unit_nr => ri_data%unit_nr, dbcsr_nflop => ri_data%dbcsr_nflop, &
                  dbcsr_time => ri_data%dbcsr_time, num_pe => ri_data%num_pe)
-         ! The pair-local backend does not execute DBT contractions.
          my_flop_rate = 0.0_dp
          IF (dbcsr_time > 0.0_dp) my_flop_rate = REAL(dbcsr_nflop, dp)/(1.0E09_dp*dbcsr_time)
          IF (unit_nr > 0) WRITE (UNIT=unit_nr, FMT="(/T2,A,T73,ES8.2)") &
@@ -1661,8 +1769,6 @@ CONTAINS
          END DO
          DEALLOCATE (ri_data%iatom_to_subgroup)
       END IF
-
-      CALL hfx_lri_kp_release(ri_data%lri_kp)
 
       CALL timestop(handle)
    END SUBROUTINE hfx_ri_release
@@ -1943,6 +2049,10 @@ CONTAINS
       DO i_thread = 1, n_threads
          DO irep = 1, n_rep_hf
             actual_x_data => x_data(irep, i_thread)
+            IF (ALLOCATED(actual_x_data%lri)) THEN
+               CALL hfx_lri_release_lattice(actual_x_data%lri%lattice)
+               CYCLE
+            END IF
             DEALLOCATE (actual_x_data%neighbor_cells)
             DEALLOCATE (actual_x_data%distribution_energy)
             DEALLOCATE (actual_x_data%distribution_forces)
@@ -2058,6 +2168,65 @@ CONTAINS
    END SUBROUTINE hfx_release
 
 ! **************************************************************************************************
+!> \brief Checks the range of periodic exchange against the sampled supercell.
+!> \param x_data ...
+!> \param cell ...
+!> \param nkp_grid ...
+! **************************************************************************************************
+   SUBROUTINE hfx_check_periodic_potential(x_data, cell, nkp_grid)
+      TYPE(hfx_type), INTENT(IN)                         :: x_data
+      TYPE(cell_type), POINTER                           :: cell
+      INTEGER, DIMENSION(3), OPTIONAL                    :: nkp_grid
+
+      CHARACTER(LEN=512)                                 :: error_msg
+      INTEGER, DIMENSION(3)                              :: nkp
+      LOGICAL                                            :: do_kpoints
+      REAL(dp)                                           :: l_min
+
+      nkp = 1
+      IF (PRESENT(nkp_grid)) nkp = nkp_grid
+      do_kpoints = ANY(nkp > 1)
+
+      IF (x_data%potential_parameter%potential_type /= do_potential_truncated .AND. &
+          x_data%potential_parameter%potential_type /= do_potential_short .AND. &
+          x_data%potential_parameter%potential_type /= do_potential_mix_cl_trunc .AND. &
+          x_data%potential_parameter%potential_type /= do_potential_id) THEN
+         CALL cp_warn(__LOCATION__, &
+                      "Periodic Hartree Fock calculation requested without use "// &
+                      "of a truncated or shortrange potential. This may lead to unphysical total energies. "// &
+                      "Use a truncated  potential to avoid possible problems.")
+      ELSE IF (x_data%potential_parameter%potential_type /= do_potential_id) THEN
+         !If k-points, use the Born-von Karman super cell as reference
+         l_min = MIN(REAL(nkp(1), dp)*plane_distance(1, 0, 0, cell), &
+                     REAL(nkp(2), dp)*plane_distance(0, 1, 0, cell), &
+                     REAL(nkp(3), dp)*plane_distance(0, 0, 1, cell))
+         l_min = 0.5_dp*l_min
+         IF (x_data%potential_parameter%cutoff_radius >= l_min) THEN
+            IF (.NOT. do_kpoints) THEN
+               WRITE (error_msg, "(A,F6.3,A,F6.3,A)") &
+                  "Periodic Hartree Fock calculation requested with the use "// &
+                  "of a truncated or shortrange potential. "// &
+                  "The cutoff radius (", x_data%potential_parameter%cutoff_radius*a_bohr*1e+10_dp, &
+                  " A) is larger than half the minimal cell dimension (", &
+                  l_min*a_bohr*1e+10_dp, " A). This may lead to unphysical "// &
+                  "total energies. Reduce the cutoff radius in order to avoid "// &
+                  "possible problems."
+            ELSE
+               WRITE (error_msg, "(A,F6.3,A,F6.3,A)") &
+                  "K-point Hartree-Fock calculation requested with the use of a "// &
+                  "truncated or shortrange potential. The cutoff radius (", &
+                  x_data%potential_parameter%cutoff_radius*a_bohr*1e+10_dp, &
+                  " A) is larger than half the minimal Born-von Karman supercell dimension (", &
+                  l_min*a_bohr*1e+10_dp, " A). This may lead "// &
+                  "to unphysical total energies. Reduce the cutoff radius or increase "// &
+                  "the number of K-points in order to avoid possible problems."
+            END IF
+            CALL cp_warn(__LOCATION__, error_msg)
+         END IF
+      END IF
+   END SUBROUTINE hfx_check_periodic_potential
+
+! **************************************************************************************************
 !> \brief - This routine computes the neighbor cells that are taken into account
 !>        in periodic runs
 !> \param x_data contains all relevant data structures for hfx runs
@@ -2079,61 +2248,18 @@ CONTAINS
       CHARACTER(LEN=512)                                 :: error_msg
       CHARACTER(LEN=64)                                  :: char_nshells
       INTEGER :: i, idx, ikind, ipgf, iset, ishell, j, jkind, jpgf, jset, jshell, k, kshell, l, &
-         m(3), max_shell, nkp(3), nseta, nsetb, perd(3), total_number_of_cells, ub, ub_max
+         m(3), max_shell, nseta, nsetb, perd(3), total_number_of_cells, ub, ub_max
       INTEGER, DIMENSION(:), POINTER                     :: la_max, lb_max, npgfa, npgfb
-      LOGICAL                                            :: do_kpoints, image_cell_found, &
+      LOGICAL                                            :: image_cell_found, &
                                                             nothing_more_to_add
-      REAL(dp) :: cross_product(3), dist_min, distance(14), l_min, normal(3, 6), P(3, 14), &
+      REAL(dp) :: cross_product(3), dist_min, distance(14), normal(3, 6), P(3, 14), &
          plane_vector(3, 2), point_in_plane(3), r(3), R1, R_max, R_max_stress, s(3), x, y, z, Zeta1
       REAL(dp), DIMENSION(:, :), POINTER                 :: zeta, zetb
       TYPE(hfx_cell_type), ALLOCATABLE, DIMENSION(:)     :: tmp_neighbor_cells
 
       total_number_of_cells = 0
 
-      nkp = 1
-      IF (PRESENT(nkp_grid)) nkp = nkp_grid
-      do_kpoints = ANY(nkp > 1)
-
-      ! ** Check some settings
-      IF (i_thread == 1) THEN
-         IF (x_data%potential_parameter%potential_type /= do_potential_truncated .AND. &
-             x_data%potential_parameter%potential_type /= do_potential_short .AND. &
-             x_data%potential_parameter%potential_type /= do_potential_mix_cl_trunc .AND. &
-             x_data%potential_parameter%potential_type /= do_potential_id) THEN
-            CALL cp_warn(__LOCATION__, &
-                         "Periodic Hartree Fock calculation requested without use "// &
-                         "of a truncated or shortrange potential. This may lead to unphysical total energies. "// &
-                         "Use a truncated  potential to avoid possible problems.")
-         ELSE IF (x_data%potential_parameter%potential_type /= do_potential_id) THEN
-            !If k-points, use the Born-von Karman super cell as reference
-            l_min = MIN(REAL(nkp(1), dp)*plane_distance(1, 0, 0, cell), &
-                        REAL(nkp(2), dp)*plane_distance(0, 1, 0, cell), &
-                        REAL(nkp(3), dp)*plane_distance(0, 0, 1, cell))
-            l_min = 0.5_dp*l_min
-            IF (x_data%potential_parameter%cutoff_radius >= l_min) THEN
-               IF (.NOT. do_kpoints) THEN
-                  WRITE (error_msg, "(A,F6.3,A,F6.3,A)") &
-                     "Periodic Hartree Fock calculation requested with the use "// &
-                     "of a truncated or shortrange potential. "// &
-                     "The cutoff radius (", x_data%potential_parameter%cutoff_radius*a_bohr*1e+10_dp, &
-                     " A) is larger than half the minimal cell dimension (", &
-                     l_min*a_bohr*1e+10_dp, " A). This may lead to unphysical "// &
-                     "total energies. Reduce the cutoff radius in order to avoid "// &
-                     "possible problems."
-               ELSE
-                  WRITE (error_msg, "(A,F6.3,A,F6.3,A)") &
-                     "K-point Hartree-Fock calculation requested with the use of a "// &
-                     "truncated or shortrange potential. The cutoff radius (", &
-                     x_data%potential_parameter%cutoff_radius*a_bohr*1e+10_dp, &
-                     " A) is larger than half the minimal Born-von Karman supercell dimension (", &
-                     l_min*a_bohr*1e+10_dp, " A). This may lead "// &
-                     "to unphysical total energies. Reduce the cutoff radius or increase "// &
-                     "the number of K-points in order to avoid possible problems."
-               END IF
-               CALL cp_warn(__LOCATION__, error_msg)
-            END IF
-         END IF
-      END IF
+      IF (i_thread == 1) CALL hfx_check_periodic_potential(x_data, cell, nkp_grid)
 
       SELECT CASE (x_data%potential_parameter%potential_type)
       CASE (do_potential_truncated, do_potential_mix_cl_trunc, do_potential_short)
@@ -2883,7 +3009,9 @@ CONTAINS
          END SELECT
 
       END IF
-      IF (x_data%do_hfx_ri) THEN
+      IF (ALLOCATED(x_data%lri)) THEN
+         IF (iw > 0) WRITE (iw, '(T3,A)') "HFX_INFO| Pair-local RI exchange"
+      ELSE IF (x_data%do_hfx_ri) THEN
          CALL hfx_print_ri_info(x_data%ri_data, hfx_section)
       ELSE
          CALL hfx_print_std_info(x_data, hfx_section)
@@ -3007,6 +3135,11 @@ CONTAINS
       IF (.NOT. is_identical) RETURN
 
       DO irep = 1, n_rep_hf1
+         IF (ASSOCIATED(hfx_pair_local_section(hfx_section1, irep)) .NEQV. &
+             ASSOCIATED(hfx_pair_local_section(hfx_section2, irep))) THEN
+            is_identical = .FALSE.
+            RETURN
+         END IF
          CALL section_vals_val_get(hfx_section1, "PW_HFX", l_val=lval1, i_rep_section=irep)
          CALL section_vals_val_get(hfx_section2, "PW_HFX", l_val=lval2, i_rep_section=irep)
          IF (lval1 .NEQV. lval2) is_identical = .FALSE.

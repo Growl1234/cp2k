@@ -87,7 +87,8 @@ MODULE qs_environment
                                               xtb_header
    USE hfx_lri_basis,                   ONLY: create_hfx_lri_basis
    USE hfx_types,                       ONLY: compare_hfx_sections,&
-                                              hfx_create
+                                              hfx_create,&
+                                              hfx_pair_local_section
    USE input_constants,                 ONLY: &
         atomic_guess, cdft_charge_constraint, debug_run, diag_ot, dispersion_d2, dispersion_d3, &
         dispersion_d3bj, do_et_ddapc, do_method_am1, do_method_dftb, do_method_gapw, &
@@ -102,7 +103,6 @@ MODULE qs_environment
         vdw_pairpot_dftd4, wfi_linear_ps_method_nr, wfi_linear_wf_method_nr, &
         wfi_use_guess_method_nr, wfi_use_prev_wf_method_nr, xc_vdw_fun_none, xc_vdw_fun_nonloc, &
         xc_vdw_fun_pairpot, xtb_vdw_type_d3, xtb_vdw_type_d4, xtb_vdw_type_none
-   USE input_cp2k_hfx,                  ONLY: hfx_ri_kp_lri
    USE input_section_types,             ONLY: section_get_ival,&
                                               section_get_ivals,&
                                               section_vals_get,&
@@ -1099,7 +1099,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'qs_init_subsys'
 
       CHARACTER(len=2)                                   :: element_symbol
-      INTEGER :: gfn_type, handle, ikind, ispin, iw, kp_ri_method, lmax_sphere, maxl, maxlgto, &
+      INTEGER :: gfn_type, handle, ikind, irep, ispin, iw, nrep_hf, lmax_sphere, maxl, maxlgto, &
          maxlgto_lri, maxlgto_nuc, maxlppl, maxlppnl, method_id, multiplicity, my_ival, n_ao, &
          n_mo_add, n_mo_auto, n_mo_target, natom, nelectron, ngauss, nkind, nlumo_dos, &
          nlumo_molden, nlumo_required, output_unit, sort_basis, tnadd_method
@@ -1108,7 +1108,7 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: mo_index_range
       LOGICAL :: all_potential_present, be_silent, cneo_potential_present, do_kpoints, do_lri_hfx, &
          do_ri_hfx, do_ri_mp2, do_ri_rpa, do_ri_sos_mp2, do_rpa_ri_exx, do_wfc_im_time, e1terms, &
-         has_unit_metric, lribas, mp2_present, orb_gradient, paw_atom
+         has_unit_metric, lribas, ri_active, mp2_present, orb_gradient, paw_atom
       REAL(KIND=dp)                                      :: alpha, ccore, ewald_rcut, fxx, maxocc, &
                                                             rc, rcut, total_zeff_corr, &
                                                             verlet_skin, zeff_correction
@@ -1151,7 +1151,7 @@ CONTAINS
       TYPE(scf_control_type), POINTER                    :: scf_control
       TYPE(se_taper_type), POINTER                       :: se_taper
       TYPE(section_vals_type), POINTER :: dft_section, et_coupling_section, et_ddapc_section, &
-         ewald_section, harris_section, lri_section, mp2_section, nl_section, poisson_section, &
+         ewald_section, harris_section, hf_section, hf_ri_section, lri_section, mp2_section, nl_section, poisson_section, &
          pp_section, print_section, qs_section, rixs_section, se_section, tddfpt_section, &
          xc_section
       TYPE(semi_empirical_control_type), POINTER         :: se_control
@@ -1496,17 +1496,29 @@ CONTAINS
          END DO
       END IF
 
-      CALL section_vals_val_get(qs_env%input, "DFT%XC%HF%RI%_SECTION_PARAMETERS_", l_val=do_ri_hfx)
+      hf_section => section_vals_get_subs_vals(dft_section, "XC%HF")
+      CALL section_vals_get(hf_section, n_repetition=nrep_hf)
+      do_ri_hfx = .FALSE.
+      do_lri_hfx = .FALSE.
+      DO irep = 1, nrep_hf
+         hf_ri_section => section_vals_get_subs_vals(hf_section, "RI", i_rep_section=irep)
+         CALL section_vals_val_get(hf_ri_section, "_SECTION_PARAMETERS_", l_val=ri_active)
+         do_ri_hfx = do_ri_hfx .OR. ri_active
+         IF (ASSOCIATED(hfx_pair_local_section(hf_section, irep))) THEN
+            IF (ri_active) CPABORT("Enable only one of HF%PAIR_LOCAL and HF%RI per HF section")
+            do_lri_hfx = .TRUE.
+         END IF
+      END DO
+      IF (do_lri_hfx) THEN
+         IF (.NOT. do_kpoints) CPABORT("HF%PAIR_LOCAL currently requires k-point sampling")
+         IF (dft_control%do_admm) CPABORT("HF%PAIR_LOCAL does not support ADMM")
+         IF (dft_control%nspins /= 1) CPABORT("HF%PAIR_LOCAL requires a spin-restricted calculation")
+      END IF
       CALL section_vals_val_get(qs_env%input, "DFT%XC%WF_CORRELATION%RI_RPA%HF%RI%_SECTION_PARAMETERS_", &
                                 l_val=do_rpa_ri_exx)
-      IF (do_ri_hfx .OR. do_rpa_ri_exx) THEN
+      IF (do_lri_hfx .OR. do_ri_hfx .OR. do_rpa_ri_exx) THEN
          CALL get_qs_env(qs_env, nkind=nkind)
          CALL section_vals_val_get(qs_env%input, "DFT%SORT_BASIS", i_val=sort_basis)
-         do_lri_hfx = .FALSE.
-         IF (do_ri_hfx .AND. do_kpoints) THEN
-            CALL section_vals_val_get(qs_env%input, "DFT%XC%HF%RI%KP_RI_METHOD", i_val=kp_ri_method)
-            do_lri_hfx = kp_ri_method == hfx_ri_kp_lri
-         END IF
          DO ikind = 1, nkind
             NULLIFY (ri_hfx_basis)
             qs_kind => qs_kind_set(ikind)

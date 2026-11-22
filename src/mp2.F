@@ -544,7 +544,7 @@ CONTAINS
       IF (ASSOCIATED(qs_env%x_data)) THEN
          free_hfx_buffer = .TRUE.
          IF (calc_forces .AND. (.NOT. mp2_env%ri_grad%free_hfx_buffer)) free_hfx_buffer = .FALSE.
-         IF (qs_env%x_data(1, 1)%do_hfx_ri) free_hfx_buffer = .FALSE.
+         IF (qs_env%x_data(1, 1)%do_hfx_ri .OR. ALLOCATED(qs_env%x_data(1, 1)%lri)) free_hfx_buffer = .FALSE.
          IF (calc_forces .AND. mp2_env%do_im_time) free_hfx_buffer = .FALSE.
          IF (mp2_env%ri_rpa%reuse_hfx) free_hfx_buffer = .FALSE.
       END IF

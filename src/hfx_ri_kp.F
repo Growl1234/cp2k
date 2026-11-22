@@ -493,9 +493,9 @@ CONTAINS
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:)          :: ks_t_split, t_2c_ao_tmp, t_3c_work_2
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)       :: ks_t, ks_t_sub, t_3c_apc, t_3c_apc_sub
       TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_sub
-      TYPE(section_vals_type), POINTER                   :: hfx_section, print_section
+      TYPE(section_vals_type), POINTER                   :: print_section
 
-      NULLIFY (para_env, para_env_sub, hfx_section, print_section)
+      NULLIFY (para_env, para_env_sub, print_section)
 
       CALL cite_reference(Bussy2024)
 
@@ -509,10 +509,9 @@ CONTAINS
          fac = 1.0_dp*hf_fraction
       END IF
 
-      hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF%RI")
-      CALL section_vals_val_get(hfx_section, "KP_NGROUPS", i_val=ngroups)
-      CALL section_vals_val_get(hfx_section, "KP_STACK_SIZE", i_val=batch_size)
-      CALL section_vals_val_get(hfx_section, "KP_USE_DELTA_P", l_val=use_delta_p)
+      CALL section_vals_val_get(ri_data%ri_section, "KP_NGROUPS", i_val=ngroups)
+      CALL section_vals_val_get(ri_data%ri_section, "KP_STACK_SIZE", i_val=batch_size)
+      CALL section_vals_val_get(ri_data%ri_section, "KP_USE_DELTA_P", l_val=use_delta_p)
       ri_data%kp_stack_size = batch_size
       ri_data%kp_ngroups = ngroups
 
@@ -544,7 +543,7 @@ CONTAINS
       IF (MOD(para_env%num_pe, ngroups) /= 0) THEN
          CPWARN("KP_NGROUPS must be an integer divisor of the total number of MPI ranks. It was set to 1.")
          ngroups = 1
-         CALL section_vals_val_set(hfx_section, "KP_NGROUPS", i_val=ngroups)
+         CALL section_vals_val_set(ri_data%ri_section, "KP_NGROUPS", i_val=ngroups)
       END IF
       IF ((MOD(ngroups, natom) /= 0) .AND. (MOD(natom, ngroups) /= 0) .AND. geometry_did_change) THEN
          IF (ngroups > 1) THEN
@@ -638,7 +637,7 @@ CONTAINS
       END DO
       batch_ranges_nze(n_batch_nze + 1) = nimg_nze + 1
 
-      print_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF%RI%PRINT")
+      print_section => section_vals_get_subs_vals(ri_data%ri_section, "PRINT")
       CALL section_vals_val_get(print_section, "KP_RI_PROGRESS_BAR", l_val=print_progress)
       CALL section_vals_val_get(print_section, "KP_RI_MEMORY_ESTIMATE", l_val=estimate_mem)
 
@@ -870,10 +869,9 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_sub
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
-      TYPE(section_vals_type), POINTER                   :: hfx_section
       TYPE(virial_type), POINTER                         :: virial
 
-      NULLIFY (para_env, para_env_sub, hfx_section, blacs_env_sub, dbcsr_template, force, atomic_kind_set, &
+      NULLIFY (para_env, para_env_sub, blacs_env_sub, dbcsr_template, force, atomic_kind_set, &
                virial, particle_set, cell)
 
       CALL timeset(routineN, handle)
@@ -928,8 +926,7 @@ CONTAINS
       CALL contract_pmat_3c(t_3c_apc, rho_ao_t, ri_data, qs_env)
 
       !Setup the subgroups
-      hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF%RI")
-      CALL section_vals_val_get(hfx_section, "KP_NGROUPS", i_val=ngroups)
+      CALL section_vals_val_get(ri_data%ri_section, "KP_NGROUPS", i_val=ngroups)
       group_size = para_env%num_pe/ngroups
       igroup = para_env%mepos/group_size
 
@@ -4251,10 +4248,9 @@ CONTAINS
          POINTER                                         :: nl_2c
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      TYPE(section_vals_type), POINTER                   :: hfx_section
 
       NULLIFY (qs_kind_set, dist_2d, nl_2c, nl_iterator, dft_control, &
-               particle_set, kpoints, para_env, cell_to_index, hfx_section)
+               particle_set, kpoints, para_env, cell_to_index)
 
       CALL timeset(routineN, handle)
 
@@ -4266,8 +4262,7 @@ CONTAINS
       kp_index_lbounds = LBOUND(cell_to_index)
       kp_index_ubounds = UBOUND(cell_to_index)
 
-      hfx_section => section_vals_get_subs_vals(qs_env%input, "DFT%XC%HF%RI")
-      CALL section_vals_val_get(hfx_section, "KP_NGROUPS", i_val=ngroups)
+      CALL section_vals_val_get(ri_data%ri_section, "KP_NGROUPS", i_val=ngroups)
 
       ALLOCATE (basis_set_RI(nkind), basis_set_AO(nkind))
       CALL basis_set_list_setup(basis_set_RI, ri_data%ri_basis_type, qs_kind_set)
@@ -4302,7 +4297,7 @@ CONTAINS
          ri_data%kp_image_range = MAX(image_range, ri_data%kp_image_range)
       END DO
 
-      CALL section_vals_val_get(hfx_section, "KP_RI_BUMP_FACTOR", r_val=bump_fact)
+      CALL section_vals_val_get(ri_data%ri_section, "KP_RI_BUMP_FACTOR", r_val=bump_fact)
       ri_data%kp_bump_rad = bump_fact*ri_data%kp_RI_range
 
       !For the extent of the KP RI-HFX images, we are limited by the RI-HFX potential in
