@@ -18,14 +18,9 @@ MODULE qs_ot_types
                                               cite_reference
    USE cp_blacs_env,                    ONLY: cp_blacs_env_release,&
                                               cp_blacs_env_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_copy,&
-                                              dbcsr_get_info,&
-                                              dbcsr_init_p,&
-                                              dbcsr_p_type,&
-                                              dbcsr_release_p,&
-                                              dbcsr_set,&
-                                              dbcsr_type,&
-                                              dbcsr_type_no_symmetry
+   USE cp_dbcsr_api,                    ONLY: &
+        dbcsr_copy, dbcsr_create, dbcsr_get_info, dbcsr_init_p, dbcsr_p_type, dbcsr_release_p, &
+        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_add_on_diag
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_m_by_n_from_row_template,&
                                               cp_dbcsr_m_by_n_from_template,&
@@ -895,7 +890,7 @@ CONTAINS
       NULLIFY (qs_ot_env%buf1_n_k_dp)
       NULLIFY (qs_ot_env%p_k_k_sym)
 
-      ! COMMON MATRICES
+      ! Use C0 as the layout for all AO-by-active-orbital matrices in this channel.
       CALL dbcsr_init_p(qs_ot_env%matrix_c0)
       CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_c0, template=matrix_s, n=k, &
                                              sym=dbcsr_type_no_symmetry)
@@ -905,34 +900,27 @@ CONTAINS
                                              sym=dbcsr_type_no_symmetry)
 
       CALL dbcsr_init_p(qs_ot_env%matrix_x)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_x, template=matrix_s, n=k, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_x, template=qs_ot_env%matrix_c0)
 
       CALL dbcsr_init_p(qs_ot_env%matrix_sx)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_sx, template=matrix_s, n=k, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_sx, template=qs_ot_env%matrix_c0)
 
       CALL dbcsr_init_p(qs_ot_env%matrix_gx)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_gx, template=matrix_s, n=k, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_gx, template=qs_ot_env%matrix_c0)
 
       IF (qs_ot_env%settings%occupation_preconditioner .OR. qs_ot_env%optimize_virtuals) THEN
          CALL dbcsr_init_p(qs_ot_env%matrix_preconditioned_gx)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_preconditioned_gx, &
-                                                template=matrix_s, n=k, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%matrix_preconditioned_gx, template=qs_ot_env%matrix_c0)
       END IF
 
       IF (qs_ot_env%use_dx) THEN
          CALL dbcsr_init_p(qs_ot_env%matrix_dx)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_dx, template=matrix_s, n=k, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%matrix_dx, template=qs_ot_env%matrix_c0)
       END IF
 
       IF (qs_ot_env%use_gx_old) THEN
          CALL dbcsr_init_p(qs_ot_env%matrix_gx_old)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_gx_old, template=matrix_s, n=k, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%matrix_gx_old, template=qs_ot_env%matrix_c0)
       END IF
 
       SELECT CASE (qs_ot_env%settings%ot_algorithm)
@@ -1028,8 +1016,7 @@ CONTAINS
                                             sym=dbcsr_type_no_symmetry)
          !
          CALL dbcsr_init_p(qs_ot_env%buf1_n_k)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%buf1_n_k, template=matrix_s, n=k, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%buf1_n_k, template=qs_ot_env%matrix_c0)
          !
          CALL dbcsr_init_p(qs_ot_env%matrix_buf1)
          CALL cp_dbcsr_m_by_n_from_template(qs_ot_env%matrix_buf1, template=matrix_s, m=k, n=k, &
@@ -1050,12 +1037,10 @@ CONTAINS
          CALL dbcsr_allocate_matrix_set(qs_ot_env%matrix_h_x, ncoef)
          DO i = 1, ncoef
             CALL dbcsr_init_p(qs_ot_env%matrix_h_x(i)%matrix)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_h_x(i)%matrix, template=matrix_s, n=k, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_h_x(i)%matrix, template=qs_ot_env%matrix_c0)
 
             CALL dbcsr_init_p(qs_ot_env%matrix_h_e(i)%matrix)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_h_e(i)%matrix, template=matrix_s, n=k, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_h_e(i)%matrix, template=qs_ot_env%matrix_c0)
          END DO
       END IF
 
@@ -1194,44 +1179,29 @@ CONTAINS
       CALL dbcsr_get_info(qs_ot_env%matrix_sc0, nfullcols_total=nmo_ortho)
 
       CALL dbcsr_init_p(qs_ot_env%matrix_c0_im)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_c0_im, template=matrix_s, n=nmo, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_c0_im, template=qs_ot_env%matrix_c0)
       CALL dbcsr_init_p(qs_ot_env%matrix_sc0_im)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_sc0_im, template=matrix_s, n=nmo_ortho, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_sc0_im, template=qs_ot_env%matrix_sc0)
       CALL dbcsr_init_p(qs_ot_env%matrix_x_im)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_x_im, template=matrix_s, n=nmo, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_x_im, template=qs_ot_env%matrix_c0)
       CALL dbcsr_init_p(qs_ot_env%matrix_sx_im)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_sx_im, template=matrix_s, n=nmo, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_sx_im, template=qs_ot_env%matrix_c0)
       CALL dbcsr_init_p(qs_ot_env%matrix_gx_im)
-      CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_gx_im, template=matrix_s, n=nmo, &
-                                             sym=dbcsr_type_no_symmetry)
+      CALL dbcsr_create(qs_ot_env%matrix_gx_im, template=qs_ot_env%matrix_c0)
       IF (qs_ot_env%settings%occupation_preconditioner .OR. qs_ot_env%optimize_virtuals) THEN
          CALL dbcsr_init_p(qs_ot_env%matrix_preconditioned_gx_im)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_preconditioned_gx_im, &
-                                                template=matrix_s, n=nmo, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%matrix_preconditioned_gx_im, template=qs_ot_env%matrix_c0)
       END IF
       IF (qs_ot_env%settings%occupation_preconditioner .AND. .NOT. qs_ot_env%optimize_virtuals) THEN
          IF (qs_ot_env%use_dx) THEN
             CALL dbcsr_init_p(qs_ot_env%matrix_response_gx)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_response_gx, &
-                                                   template=matrix_s, n=nmo, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_response_gx, template=qs_ot_env%matrix_c0)
             CALL dbcsr_init_p(qs_ot_env%matrix_response_gx_im)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_response_gx_im, &
-                                                   template=matrix_s, n=nmo, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_response_gx_im, template=qs_ot_env%matrix_c0)
             CALL dbcsr_init_p(qs_ot_env%matrix_mermin_g0)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_mermin_g0, &
-                                                   template=matrix_s, n=nmo, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_mermin_g0, template=qs_ot_env%matrix_c0)
             CALL dbcsr_init_p(qs_ot_env%matrix_mermin_g0_im)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_mermin_g0_im, &
-                                                   template=matrix_s, n=nmo, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_mermin_g0_im, template=qs_ot_env%matrix_c0)
             IF (qs_ot_env%settings%do_ener) THEN
                CPASSERT(ASSOCIATED(qs_ot_env%ener_x))
                ALLOCATE (qs_ot_env%ener_mermin_g0(SIZE(qs_ot_env%ener_x)))
@@ -1267,20 +1237,17 @@ CONTAINS
          CALL cp_dbcsr_m_by_n_from_template(qs_ot_env%matrix_ref_inv_sqrt_im, template=matrix_s, m=nmo, n=nmo, &
                                             sym=dbcsr_type_no_symmetry)
          CALL dbcsr_init_p(qs_ot_env%buf1_n_k_dp)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%buf1_n_k_dp, template=matrix_s, n=nmo, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%buf1_n_k_dp, template=qs_ot_env%matrix_c0)
       CASE DEFAULT
          CPABORT("Complex K-point OT state requires ALGORITHM STRICT or IRAC")
       END SELECT
       IF (qs_ot_env%use_dx) THEN
          CALL dbcsr_init_p(qs_ot_env%matrix_dx_im)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_dx_im, template=matrix_s, n=nmo, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%matrix_dx_im, template=qs_ot_env%matrix_c0)
       END IF
       IF (qs_ot_env%use_gx_old) THEN
          CALL dbcsr_init_p(qs_ot_env%matrix_gx_old_im)
-         CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_gx_old_im, template=matrix_s, n=nmo, &
-                                                sym=dbcsr_type_no_symmetry)
+         CALL dbcsr_create(qs_ot_env%matrix_gx_old_im, template=qs_ot_env%matrix_c0)
       END IF
       IF (qs_ot_env%settings%ot_method == "DIIS" .OR. &
           qs_ot_env%settings%ot_method == "BROY" .OR. &
@@ -1291,13 +1258,9 @@ CONTAINS
          CALL dbcsr_allocate_matrix_set(qs_ot_env%matrix_h_x_im, ncoef)
          DO i = 1, ncoef
             CALL dbcsr_init_p(qs_ot_env%matrix_h_e_im(i)%matrix)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_h_e_im(i)%matrix, &
-                                                   template=matrix_s, n=nmo, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_h_e_im(i)%matrix, template=qs_ot_env%matrix_c0)
             CALL dbcsr_init_p(qs_ot_env%matrix_h_x_im(i)%matrix)
-            CALL cp_dbcsr_m_by_n_from_row_template(qs_ot_env%matrix_h_x_im(i)%matrix, &
-                                                   template=matrix_s, n=nmo, &
-                                                   sym=dbcsr_type_no_symmetry)
+            CALL dbcsr_create(qs_ot_env%matrix_h_x_im(i)%matrix, template=qs_ot_env%matrix_c0)
          END DO
       END IF
 
