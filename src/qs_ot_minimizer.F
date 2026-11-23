@@ -43,6 +43,7 @@ MODULE qs_ot_minimizer
    USE qs_ot_kp,                        ONLY: qs_ot_get_derivative_complex,&
                                               qs_ot_get_derivative_local_batch,&
                                               qs_ot_get_derivative_ref_complex,&
+                                              qs_ot_local_hc_type,&
                                               qs_ot_prepare_complex_tangent_metric,&
                                               qs_ot_prepare_complex_tangent_metric_batch,&
                                               qs_ot_project_gradient
@@ -242,10 +243,11 @@ CONTAINS
 !> \param gradient_only return after evaluating the current OT gradient
 !> \param gradient_prepared reuse a gradient evaluated by ot_mini_prepare_gradient
 !> \param restart_history pending restart from ot_mini_prepare; absent prepares here
+!> \param dense_hc local SCF products for the single-rank k-point gradient
 ! **************************************************************************************************
    SUBROUTINE ot_mini(qs_ot_env, matrix_hc, matrix_hc_im, &
                       matrix_hc_physical, matrix_hc_physical_im, para_env_inter_kp, &
-                      gradient_only, gradient_prepared, restart_history)
+                      gradient_only, gradient_prepared, restart_history, dense_hc)
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_hc
       TYPE(dbcsr_p_type), DIMENSION(:), OPTIONAL, &
@@ -255,6 +257,7 @@ CONTAINS
       TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
       LOGICAL, INTENT(IN), OPTIONAL                      :: gradient_only, gradient_prepared, &
                                                             restart_history
+      TYPE(qs_ot_local_hc_type), INTENT(IN), OPTIONAL    :: dense_hc(:)
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_mini'
 
@@ -287,8 +290,8 @@ CONTAINS
          reuse_gradient = .FALSE.
       END IF
 
-      IF (qs_ot_env(1)%optimize_virtuals .AND. .NOT. reuse_gradient) THEN
-         CPASSERT(PRESENT(matrix_hc_physical) .OR. qs_ot_env(1)%energy_only)
+      IF (qs_ot_env(1)%optimize_virtuals .AND. .NOT. reuse_gradient .AND. .NOT. qs_ot_env(1)%energy_only) THEN
+         CPASSERT(PRESENT(matrix_hc_physical) .OR. PRESENT(dense_hc))
       END IF
       npasses = 1
       IF (PRESENT(matrix_hc_physical)) THEN
@@ -304,13 +307,13 @@ CONTAINS
          qs_ot_env(1)%gradient = 0.0_dp
          local_gradient = .FALSE.
          IF (do_ks .AND. qs_ot_env(1)%has_complex_kpoint_state) THEN
-            IF (.NOT. PRESENT(matrix_hc_im)) THEN
+            IF (.NOT. PRESENT(matrix_hc_im) .AND. .NOT. PRESENT(dense_hc)) THEN
                CPABORT("Complex k-point OT derivative requires imaginary H(k)*C(k).")
             END IF
             local_gradient = qs_ot_env(1)%para_env%num_pe == 1
             IF (local_gradient) THEN
                CALL qs_ot_get_derivative_local_batch(qs_ot_env, matrix_hc, matrix_hc_im, &
-                                                     matrix_hc_physical, matrix_hc_physical_im)
+                                                     matrix_hc_physical, matrix_hc_physical_im, dense_hc)
             END IF
          END IF
          DO ispin = 1, nspin
@@ -450,10 +453,11 @@ CONTAINS
 !> \param matrix_hc_physical_im occupation-weighted imaginary H*C products
 !> \param para_env_inter_kp communicator between distributed K-point groups
 !> \param restart_history pending restart from ot_mini_prepare; absent prepares here
+!> \param dense_hc local SCF products for the single-rank k-point gradient
 ! **************************************************************************************************
    SUBROUTINE ot_mini_prepare_gradient(qs_ot_env, matrix_hc, matrix_hc_im, &
                                        matrix_hc_physical, matrix_hc_physical_im, para_env_inter_kp, &
-                                       restart_history)
+                                       restart_history, dense_hc)
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_hc
       TYPE(dbcsr_p_type), DIMENSION(:), OPTIONAL, &
@@ -462,11 +466,12 @@ CONTAINS
          OPTIONAL                                        :: matrix_hc_physical, matrix_hc_physical_im
       TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env_inter_kp
       LOGICAL, INTENT(IN), OPTIONAL                      :: restart_history
+      TYPE(qs_ot_local_hc_type), INTENT(IN), OPTIONAL    :: dense_hc(:)
 
       CALL ot_mini(qs_ot_env, matrix_hc, matrix_hc_im=matrix_hc_im, &
                    matrix_hc_physical=matrix_hc_physical, &
                    matrix_hc_physical_im=matrix_hc_physical_im, &
-                   para_env_inter_kp=para_env_inter_kp, gradient_only=.TRUE., restart_history=restart_history)
+                   para_env_inter_kp=para_env_inter_kp, gradient_only=.TRUE., restart_history=restart_history, dense_hc=dense_hc)
 
    END SUBROUTINE ot_mini_prepare_gradient
 

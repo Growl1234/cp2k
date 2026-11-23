@@ -31,7 +31,8 @@ MODULE qs_ot_kp
    USE cp_fm_diag,                      ONLY: FM_DIAG_TYPE_DLAF,&
                                               diag_lib_explicit,&
                                               diag_type
-   USE cp_fm_types,                     ONLY: cp_fm_p_type
+   USE cp_fm_types,                     ONLY: cp_fm_p_type,&
+                                              cp_fm_type
    USE kinds,                           ONLY: dp
    USE local_gemm_api,                  ONLY: LOCAL_GEMM_PU_GPU,&
                                               LOCAL_GEMM_PU_HOST,&
@@ -62,6 +63,7 @@ MODULE qs_ot_kp
    PUBLIC :: qs_ot_get_orbitals_local_batch
    PUBLIC :: qs_ot_get_derivative_complex
    PUBLIC :: qs_ot_get_derivative_local_batch
+   PUBLIC :: qs_ot_local_hc_type
    PUBLIC :: qs_ot_prepare_complex_tangent_metric
    PUBLIC :: qs_ot_prepare_complex_tangent_metric_batch
    PUBLIC :: qs_ot_get_orbitals_ref_complex
@@ -81,6 +83,12 @@ MODULE qs_ot_kp
    PUBLIC :: qs_ot_project_gradient
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_ot_kp'
+
+   ! One local OT channel. The SCF driver owns the split H*C matrices until the gradient is prepared.
+   TYPE qs_ot_local_hc_type
+      TYPE(cp_fm_type), POINTER :: re => NULL(), im => NULL()
+      REAL(KIND=dp), ALLOCATABLE :: column_scale(:)
+   END TYPE qs_ot_local_hc_type
 
    INTERFACE qs_ot_complex_multiply_local
       MODULE PROCEDURE qs_ot_complex_multiply_pair_local, qs_ot_complex_multiply_parts_local
@@ -2510,29 +2518,38 @@ CONTAINS
 !> \param matrix_hc_im imaginary orbital gradients
 !> \param matrix_hc_physical optional physical gradients for occupation preconditioning
 !> \param matrix_hc_physical_im imaginary physical gradients
+!> \param dense_hc local SCF products and their physical column weights
 ! **************************************************************************************************
    SUBROUTINE qs_ot_get_derivative_local_batch(qs_ot_env, matrix_hc, matrix_hc_im, &
-                                               matrix_hc_physical, matrix_hc_physical_im)
+                                               matrix_hc_physical, matrix_hc_physical_im, dense_hc)
       TYPE(qs_ot_type), INTENT(INOUT)                    :: qs_ot_env(:)
-      TYPE(dbcsr_p_type), INTENT(IN)                     :: matrix_hc(:), matrix_hc_im(:)
-      TYPE(dbcsr_p_type), INTENT(IN), OPTIONAL           :: matrix_hc_physical(:), &
+      TYPE(dbcsr_p_type), INTENT(IN), OPTIONAL           :: matrix_hc(:), matrix_hc_im(:), &
+                                                            matrix_hc_physical(:), &
                                                             matrix_hc_physical_im(:)
+      TYPE(qs_ot_local_hc_type), INTENT(IN), OPTIONAL    :: dense_hc(:)
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_ot_get_derivative_local_batch'
 
-      INTEGER                                            :: first, handle, i, j, nbatch, nchannels, &
-                                                            npasses, nworkers, pass
+      INTEGER                                            :: col, first, handle, i, j, n, nbatch, &
+                                                            nchannels, npasses, nworkers, pass
       LOGICAL                                            :: ref
+      REAL(KIND=dp)                                      :: scale
       TYPE(qs_ot_local_work_type), ALLOCATABLE           :: work(:)
 
       CPASSERT(qs_ot_local_channels(qs_ot_env))
       ref = qs_ot_env(1)%settings%ot_algorithm == 'REF'
-      npasses = 1
-      IF (PRESENT(matrix_hc_physical)) THEN
-         CPASSERT(PRESENT(matrix_hc_physical_im))
-         npasses = 2
-      END IF
       nchannels = SIZE(qs_ot_env)
+      npasses = 1
+      IF (PRESENT(dense_hc)) THEN
+         CPASSERT(SIZE(dense_hc) == nchannels)
+         IF (qs_ot_env(1)%settings%occupation_preconditioner .OR. qs_ot_env(1)%optimize_virtuals) npasses = 2
+      ELSE
+         CPASSERT(PRESENT(matrix_hc) .AND. PRESENT(matrix_hc_im))
+         IF (PRESENT(matrix_hc_physical)) THEN
+            CPASSERT(PRESENT(matrix_hc_physical_im))
+            npasses = 2
+         END IF
+      END IF
 
       CALL timeset(routineN, handle)
       nworkers = 1
@@ -2546,19 +2563,30 @@ CONTAINS
          DO j = 1, nbatch
             i = first + j - 1
             IF (.NOT. ref) CALL qs_ot_prepare_complex_tangent_metric(qs_ot_env(i))
-            CALL qs_ot_load_local_work(work(j), qs_ot_env(i), matrix_hc(i)%matrix, matrix_hc_im(i)%matrix)
+            CALL qs_ot_load_local_work(work(j), qs_ot_env(i))
+            IF (.NOT. PRESENT(dense_hc)) CALL qs_ot_load_local_pair(matrix_hc(i)%matrix, matrix_hc_im(i)%matrix, work(j)%hc)
             work(j)%filtered = ref .AND. qs_ot_env(i)%settings%eps_irac_filter_matrix > 0.0_dp
          END DO
          DO pass = 1, npasses
-            IF (pass == 2) THEN
+            IF (pass == 2 .AND. .NOT. PRESENT(dense_hc)) THEN
                DO j = 1, nbatch
                   i = first + j - 1
                   CALL qs_ot_load_local_pair(matrix_hc_physical(i)%matrix, matrix_hc_physical_im(i)%matrix, work(j)%hc)
                END DO
             END IF
 !$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) NUM_THREADS(nbatch) IF(nbatch > 1) &
-!$OMP SHARED(work,nbatch,ref,pass,npasses)
+!$OMP SHARED(work,nbatch,ref,pass,npasses,dense_hc,qs_ot_env,first) PRIVATE(i,col,n,scale)
             DO j = 1, nbatch
+               IF (PRESENT(dense_hc)) THEN
+                  i = first + j - 1
+                  n = SIZE(work(j)%hc, 1)
+                  DO col = 1, SIZE(work(j)%hc, 2)
+                     scale = dense_hc(i)%column_scale(col)
+                     IF (pass < npasses) scale = 2.0_dp*qs_ot_env(i)%kpoint_weight
+                     work(j)%hc(:, col, 1) = scale*dense_hc(i)%re%local_data(1:n, col)
+                     work(j)%hc(:, col, 2) = scale*dense_hc(i)%im%local_data(1:n, col)
+                  END DO
+               END IF
                IF (ref) THEN
                   CALL qs_ot_complex_multiply_local('N', 'N', work(j)%x, work(j)%sinp, &
                                                     work(j)%c0, work(j)%tmp, work(j)%gemm_ctx)
@@ -2732,13 +2760,10 @@ CONTAINS
 !> \brief Reuse one worker's scratch and pack the local kernel inputs.
 !> \param w worker storage
 !> \param qs_ot_env channel with an already prepared tangent metric
-!> \param matrix_hc real orbital gradient
-!> \param matrix_hc_im imaginary orbital gradient
 ! **************************************************************************************************
-   SUBROUTINE qs_ot_load_local_work(w, qs_ot_env, matrix_hc, matrix_hc_im)
+   SUBROUTINE qs_ot_load_local_work(w, qs_ot_env)
       TYPE(qs_ot_local_work_type), INTENT(INOUT)         :: w
       TYPE(qs_ot_type), INTENT(IN)                       :: qs_ot_env
-      TYPE(dbcsr_type), INTENT(IN)                       :: matrix_hc, matrix_hc_im
 
       INTEGER                                            :: k, n, o
 
@@ -2748,7 +2773,6 @@ CONTAINS
          IF (SIZE(w%hc, 1) /= n .OR. SIZE(w%hc, 2) /= k) DEALLOCATE (w%hc)
       END IF
       IF (.NOT. ALLOCATED(w%hc)) ALLOCATE (w%hc(n, k, 2))
-      CALL qs_ot_load_local_pair(matrix_hc, matrix_hc_im, w%hc)
       CALL qs_ot_load_local_pair(qs_ot_env%matrix_x, qs_ot_env%matrix_x_im, w%x)
       CALL qs_ot_load_local_pair(qs_ot_env%matrix_sx, qs_ot_env%matrix_sx_im, w%sx)
       w%do_rotation = qs_ot_env%settings%do_rotation

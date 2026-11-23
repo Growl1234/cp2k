@@ -115,7 +115,7 @@ MODULE qs_scf_loop_utils
         qs_ot_density_secant_projected_hessian, qs_ot_density_tangent, &
         qs_ot_finite_rotation_response, qs_ot_fixed_n_energy_gradient, &
         qs_ot_fixed_n_multigroup_schur_block, qs_ot_get_orbitals_complex, &
-        qs_ot_get_orbitals_local_batch, qs_ot_get_orbitals_ref_complex, &
+        qs_ot_get_orbitals_local_batch, qs_ot_get_orbitals_ref_complex, qs_ot_local_hc_type, &
         qs_ot_projected_response_update, qs_ot_symmetric_abs_solve
    USE qs_ot_minimizer,                 ONLY: ot_mermin_response_preparation_needed,&
                                               ot_mermin_secant_curvature,&
@@ -753,6 +753,7 @@ CONTAINS
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
       TYPE(qs_energy_type), POINTER                      :: energy
+      TYPE(qs_ot_local_hc_type), ALLOCATABLE             :: dense_hc(:)
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: local_ot_env
       TYPE(qs_rho_type), POINTER                         :: rho
       TYPE(scf_control_type), POINTER                    :: scf_control
@@ -823,22 +824,26 @@ CONTAINS
          END IF
       END IF
 
-      ALLOCATE (matrix_hc(nlocal_channels))
-      ALLOCATE (matrix_hc_im(nlocal_channels))
-      IF (need_gradient .AND. unweighted_search) THEN
-         ALLOCATE (matrix_hc_physical(nlocal_channels), matrix_hc_physical_im(nlocal_channels))
-      END IF
-      DO local_channel = 1, nlocal_channels
-         ALLOCATE (matrix_hc(local_channel)%matrix, matrix_hc_im(local_channel)%matrix)
-         CALL dbcsr_copy(matrix_hc(local_channel)%matrix, local_ot_env(local_channel)%matrix_x, name="matrix_hc")
-         CALL dbcsr_copy(matrix_hc_im(local_channel)%matrix, local_ot_env(local_channel)%matrix_x_im, &
-                         name="matrix_hc_im")
-         CALL dbcsr_set(matrix_hc(local_channel)%matrix, 0.0_dp)
-         CALL dbcsr_set(matrix_hc_im(local_channel)%matrix, 0.0_dp)
-      END DO
-
-      IF (kpoints%para_env_kp%num_pe == 1 .AND. (need_gradient .OR. local_ot_env(1)%settings%do_ener)) THEN
-         CALL qs_scf_ot_kp_hc(kpoints, local_ot_env, restricted_roks, local_hc)
+      local_orbitals = kpoints%para_env_kp%num_pe == 1
+      IF (local_orbitals) THEN
+         IF (need_gradient .OR. local_ot_env(1)%settings%do_ener) THEN
+            CALL qs_scf_ot_kp_hc(kpoints, local_ot_env, restricted_roks, local_hc)
+         END IF
+         IF (need_gradient) ALLOCATE (dense_hc(nlocal_channels))
+      ELSE
+         ! The distributed orbital update also uses these matrices on energy-only steps.
+         ALLOCATE (matrix_hc(nlocal_channels), matrix_hc_im(nlocal_channels))
+         IF (need_gradient .AND. unweighted_search) THEN
+            ALLOCATE (matrix_hc_physical(nlocal_channels), matrix_hc_physical_im(nlocal_channels))
+         END IF
+         DO local_channel = 1, nlocal_channels
+            ALLOCATE (matrix_hc(local_channel)%matrix, matrix_hc_im(local_channel)%matrix)
+            CALL dbcsr_copy(matrix_hc(local_channel)%matrix, local_ot_env(local_channel)%matrix_x, name="matrix_hc")
+            CALL dbcsr_copy(matrix_hc_im(local_channel)%matrix, local_ot_env(local_channel)%matrix_x_im, &
+                            name="matrix_hc_im")
+            CALL dbcsr_set(matrix_hc(local_channel)%matrix, 0.0_dp)
+            CALL dbcsr_set(matrix_hc_im(local_channel)%matrix, 0.0_dp)
+         END DO
       END IF
       need_mo_coeff = .NOT. ALLOCATED(local_hc) .OR. local_ot_env(1)%settings%do_ener .OR. ALLOCATED(kpoints%lowdin_v)
 
@@ -1020,9 +1025,16 @@ CONTAINS
                CALL cp_fm_struct_release(chc_struct)
             END IF
 
-            IF (need_gradient) THEN
-               CALL copy_fm_to_dbcsr(hc_re, matrix_hc(local_channel)%matrix)
-               CALL copy_fm_to_dbcsr(hc_im, matrix_hc_im(local_channel)%matrix)
+            IF (ALLOCATED(dense_hc)) THEN
+               dense_hc(local_channel)%re => hc_re
+               dense_hc(local_channel)%im => hc_im
+            ELSE
+               IF (need_gradient) THEN
+                  CALL copy_fm_to_dbcsr(hc_re, matrix_hc(local_channel)%matrix)
+                  CALL copy_fm_to_dbcsr(hc_im, matrix_hc_im(local_channel)%matrix)
+               END IF
+               CALL cp_fm_release(hc_re)
+               CALL cp_fm_release(hc_im)
             END IF
 
             IF (need_mo_coeff) THEN
@@ -1030,16 +1042,13 @@ CONTAINS
                CALL cp_fm_release(active_mo_coeff_im)
                CALL cp_fm_struct_release(active_mo_struct)
             END IF
-            CALL cp_fm_release(hc_re)
-            CALL cp_fm_release(hc_im)
             IF (.NOT. ALLOCATED(local_hc)) THEN
                CALL dbcsr_release_p(matrix_k_re)
                CALL dbcsr_release_p(matrix_k_im)
             END IF
          END DO
       END DO
-      ! Each result was released by its consuming channel above.
-      IF (ALLOCATED(local_hc)) DEALLOCATE (local_hc)
+      IF (ALLOCATED(local_hc) .AND. .NOT. need_gradient) DEALLOCATE (local_hc)
 
       IF (local_ot_env(1)%settings%do_ener) THEN
          CALL qs_scf_loop_collect_ot_kp_trial_smearing( &
@@ -1090,6 +1099,10 @@ CONTAINS
             ELSE
                orbital_scaling_factor(:) = 2.0_dp*wkp(ikpoint)*occupation_numbers(1:nactive)
             END IF
+            IF (ALLOCATED(dense_hc)) THEN
+               CALL MOVE_ALLOC(orbital_scaling_factor, dense_hc(local_channel)%column_scale)
+               CYCLE
+            END IF
             IF (unweighted_search) THEN
                ALLOCATE (matrix_hc_physical(local_channel)%matrix, matrix_hc_physical_im(local_channel)%matrix)
                CALL dbcsr_copy(matrix_hc_physical(local_channel)%matrix, matrix_hc(local_channel)%matrix)
@@ -1116,7 +1129,9 @@ CONTAINS
             CALL ot_mini_prepare_gradient( &
                local_ot_env, matrix_hc, matrix_hc_im=matrix_hc_im, &
                matrix_hc_physical=matrix_hc_physical, matrix_hc_physical_im=matrix_hc_physical_im, &
-               para_env_inter_kp=para_env_inter_kp, restart_history=restart_history)
+               para_env_inter_kp=para_env_inter_kp, restart_history=restart_history, dense_hc=dense_hc)
+            IF (ALLOCATED(dense_hc)) DEALLOCATE (dense_hc)
+            CALL cp_fm_release(local_hc)
             ot_gradient_prepared = .TRUE.
             restart_history = .FALSE.
          END IF
@@ -1140,12 +1155,13 @@ CONTAINS
       CALL ot_mini(local_ot_env, matrix_hc, matrix_hc_im=matrix_hc_im, &
                    matrix_hc_physical=matrix_hc_physical, matrix_hc_physical_im=matrix_hc_physical_im, &
                    para_env_inter_kp=para_env_inter_kp, &
-                   gradient_prepared=ot_gradient_prepared, restart_history=restart_history)
+                   gradient_prepared=ot_gradient_prepared, restart_history=restart_history, dense_hc=dense_hc)
+      IF (ALLOCATED(dense_hc)) DEALLOCATE (dense_hc)
+      CALL cp_fm_release(local_hc)
       scf_env%iter_delta = local_ot_env(1)%delta
       energy_only = local_ot_env(1)%energy_only
 
       ! Borrow cached overlaps and physical MO storage; no matrix ownership changes in workers.
-      local_orbitals = kpoints%para_env_kp%num_pe == 1
       IF (local_orbitals) THEN
          ALLOCATE (local_s(2, nlocal_channels), local_c(nlocal_channels))
          DO local_kpoint = 1, SIZE(kpoints%kp_env)
@@ -1263,15 +1279,14 @@ CONTAINS
       scf_env%iter_param = scf_env%qs_ot_env(first_channel)%ds_min
       qs_env%broyden_adaptive_sigma = scf_env%qs_ot_env(first_channel)%broyden_adaptive_sigma
 
-      DO local_channel = 1, nlocal_channels
-         CALL dbcsr_release_p(matrix_hc(local_channel)%matrix)
-         CALL dbcsr_release_p(matrix_hc_im(local_channel)%matrix)
-         IF (ALLOCATED(matrix_hc_physical)) THEN
+      CALL dbcsr_deallocate_matrix_set(matrix_hc)
+      CALL dbcsr_deallocate_matrix_set(matrix_hc_im)
+      IF (ALLOCATED(matrix_hc_physical)) THEN
+         DO local_channel = 1, nlocal_channels
             CALL dbcsr_release_p(matrix_hc_physical(local_channel)%matrix)
             CALL dbcsr_release_p(matrix_hc_physical_im(local_channel)%matrix)
-         END IF
-      END DO
-      DEALLOCATE (matrix_hc, matrix_hc_im)
+         END DO
+      END IF
 
       CALL timestop(handle)
 
